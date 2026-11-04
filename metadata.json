@@ -1,0 +1,6 @@
+{
+  "name": "HaxArena 2D — Командный Мультиплеер",
+  "description": "Мультиплеерная 2D-игра в стиле командного HaxBall на HTML5 Canvas с синхронизацией через Firebase в реальном времени.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

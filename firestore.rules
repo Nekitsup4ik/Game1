@@ -1,0 +1,273 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Hardened Global Helpers
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isNum(val) {
+      return val is int || val is float;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    // Master Gate Relational Helpers
+    function isCurrentRoomMember(roomId) {
+      return exists(/databases/$(database)/documents/rooms/$(roomId)) &&
+        request.auth.uid in get(/databases/$(database)/documents/rooms/$(roomId)).data.memberUids;
+    }
+
+    function isRoomMemberAfter(roomId) {
+      return existsAfter(/databases/$(database)/documents/rooms/$(roomId)) &&
+        request.auth.uid in getAfter(/databases/$(database)/documents/rooms/$(roomId)).data.memberUids;
+    }
+
+    // Validation Blueprint: LobbyDirectory
+    function isValidLobbyDirectory(data) {
+      return data.keys().hasAll(['lobbyId', 'roomIds', 'updatedBy', 'updatedAt']) &&
+        data.keys().hasOnly(['lobbyId', 'roomIds', 'updatedBy', 'updatedAt']) &&
+        isValidId(data.lobbyId) &&
+        data.lobbyId.size() <= 64 &&
+        data.roomIds is list &&
+        data.roomIds.size() <= 20 &&
+        (data.roomIds.size() == 0 || (data.roomIds[0] is string && data.roomIds[0].size() >= 1 && data.roomIds[0].size() <= 64)) &&
+        isValidId(data.updatedBy) &&
+        data.updatedBy == request.auth.uid &&
+        data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: MatchRoom
+    function isValidMatchRoom(data) {
+      return data.keys().hasAll([
+          'roomId', 'title', 'hostUid', 'hostName', 'status',
+          'memberUids', 'redUids', 'blueUids',
+          'redScore', 'blueScore', 'matchStartedAtMs', 'winnerTeam',
+          'ballX', 'ballY', 'ballVx', 'ballVy',
+          'eventState', 'eventTeam', 'eventUntilMs', 'lastTouchTeam',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'roomId', 'title', 'hostUid', 'hostName', 'status',
+          'memberUids', 'redUids', 'blueUids',
+          'redScore', 'blueScore', 'matchStartedAtMs', 'winnerTeam',
+          'ballX', 'ballY', 'ballVx', 'ballVy',
+          'eventState', 'eventTeam', 'eventUntilMs', 'lastTouchTeam',
+          'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.roomId) &&
+        data.roomId.size() <= 64 &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 60 &&
+        isValidId(data.hostUid) &&
+        data.hostName is string && data.hostName.size() >= 1 && data.hostName.size() <= 24 &&
+        data.status is string && data.status in ['waiting', 'playing', 'finished'] &&
+        data.memberUids is list && data.memberUids.size() >= 1 && data.memberUids.size() <= 10 &&
+        data.memberUids[0] is string && data.memberUids[0].size() >= 1 && data.memberUids[0].size() <= 128 &&
+        data.redUids is list && data.redUids.size() <= 5 &&
+        (data.redUids.size() == 0 || (data.redUids[0] is string && data.redUids[0].size() >= 1 && data.redUids[0].size() <= 128)) &&
+        data.blueUids is list && data.blueUids.size() <= 5 &&
+        (data.blueUids.size() == 0 || (data.blueUids[0] is string && data.blueUids[0].size() >= 1 && data.blueUids[0].size() <= 128)) &&
+        isNum(data.redScore) && data.redScore >= 0 && data.redScore <= 99 &&
+        isNum(data.blueScore) && data.blueScore >= 0 && data.blueScore <= 99 &&
+        isNum(data.matchStartedAtMs) && data.matchStartedAtMs >= 0 && data.matchStartedAtMs <= 9999999999999 &&
+        data.winnerTeam is string && data.winnerTeam in ['none', 'red', 'blue', 'draw'] &&
+        isNum(data.ballX) && data.ballX >= -2000 && data.ballX <= 2000 &&
+        isNum(data.ballY) && data.ballY >= -2000 && data.ballY <= 2000 &&
+        isNum(data.ballVx) && data.ballVx >= -100 && data.ballVx <= 100 &&
+        isNum(data.ballVy) && data.ballVy >= -100 && data.ballVy <= 100 &&
+        data.eventState is string && data.eventState in ['normal', 'out', 'corner', 'goal'] &&
+        data.eventTeam is string && data.eventTeam in ['none', 'red', 'blue'] &&
+        isNum(data.eventUntilMs) && data.eventUntilMs >= 0 && data.eventUntilMs <= 9999999999999 &&
+        data.lastTouchTeam is string && data.lastTouchTeam in ['none', 'red', 'blue'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: RoomPlayer
+    function isValidRoomPlayer(data) {
+      return data.keys().hasAll([
+          'playerId', 'roomId', 'nickname', 'jerseyNumber', 'team',
+          'x', 'y', 'vx', 'vy', 'kicking', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'playerId', 'roomId', 'nickname', 'jerseyNumber', 'team',
+          'x', 'y', 'vx', 'vy', 'kicking', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.playerId) &&
+        isValidId(data.roomId) &&
+        data.roomId.size() <= 64 &&
+        data.nickname is string && data.nickname.size() >= 1 && data.nickname.size() <= 24 &&
+        isNum(data.jerseyNumber) && data.jerseyNumber >= 1 && data.jerseyNumber <= 99 &&
+        data.team is string && data.team in ['red', 'blue'] &&
+        isNum(data.x) && data.x >= -2000 && data.x <= 2000 &&
+        isNum(data.y) && data.y >= -2000 && data.y <= 2000 &&
+        isNum(data.vx) && data.vx >= -50 && data.vx <= 50 &&
+        isNum(data.vy) && data.vy >= -50 && data.vy <= 50 &&
+        data.kicking is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // Collection: /lobbies/{lobbyId}
+    match /lobbies/{lobbyId} {
+      allow get: if isVerified() && isValidId(lobbyId);
+      allow list: if false;
+      allow create: if isVerified() &&
+        isValidId(lobbyId) &&
+        isValidLobbyDirectory(incoming()) &&
+        incoming().lobbyId == lobbyId &&
+        incoming().updatedAt == request.time;
+      allow update: if isVerified() &&
+        isValidId(lobbyId) &&
+        isValidLobbyDirectory(incoming()) &&
+        incoming().lobbyId == existing().lobbyId &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['roomIds', 'updatedBy', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // Collection: /rooms/{roomId}
+    match /rooms/{roomId} {
+      allow get: if isVerified() && isValidId(roomId);
+      allow list: if false;
+      allow create: if isVerified() &&
+        isValidId(roomId) &&
+        isValidMatchRoom(incoming()) &&
+        incoming().roomId == roomId &&
+        incoming().hostUid == request.auth.uid &&
+        incoming().status == 'waiting' &&
+        incoming().winnerTeam == 'none' &&
+        request.auth.uid in incoming().memberUids &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        existsAfter(/databases/$(database)/documents/rooms/$(roomId)/players/$(request.auth.uid));
+
+      allow update: if isVerified() &&
+        isValidId(roomId) &&
+        isValidMatchRoom(incoming()) &&
+        existing().status != 'finished' &&
+        incoming().roomId == existing().roomId &&
+        incoming().title == existing().title &&
+        incoming().hostUid == existing().hostUid &&
+        incoming().hostName == existing().hostName &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          // Action 1: Join, Leave, or Switch Team
+          (
+            existing().status in ['waiting', 'playing'] &&
+            incoming().status == existing().status &&
+            (request.auth.uid in incoming().memberUids || request.auth.uid in existing().memberUids) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['memberUids', 'redUids', 'blueUids', 'updatedAt'])
+          ) ||
+          // Action 2: Host Starts the Match
+          (
+            existing().status == 'waiting' &&
+            incoming().status == 'playing' &&
+            existing().hostUid == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'matchStartedAtMs',
+              'ballX', 'ballY', 'ballVx', 'ballVy',
+              'eventState', 'eventTeam', 'eventUntilMs', 'lastTouchTeam',
+              'updatedAt'
+            ])
+          ) ||
+          // Action 3: Active Match Physics, Ball Sync, Goal & Out-of-Bounds Updates
+          (
+            existing().status == 'playing' &&
+            incoming().status == 'playing' &&
+            request.auth.uid in existing().memberUids &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'redScore', 'blueScore',
+              'ballX', 'ballY', 'ballVx', 'ballVy',
+              'eventState', 'eventTeam', 'eventUntilMs', 'lastTouchTeam',
+              'updatedAt'
+            ])
+          ) ||
+          // Action 4: Conclude 5-Minute Match (Terminal Transition)
+          (
+            existing().status == 'playing' &&
+            incoming().status == 'finished' &&
+            request.auth.uid in existing().memberUids &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'winnerTeam',
+              'ballX', 'ballY', 'ballVx', 'ballVy',
+              'eventState', 'eventTeam', 'eventUntilMs',
+              'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isVerified() &&
+        isValidId(roomId) &&
+        (existing().hostUid == request.auth.uid || request.auth.uid in existing().memberUids || existing().status == 'finished');
+
+      // Subcollection: /rooms/{roomId}/players/{playerId}
+      match /players/{playerId} {
+        allow get: if isVerified() && isValidId(roomId) && isValidId(playerId) && isCurrentRoomMember(roomId);
+        allow list: if false;
+        allow create: if isVerified() &&
+          isValidId(roomId) &&
+          isValidId(playerId) &&
+          playerId == request.auth.uid &&
+          isValidRoomPlayer(incoming()) &&
+          incoming().playerId == playerId &&
+          incoming().roomId == roomId &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          isRoomMemberAfter(roomId);
+
+        allow update: if isVerified() &&
+          isValidId(roomId) &&
+          isValidId(playerId) &&
+          isValidRoomPlayer(incoming()) &&
+          incoming().playerId == existing().playerId &&
+          incoming().roomId == existing().roomId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          isCurrentRoomMember(roomId) &&
+          get(/databases/$(database)/documents/rooms/$(roomId)).data.status != 'finished' && (
+            // Action 1: Player updates own team, profile, or spawn in Lobby
+            (
+              playerId == request.auth.uid &&
+              get(/databases/$(database)/documents/rooms/$(roomId)).data.status == 'waiting' &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'team', 'nickname', 'jerseyNumber', 'x', 'y', 'vx', 'vy', 'kicking', 'updatedAt'
+              ])
+            ) ||
+            // Action 2: Player moves own disc OR Host resets player positions on Goal / Start / Out
+            (
+              (playerId == request.auth.uid || get(/databases/$(database)/documents/rooms/$(roomId)).data.hostUid == request.auth.uid) &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'x', 'y', 'vx', 'vy', 'kicking', 'updatedAt'
+              ])
+            )
+          );
+
+        allow delete: if isVerified() &&
+          isValidId(roomId) &&
+          isValidId(playerId) &&
+          playerId == request.auth.uid;
+      }
+    }
+  }
+}

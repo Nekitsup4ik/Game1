@@ -1,0 +1,271 @@
+{
+  "entities": {
+    "LobbyDirectory": {
+      "title": "LobbyDirectory",
+      "description": "Global directory of active HaxBall match room IDs",
+      "type": "object",
+      "properties": {
+        "lobbyId": {
+          "type": "string",
+          "description": "Identifier of the lobby directory document",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "roomIds": {
+          "type": "array",
+          "description": "Bounded list of up to 20 active match room IDs"
+        },
+        "updatedBy": {
+          "type": "string",
+          "description": "UID of the user who last updated the directory",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the last update"
+        }
+      },
+      "required": ["lobbyId", "roomIds", "updatedBy", "updatedAt"]
+    },
+    "MatchRoom": {
+      "title": "MatchRoom",
+      "description": "Multiplayer 2D HaxBall match room state, teams, score, timer, and ball physics",
+      "type": "object",
+      "properties": {
+        "roomId": {
+          "type": "string",
+          "description": "Unique room identifier",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "description": "Human-readable room name",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "hostUid": {
+          "type": "string",
+          "description": "UID of the room creator who can start the match",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "hostName": {
+          "type": "string",
+          "description": "Nickname of the room creator",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "status": {
+          "type": "string",
+          "description": "Current lifecycle status of the match room",
+          "enum": ["waiting", "playing", "finished"]
+        },
+        "memberUids": {
+          "type": "array",
+          "description": "Bounded list of up to 10 member UIDs currently in the room"
+        },
+        "redUids": {
+          "type": "array",
+          "description": "Bounded list of up to 5 member UIDs in the Red team"
+        },
+        "blueUids": {
+          "type": "array",
+          "description": "Bounded list of up to 5 member UIDs in the Blue team"
+        },
+        "redScore": {
+          "type": "integer",
+          "description": "Current goals scored by the Red team"
+        },
+        "blueScore": {
+          "type": "integer",
+          "description": "Current goals scored by the Blue team"
+        },
+        "matchStartedAtMs": {
+          "type": "integer",
+          "description": "Epoch timestamp in ms when the 5-minute match started"
+        },
+        "winnerTeam": {
+          "type": "string",
+          "description": "Winning team once status reaches finished",
+          "enum": ["none", "red", "blue", "draw"]
+        },
+        "ballX": {
+          "type": "number",
+          "description": "Ball X coordinate on the pitch"
+        },
+        "ballY": {
+          "type": "number",
+          "description": "Ball Y coordinate on the pitch"
+        },
+        "ballVx": {
+          "type": "number",
+          "description": "Ball X velocity component"
+        },
+        "ballVy": {
+          "type": "number",
+          "description": "Ball Y velocity component"
+        },
+        "eventState": {
+          "type": "string",
+          "description": "Active pitch state (normal play, out-of-bounds throw-in, corner kick, or goal delay)",
+          "enum": ["normal", "out", "corner", "goal"]
+        },
+        "eventTeam": {
+          "type": "string",
+          "description": "Team associated with the current goal or throw-in right",
+          "enum": ["none", "red", "blue"]
+        },
+        "eventUntilMs": {
+          "type": "integer",
+          "description": "Epoch timestamp in ms when the out/goal pause ends"
+        },
+        "lastTouchTeam": {
+          "type": "string",
+          "description": "Team that last touched the ball before going out",
+          "enum": ["none", "red", "blue"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of room creation"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last room update"
+        }
+      },
+      "required": [
+        "roomId",
+        "title",
+        "hostUid",
+        "hostName",
+        "status",
+        "memberUids",
+        "redUids",
+        "blueUids",
+        "redScore",
+        "blueScore",
+        "matchStartedAtMs",
+        "winnerTeam",
+        "ballX",
+        "ballY",
+        "ballVx",
+        "ballVy",
+        "eventState",
+        "eventTeam",
+        "eventUntilMs",
+        "lastTouchTeam",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "RoomPlayer": {
+      "title": "RoomPlayer",
+      "description": "Individual player state, jersey number, team assignment, and real-time canvas coordinates",
+      "type": "object",
+      "properties": {
+        "playerId": {
+          "type": "string",
+          "description": "Authenticated user UID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "roomId": {
+          "type": "string",
+          "description": "Parent match room ID",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "nickname": {
+          "type": "string",
+          "description": "Player display nickname rendered above the disc",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "jerseyNumber": {
+          "type": "integer",
+          "description": "Player jersey number (1-99) rendered in white inside the disc"
+        },
+        "team": {
+          "type": "string",
+          "description": "Assigned team color",
+          "enum": ["red", "blue"]
+        },
+        "x": {
+          "type": "number",
+          "description": "Player disc X coordinate on canvas"
+        },
+        "y": {
+          "type": "number",
+          "description": "Player disc Y coordinate on canvas"
+        },
+        "vx": {
+          "type": "number",
+          "description": "Player disc X velocity"
+        },
+        "vy": {
+          "type": "number",
+          "description": "Player disc Y velocity"
+        },
+        "kicking": {
+          "type": "boolean",
+          "description": "Whether the player is actively pressing kick"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when player joined the room"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last player sync"
+        }
+      },
+      "required": [
+        "playerId",
+        "roomId",
+        "nickname",
+        "jerseyNumber",
+        "team",
+        "x",
+        "y",
+        "vx",
+        "vy",
+        "kicking",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/lobbies/{lobbyId}": {
+      "schema": {
+        "$ref": "#/entities/LobbyDirectory"
+      },
+      "description": "Global directory of active HaxBall match room IDs"
+    },
+    "/rooms/{roomId}": {
+      "schema": {
+        "$ref": "#/entities/MatchRoom"
+      },
+      "description": "Match room state, score, timer, and ball physics"
+    },
+    "/rooms/{roomId}/players/{playerId}": {
+      "schema": {
+        "$ref": "#/entities/RoomPlayer"
+      },
+      "description": "Real-time player disc state inside a match room"
+    }
+  }
+}
