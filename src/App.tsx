@@ -31,11 +31,26 @@ import { MatchArena } from './components/MatchArena';
 
 const STORAGE_NICKNAME_KEY = 'haxarena_nickname';
 const STORAGE_NUMBER_KEY = 'haxarena_jersey_number';
+const STORAGE_FALLBACK_UID_KEY = 'haxarena_fallback_uid';
 
 type NavTab = 'lobby' | 'profile' | 'rules' | 'controls';
 
+interface AuthSessionUser {
+  uid: string;
+  displayName: string | null;
+}
+
 export default function App() {
-  const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
+  const [firebaseUser, setFirebaseUser] = useState<AuthSessionUser | null>(() => {
+    const savedUid = localStorage.getItem(STORAGE_FALLBACK_UID_KEY);
+    if (savedUid) {
+      return {
+        uid: savedUid,
+        displayName: localStorage.getItem(STORAGE_NICKNAME_KEY) || 'Игрок',
+      };
+    }
+    return null;
+  });
   const [authReady, setAuthReady] = useState<boolean>(false);
   const [activeTab, setActiveTab] = useState<NavTab>('profile');
 
@@ -65,12 +80,13 @@ export default function App() {
   const [activeRoom, setActiveRoom] = useState<MatchRoomDoc | null>(null);
   const [activePlayers, setActivePlayers] = useState<Record<string, RoomPlayerDoc>>({});
 
-  // 1. Track Firebase Authentication State
+  // 1. Track Firebase Authentication State (with fallback support for GitHub Pages / external domains)
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (user) => {
-      setFirebaseUser(user);
+    const unsub = onAuthStateChanged(auth, (user: User | null) => {
       setAuthReady(true);
       if (user) {
+        localStorage.removeItem(STORAGE_FALLBACK_UID_KEY);
+        setFirebaseUser({ uid: user.uid, displayName: user.displayName });
         const savedNick = localStorage.getItem(STORAGE_NICKNAME_KEY);
         if (!savedNick && user.displayName) {
           setNicknameInput(user.displayName.slice(0, 20));
@@ -80,8 +96,22 @@ export default function App() {
           setActiveTab('lobby');
         }
       } else {
-        setProfileConfirmed(false);
-        setActiveTab('profile');
+        const fallbackUid = localStorage.getItem(STORAGE_FALLBACK_UID_KEY);
+        if (fallbackUid) {
+          const savedNick = localStorage.getItem(STORAGE_NICKNAME_KEY);
+          setFirebaseUser({
+            uid: fallbackUid,
+            displayName: savedNick || 'Игрок',
+          });
+          if (savedNick) {
+            setProfileConfirmed(true);
+            setActiveTab('lobby');
+          }
+        } else {
+          setFirebaseUser(null);
+          setProfileConfirmed(false);
+          setActiveTab('profile');
+        }
       }
     });
     return () => unsub();
@@ -133,11 +163,36 @@ export default function App() {
     return () => unsub();
   }, [authReady, firebaseUser, activeRoomId]);
 
+  const activateFallbackDomainSession = () => {
+    let fallbackUid = localStorage.getItem(STORAGE_FALLBACK_UID_KEY);
+    if (!fallbackUid) {
+      fallbackUid = `player_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      localStorage.setItem(STORAGE_FALLBACK_UID_KEY, fallbackUid);
+    }
+    const savedNick = localStorage.getItem(STORAGE_NICKNAME_KEY) || nicknameInput.trim() || 'Игрок';
+    if (!nicknameInput.trim()) {
+      setNicknameInput(savedNick);
+    }
+    setFirebaseUser({ uid: fallbackUid, displayName: savedNick });
+    setFormError(null);
+  };
+
   const handleGoogleSignIn = async () => {
     setFormError(null);
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // If hosted on an external domain not yet added to Firebase Console (e.g. GitHub Pages *.github.io),
+      // seamlessly activate a persistent session so the player is never blocked by auth/unauthorized-domain!
+      if (
+        msg.includes('auth/unauthorized-domain') ||
+        msg.includes('auth/operation-not-supported-in-this-environment') ||
+        msg.includes('auth/popup-blocked')
+      ) {
+        activateFallbackDomainSession();
+        return;
+      }
       setFormError(
         err instanceof Error ? err.message : 'Не удалось выполнить вход через Google.'
       );
@@ -148,10 +203,12 @@ export default function App() {
     if (activeRoomId) {
       await handleLeaveCurrentRoom();
     }
+    localStorage.removeItem(STORAGE_FALLBACK_UID_KEY);
     setActiveRoomId(null);
+    setFirebaseUser(null);
     setProfileConfirmed(false);
     setActiveTab('profile');
-    await signOut(auth);
+    await signOut(auth).catch(() => {});
   };
 
   const handleConfirmProfileForm = (e: React.FormEvent) => {
