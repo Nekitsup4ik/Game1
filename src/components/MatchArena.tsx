@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { LogOut, RotateCcw, Shield, Trophy, Volume2, VolumeX } from 'lucide-react';
+import { LogOut, RotateCcw, Shield, Trophy, Volume2, VolumeX, Wifi } from 'lucide-react';
 import {
   BALL_DAMPING,
   BALL_MAX_SPEED,
@@ -41,8 +41,11 @@ import {
 } from '../types/game';
 import {
   finishMatchRoom,
+  getLiveMatchSnapshot,
+  getLocalPingMs,
   registerGoalInNet,
   resetFormationAfterGoalDelay,
+  sendRoomHeartbeat,
   syncLocalPlayerDisc,
   syncRoomGameplayState,
 } from '../services/roomService';
@@ -570,120 +573,28 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   const lastBallSyncMsRef = useRef<number>(0);
   const lastLocalBallTouchMsRef = useRef<number>(0);
   const remoteBallGraceUntilMsRef = useRef<number>(0);
+  const lastAppliedBallSeqRef = useRef<number>(room.seq || 0);
   const lastHandledEventUntilRef = useRef<number>(0);
   const finishTriggeredRef = useRef<boolean>(false);
+  const [localPing, setLocalPing] = useState<number>(() => getLocalPingMs());
 
   useEffect(() => {
     soundEnabledRef.current = soundEnabled;
   }, [soundEnabled]);
 
-  // Keep refs updated with incoming snapshots while protecting active 3-second post-goal cooldown
+  // Keep room alive with a 3.5-second heartbeat & update local ping HUD
   useEffect(() => {
-    const now = Date.now();
-    const prevEventState = roomRef.current.eventState;
-    const p = physRef.current;
+    sendRoomHeartbeat(room.roomId, profile.uid).catch(() => {});
+    const hbId = window.setInterval(() => {
+      setLocalPing(getLocalPingMs());
+      sendRoomHeartbeat(roomRef.current.roomId, profile.uid).catch(() => {});
+    }, 3500);
+    return () => window.clearInterval(hbId);
+  }, [room.roomId, profile.uid]);
 
-    // If local physics is currently inside the 3-second post-goal celebration window,
-    // do NOT allow a slightly older in-flight network poll to prematurely reset to formation!
-    if (p.eventState === 'goal' && now < p.eventUntilMs - 100) {
-      roomRef.current = {
-        ...room,
-        redScore: Math.max(roomRef.current.redScore, room.redScore),
-        blueScore: Math.max(roomRef.current.blueScore, room.blueScore),
-        eventState: 'goal',
-        eventTeam: p.eventTeam,
-        eventUntilMs: p.eventUntilMs,
-      };
-      return;
-    }
-
+  useEffect(() => {
     roomRef.current = room;
-
-    // When a new goal, out, or corner event arrives from network
-    if (
-      room.eventState !== 'normal' &&
-      room.eventUntilMs !== lastHandledEventUntilRef.current &&
-      room.eventUntilMs > now - 500
-    ) {
-      lastHandledEventUntilRef.current = room.eventUntilMs;
-      p.eventState = room.eventState;
-      p.eventTeam = room.eventTeam;
-      p.eventUntilMs = room.eventUntilMs;
-      p.ballX = room.ballX;
-      p.ballY = room.ballY;
-      p.ballVx = room.ballVx;
-      p.ballVy = room.ballVy;
-
-      if (room.eventState === 'goal') {
-        p.awaitingSetPieceTouch = false;
-        p.isCornerSetPiece = false;
-        if (soundEnabledRef.current && prevEventState !== 'goal') {
-          soundFX.playGoalFanfare();
-        }
-      } else if (room.eventState === 'out' || room.eventState === 'corner') {
-        p.awaitingSetPieceTouch = true;
-        p.isCornerSetPiece = room.eventState === 'corner';
-        p.setPieceExpireMs = room.eventUntilMs + 4500;
-        if (soundEnabledRef.current && prevEventState !== room.eventState) {
-          soundFX.playOutWhistle();
-        }
-      }
-    } else if (
-      prevEventState === 'goal' &&
-      room.eventState === 'normal' &&
-      p.eventState === 'goal' &&
-      now >= p.eventUntilMs - 100
-    ) {
-      // Network triggered 3-second post-goal reset to formation after full 3s cooldown
-      p.eventState = 'normal';
-      p.eventTeam = 'none';
-      p.eventUntilMs = 0;
-      p.ballX = FIELD_CENTER_X;
-      p.ballY = FIELD_CENTER_Y;
-      p.ballVx = 0;
-      p.ballVy = 0;
-      const team: TeamColor = room.blueUids.includes(profile.uid) ? 'blue' : 'red';
-      const idx = Math.max(
-        0,
-        team === 'red'
-          ? room.redUids.indexOf(profile.uid)
-          : room.blueUids.indexOf(profile.uid)
-      );
-      const spawn = getTeamSpawnPosition(team, idx);
-      p.myX = spawn.x;
-      p.myY = spawn.y;
-      p.myVx = 0;
-      p.myVy = 0;
-    } else {
-      const incomingActorUid = (room as MatchRoomDoc & { actorUid?: string }).actorUid;
-      const isFromOtherPlayer = Boolean(
-        incomingActorUid && incomingActorUid !== profile.uid
-      );
-      const recentlyTouchedLocally = now - lastLocalBallTouchMsRef.current < 150;
-
-      if (isFromOtherPlayer) {
-        remoteBallGraceUntilMsRef.current = now + 160;
-      }
-
-      if (
-        !recentlyTouchedLocally &&
-        (room.hostUid !== profile.uid || isFromOtherPlayer)
-      ) {
-        // Smoothly reconcile ball coordinates and velocity across all clients
-        const dist = Math.hypot(room.ballX - p.ballX, room.ballY - p.ballY);
-        if (dist > 44 || room.eventState !== 'normal' || isFromOtherPlayer) {
-          p.ballX = room.ballX;
-          p.ballY = room.ballY;
-        } else {
-          p.ballX += (room.ballX - p.ballX) * 0.42;
-          p.ballY += (room.ballY - p.ballY) * 0.42;
-        }
-        p.ballVx = room.ballVx;
-        p.ballVy = room.ballVy;
-        p.lastTouchTeam = room.lastTouchTeam;
-      }
-    }
-  }, [room, profile.uid]);
+  }, [room]);
 
   useEffect(() => {
     playersRef.current = players;
@@ -779,9 +690,109 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       const dtScale = rawDtMs / (1000 / 60);
 
       const now = Date.now();
+      const p = physRef.current;
+
+      // Direct 60 FPS Zero-Lag Snapshot Pull (Bypasses React state re-renders!)
+      const liveSnap = getLiveMatchSnapshot(roomRef.current.roomId);
+      if (liveSnap.room) {
+        const netRoom = liveSnap.room;
+        const prevEventState = roomRef.current.eventState;
+
+        // Protect active 3-second post-goal window from stale packets
+        if (p.eventState === 'goal' && now < p.eventUntilMs - 100) {
+          roomRef.current = {
+            ...netRoom,
+            redScore: Math.max(roomRef.current.redScore, netRoom.redScore),
+            blueScore: Math.max(roomRef.current.blueScore, netRoom.blueScore),
+            eventState: 'goal',
+            eventTeam: p.eventTeam,
+            eventUntilMs: p.eventUntilMs,
+          };
+        } else {
+          roomRef.current = {
+            ...netRoom,
+            redScore: Math.max(roomRef.current.redScore, netRoom.redScore),
+            blueScore: Math.max(roomRef.current.blueScore, netRoom.blueScore),
+          };
+
+          // Handle new goal, out, or corner event from network
+          if (
+            netRoom.eventState !== 'normal' &&
+            netRoom.eventUntilMs !== lastHandledEventUntilRef.current &&
+            netRoom.eventUntilMs > now - 500
+          ) {
+            lastHandledEventUntilRef.current = netRoom.eventUntilMs;
+            lastAppliedBallSeqRef.current = netRoom.seq || now;
+            p.eventState = netRoom.eventState;
+            p.eventTeam = netRoom.eventTeam;
+            p.eventUntilMs = netRoom.eventUntilMs;
+            p.ballX = netRoom.ballX;
+            p.ballY = netRoom.ballY;
+            p.ballVx = netRoom.ballVx;
+            p.ballVy = netRoom.ballVy;
+
+            if (netRoom.eventState === 'goal') {
+              p.awaitingSetPieceTouch = false;
+              p.isCornerSetPiece = false;
+              if (soundEnabledRef.current && prevEventState !== 'goal') {
+                soundFX.playGoalFanfare();
+              }
+            } else if (
+              netRoom.eventState === 'out' ||
+              netRoom.eventState === 'corner'
+            ) {
+              p.awaitingSetPieceTouch = true;
+              p.isCornerSetPiece = netRoom.eventState === 'corner';
+              p.setPieceExpireMs = netRoom.eventUntilMs + 4500;
+              if (soundEnabledRef.current && prevEventState !== netRoom.eventState) {
+                soundFX.playOutWhistle();
+              }
+            }
+          } else if (
+            (netRoom.seq || 0) > lastAppliedBallSeqRef.current &&
+            netRoom.eventState === 'normal'
+          ) {
+            // Only apply ball position/velocity when a genuinely NEW ball packet arrives!
+            lastAppliedBallSeqRef.current = netRoom.seq || now;
+            const isFromOtherPlayer = Boolean(
+              netRoom.actorUid && netRoom.actorUid !== profile.uid
+            );
+            const recentlyTouchedLocally =
+              now - lastLocalBallTouchMsRef.current < 130;
+
+            if (isFromOtherPlayer) {
+              remoteBallGraceUntilMsRef.current = now + 160;
+            }
+
+            if (
+              !recentlyTouchedLocally &&
+              (netRoom.hostUid !== profile.uid || isFromOtherPlayer)
+            ) {
+              const dist = Math.hypot(
+                netRoom.ballX - p.ballX,
+                netRoom.ballY - p.ballY
+              );
+              if (dist > 55 || isFromOtherPlayer) {
+                p.ballX = netRoom.ballX;
+                p.ballY = netRoom.ballY;
+              } else {
+                p.ballX += (netRoom.ballX - p.ballX) * 0.36;
+                p.ballY += (netRoom.ballY - p.ballY) * 0.36;
+              }
+              p.ballVx = netRoom.ballVx;
+              p.ballVy = netRoom.ballVy;
+              p.lastTouchTeam = netRoom.lastTouchTeam;
+            }
+          }
+        }
+      }
+
+      if (Object.keys(liveSnap.players).length > 0) {
+        playersRef.current = { ...playersRef.current, ...liveSnap.players };
+      }
+
       const currentRoom = roomRef.current;
       const allPlayers = playersRef.current;
-      const p = physRef.current;
       const isMatchFinished =
         currentRoom.status === 'finished' ||
         (currentRoom.matchStartedAtMs > 0 &&
@@ -933,20 +944,24 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         p.myKicking = false;
       }
 
-      // Interpolate remote players smoothly at 60fps
+      // Dead-Reckoning + Smooth 60fps Interpolation for Remote Players
       Object.values(allPlayers).forEach((rp) => {
         if (rp.playerId === profile.uid) return;
         const prev = p.remoteRenderPos[rp.playerId];
         if (!prev) {
           p.remoteRenderPos[rp.playerId] = { x: rp.x, y: rp.y };
         } else {
+          // Extrapolate with remote player's velocity between packets, then blend smoothly
+          prev.x += (rp.vx || 0) * dtScale * 0.48;
+          prev.y += (rp.vy || 0) * dtScale * 0.48;
           const d = Math.hypot(rp.x - prev.x, rp.y - prev.y);
-          if (d > 90) {
+          if (d > 110) {
             prev.x = rp.x;
             prev.y = rp.y;
           } else {
-            prev.x += (rp.x - prev.x) * 0.32;
-            prev.y += (rp.y - prev.y) * 0.32;
+            const blend = Math.min(0.65, 0.28 * dtScale);
+            prev.x += (rp.x - prev.x) * blend;
+            prev.y += (rp.y - prev.y) * blend;
           }
         }
       });
@@ -1548,8 +1563,33 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           </div>
         </div>
 
-        {/* Utility Controls (Sound + Leave Room) */}
-        <div className="flex items-center justify-end gap-2 min-w-[140px] md:min-w-[200px]">
+        {/* Utility Controls (Live Ping + Sound + Leave Room) */}
+        <div className="flex items-center justify-end gap-2 min-w-[160px] md:min-w-[230px]">
+          <div
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-xs font-mono-tabular"
+            title="Ваш текущий сетевой пинг"
+          >
+            <Wifi
+              className={`w-3.5 h-3.5 ${
+                localPing < 55
+                  ? 'text-emerald-400'
+                  : localPing < 110
+                    ? 'text-amber-400'
+                    : 'text-red-400'
+              }`}
+            />
+            <span
+              className={`font-semibold ${
+                localPing < 55
+                  ? 'text-emerald-300'
+                  : localPing < 110
+                    ? 'text-amber-300'
+                    : 'text-red-300'
+              }`}
+            >
+              {localPing} мс
+            </span>
+          </div>
           <button
             type="button"
             onClick={() => setSoundEnabled((prev) => !prev)}
@@ -1619,26 +1659,60 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         )}
       </div>
 
-      {/* Bottom Controls Hint Bar */}
-      <div className="w-full max-w-[min(98vw,calc((100vh-5.75rem)*1400/760))] mt-1.5 flex flex-wrap items-center justify-between gap-3 px-4 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800/80 text-xs text-slate-400 shrink-0">
-        <div className="flex items-center gap-4">
+      {/* Bottom Controls & Per-Player Live Ping Bar */}
+      <div className="w-full max-w-[min(98vw,calc((100vh-5.75rem)*1400/760))] mt-1.5 flex flex-wrap items-center justify-between gap-2 px-4 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800/80 text-xs text-slate-400 shrink-0">
+        <div className="flex items-center gap-3 flex-wrap">
           <span>
-            Движение фишки:{' '}
-            <strong className="text-slate-200 font-mono-tabular">WASD</strong> или{' '}
-            <strong className="text-slate-200 font-mono-tabular">Стрелочки</strong>
+            Движение:{' '}
+            <strong className="text-slate-200 font-mono-tabular">WASD</strong> /{' '}
+            <strong className="text-slate-200 font-mono-tabular">Стрелки</strong>
           </span>
           <span aria-hidden="true">·</span>
           <span>
-            Удар / Подача углового:{' '}
+            Удар:{' '}
             <strong className="text-slate-200 font-mono-tabular">Пробел</strong> /{' '}
             <strong className="text-slate-200 font-mono-tabular">X</strong>
           </span>
         </div>
-        <div className="flex items-center gap-3 text-slate-400">
-          <Shield className="w-3.5 h-3.5 text-emerald-400" />
-          <span>
-            Формат 4×4 · Красные ({room.redUids.length}/4) · Синие ({room.blueUids.length}/4)
-          </span>
+
+        {/* Live Ping List for All Active Players in the Match */}
+        <div className="flex items-center gap-2 flex-wrap">
+          {Object.values(players).map((pl) => {
+            const pVal =
+              pl.playerId === profile.uid
+                ? localPing
+                : pl.pingMs ?? 24;
+            const pingColor =
+              pVal < 55
+                ? 'text-emerald-400'
+                : pVal < 110
+                  ? 'text-amber-400'
+                  : 'text-red-400';
+            return (
+              <div
+                key={pl.playerId}
+                className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-950/90 border border-slate-800 text-[11px]"
+              >
+                <span
+                  className={`w-2 h-2 rounded-full ${
+                    pl.team === 'red' ? 'bg-red-500' : 'bg-blue-500'
+                  }`}
+                />
+                <span className="text-slate-200 font-medium truncate max-w-[90px]">
+                  {pl.nickname}
+                </span>
+                <span className={`font-mono-tabular font-semibold ${pingColor}`}>
+                  {pVal} мс
+                </span>
+              </div>
+            );
+          })}
+          <div className="hidden sm:flex items-center gap-1.5 text-slate-400 pl-1">
+            <Shield className="w-3.5 h-3.5 text-emerald-400" />
+            <span>
+              4×4 ({room.redUids.length} vs {room.blueUids.length})
+            </span>
+          </div>
         </div>
       </div>
     </div>
@@ -1763,6 +1837,7 @@ function drawArena(
     x: number;
     y: number;
     kicking: boolean;
+    pingMs: number;
     isMe: boolean;
   }> = [];
 
@@ -1778,6 +1853,7 @@ function drawArena(
       x: pos.x,
       y: pos.y,
       kicking: rp.kicking,
+      pingMs: rp.pingMs ?? 24,
       isMe: false,
     });
   });
@@ -1792,6 +1868,7 @@ function drawArena(
     x: phys.myX,
     y: phys.myY,
     kicking: phys.myKicking,
+    pingMs: getLocalPingMs(),
     isMe: true,
   });
 
@@ -1833,7 +1910,7 @@ function drawArena(
     ctx.textBaseline = 'middle';
     ctx.fillText(String(pl.jerseyNumber), pl.x, pl.y + 0.5);
 
-    // Player Nickname (Мелким белым текстом прямо НАД круглым персонажем игрока)
+    // Player Nickname + Ping (Мелким белым текстом прямо НАД круглым персонажем игрока)
     ctx.font = '600 11.5px "Plus Jakarta Sans", sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'bottom';
@@ -1844,6 +1921,18 @@ function drawArena(
     ctx.strokeText(pl.nickname, pl.x, labelY);
     ctx.fillStyle = '#ffffff';
     ctx.fillText(pl.nickname, pl.x, labelY);
+
+    // Compact Ping label below player disc
+    const pingText = `${pl.pingMs} мс`;
+    ctx.font = '600 9.5px "JetBrains Mono", monospace';
+    ctx.textBaseline = 'top';
+    const pingY = pl.y + PLAYER_RADIUS + 5;
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = 'rgba(2, 6, 23, 0.85)';
+    ctx.strokeText(pingText, pl.x, pingY);
+    ctx.fillStyle =
+      pl.pingMs < 55 ? '#4ade80' : pl.pingMs < 110 ? '#fbbf24' : '#f87171';
+    ctx.fillText(pingText, pl.x, pingY);
   }
 
   // 7. Draw Smaller Soccer Ball (⚽ Emoji + Crisp Outer Layer that turns GREEN during the 2.5s Powershot window after 5s hold in gray circle)

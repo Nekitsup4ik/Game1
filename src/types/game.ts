@@ -38,6 +38,9 @@ export interface MatchRoomDoc {
   eventTeam: EventTeam;
   eventUntilMs: number;
   lastTouchTeam: EventTeam;
+  seq?: number;
+  actorUid?: string;
+  heartbeatAtMs?: number;
   createdAt?: unknown;
   updatedAt?: unknown;
 }
@@ -53,6 +56,8 @@ export interface RoomPlayerDoc {
   vx: number;
   vy: number;
   kicking: boolean;
+  pingMs?: number;
+  seq?: number;
   createdAt?: unknown;
   updatedAt?: unknown;
 }

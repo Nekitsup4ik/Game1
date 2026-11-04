@@ -5,6 +5,7 @@ import {
   onSnapshot,
   serverTimestamp,
   setDoc,
+  Timestamp,
   updateDoc,
   writeBatch,
 } from 'firebase/firestore';
@@ -38,24 +39,61 @@ import {
   SyncedRoomRecord,
 } from './realtimeWsBroker';
 
-const LOCAL_ROOMS_KEY = 'haxarena_fallback_rooms_v1';
-const LOCAL_PLAYERS_KEY = 'haxarena_fallback_players_v1';
-const REMOTE_API_ORIGIN = 'https://ais-pre-j66jesv2sgfs4qsfj6vovy-801904163984.us-east1.run.app';
+// Clear legacy localStorage keys that previously caused ghost rooms & JSON freeze
+if (typeof window !== 'undefined') {
+  try {
+    localStorage.removeItem('haxarena_fallback_rooms_v1');
+    localStorage.removeItem('haxarena_fallback_players_v1');
+  } catch {
+    // ignore
+  }
+}
+
+// Fast in-memory store (zero JSON.parse/stringify overhead on main thread!)
+const memoryRooms = new Map<string, SyncedRoomRecord>();
+const memoryPlayers = new Map<string, Record<string, SyncedPlayerRecord>>();
 
 // Start global WebSocket multiplayer broker immediately
 realtimeWsBroker.start();
 
+// Only use local relative /api/mp/* when running on local dev / AI Studio server.
+// Never spam cross-origin fetch requests from GitHub Pages on 25Hz ticks!
+const isLocalApiHost =
+  typeof window !== 'undefined' &&
+  (window.location.hostname.endsWith('.run.app') ||
+    window.location.hostname === 'localhost' ||
+    window.location.hostname === '127.0.0.1');
+
+let apiReachable = isLocalApiHost;
+
 const bc =
   typeof window !== 'undefined' && 'BroadcastChannel' in window
-    ? new BroadcastChannel('haxarena_mp_channel')
+    ? new BroadcastChannel('haxarena_mp_fast_v3')
     : null;
 
-function notifyPeers(roomId?: string) {
-  try {
-    bc?.postMessage({ type: 'sync', roomId, ts: Date.now() });
-  } catch {
-    // ignore
-  }
+if (bc) {
+  bc.addEventListener('message', (ev: MessageEvent) => {
+    const data = ev.data;
+    if (!data) return;
+    if (data.type === 'room' && data.room) {
+      const r = data.room as SyncedRoomRecord;
+      const prev = memoryRooms.get(r.roomId);
+      if (!prev || (r.seq || r.updatedAtMs || 0) >= (prev.seq || prev.updatedAtMs || 0)) {
+        memoryRooms.set(r.roomId, r);
+      }
+    } else if (data.type === 'player' && data.player) {
+      const p = data.player as SyncedPlayerRecord;
+      const map = memoryPlayers.get(p.roomId) || {};
+      const prev = map[p.playerId];
+      if (!prev || (p.seq || p.updatedAtMs || 0) >= (prev.seq || prev.updatedAtMs || 0)) {
+        map[p.playerId] = p;
+        memoryPlayers.set(p.roomId, map);
+      }
+    } else if (data.type === 'delete_room' && data.roomId) {
+      memoryRooms.delete(data.roomId);
+      memoryPlayers.delete(data.roomId);
+    }
+  });
 }
 
 function clamp(val: number, min: number, max: number): number {
@@ -80,79 +118,97 @@ function sanitizeTitle(raw: string): string {
   return cleaned.length > 0 ? cleaned : 'Матч HaxArena';
 }
 
-function loadLocalRooms(): Record<string, SyncedRoomRecord> {
-  try {
-    const raw = localStorage.getItem(LOCAL_ROOMS_KEY);
-    return raw ? JSON.parse(raw) : {};
-  } catch {
-    return {};
+function extractTimestampMs(val: unknown): number {
+  if (!val) return 0;
+  if (typeof val === 'number') return val;
+  if (val instanceof Timestamp) return val.toMillis();
+  if (typeof (val as { toMillis?: () => number }).toMillis === 'function') {
+    return (val as { toMillis: () => number }).toMillis();
   }
-}
-
-function saveLocalRooms(rooms: Record<string, SyncedRoomRecord>) {
-  try {
-    localStorage.setItem(LOCAL_ROOMS_KEY, JSON.stringify(rooms));
-  } catch {
-    // ignore
+  if (typeof (val as { seconds?: number }).seconds === 'number') {
+    return (val as { seconds: number }).seconds * 1000;
   }
-}
-
-function loadLocalPlayers(): Record<string, Record<string, SyncedPlayerRecord>> {
-  try {
-    const raw = localStorage.getItem(LOCAL_PLAYERS_KEY);
-    return raw ? JSON.parse(raw) : {};
-  } catch {
-    return {};
-  }
-}
-
-function saveLocalPlayers(
-  players: Record<string, Record<string, SyncedPlayerRecord>>
-) {
-  try {
-    localStorage.setItem(LOCAL_PLAYERS_KEY, JSON.stringify(players));
-  } catch {
-    // ignore
-  }
-}
-
-function getApiBaseUrls(): string[] {
-  if (typeof window === 'undefined') return [''];
-  const host = window.location.hostname;
-  if (host.endsWith('.run.app') || host === 'localhost' || host === '127.0.0.1') {
-    return [''];
-  }
-  // When running on GitHub Pages or another static host, try remote backend if reachable
-  return [REMOTE_API_ORIGIN];
+  return 0;
 }
 
 async function fetchApiJson<T>(path: string, init?: RequestInit): Promise<T | null> {
-  for (const base of getApiBaseUrls()) {
-    try {
-      const controller = new AbortController();
-      const timeout = window.setTimeout(() => controller.abort(), 1800);
-      const res = await fetch(`${base}${path}`, {
-        ...init,
-        signal: controller.signal,
-      });
-      window.clearTimeout(timeout);
-      const contentType = res.headers.get('content-type') || '';
-      if (res.ok && contentType.includes('application/json')) {
-        return (await res.json()) as T;
-      }
-    } catch {
-      // ignore and fall through
+  if (!apiReachable) return null;
+  const t0 = performance.now();
+  try {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 1400);
+    const res = await fetch(path, {
+      ...init,
+      signal: controller.signal,
+    });
+    window.clearTimeout(timeout);
+    const contentType = res.headers.get('content-type') || '';
+    if (res.ok && contentType.includes('application/json')) {
+      const rtt = performance.now() - t0;
+      realtimeWsBroker.updateMeasuredPing(rtt);
+      return (await res.json()) as T;
     }
+    if (res.status === 404) {
+      apiReachable = false;
+    }
+  } catch {
+    // ignore
   }
   return null;
 }
 
 async function postApiJson<T>(path: string, body: unknown): Promise<T | null> {
+  if (!apiReachable) return null;
   return fetchApiJson<T>(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
+}
+
+export function getLocalPingMs(): number {
+  return realtimeWsBroker.getLocalPingMs();
+}
+
+/**
+ * Direct 60 FPS Zero-Allocation Snapshot Reader for MatchArena.tsx
+ * Bypasses React state re-renders completely during active gameplay!
+ */
+export function getLiveMatchSnapshot(roomId: string): {
+  room: SyncedRoomRecord | null;
+  players: Record<string, SyncedPlayerRecord>;
+} {
+  const memRoom = memoryRooms.get(roomId);
+  const wsRoom = realtimeWsBroker.getRoom(roomId);
+
+  let bestRoom: SyncedRoomRecord | null = memRoom || wsRoom || null;
+  if (memRoom && wsRoom) {
+    bestRoom =
+      (wsRoom.seq || wsRoom.updatedAtMs || 0) >=
+      (memRoom.seq || memRoom.updatedAtMs || 0)
+        ? wsRoom
+        : memRoom;
+    if (memRoom.redScore > bestRoom.redScore) bestRoom.redScore = memRoom.redScore;
+    if (memRoom.blueScore > bestRoom.blueScore) bestRoom.blueScore = memRoom.blueScore;
+    if (wsRoom.redScore > bestRoom.redScore) bestRoom.redScore = wsRoom.redScore;
+    if (wsRoom.blueScore > bestRoom.blueScore) bestRoom.blueScore = wsRoom.blueScore;
+  }
+
+  const memP = memoryPlayers.get(roomId) || {};
+  const wsP = realtimeWsBroker.getRoomPlayers(roomId);
+  const mergedPlayers: Record<string, SyncedPlayerRecord> = { ...memP };
+
+  for (const [uid, pDoc] of Object.entries(wsP)) {
+    const prev = mergedPlayers[uid];
+    if (
+      !prev ||
+      (pDoc.seq || pDoc.updatedAtMs || 0) >= (prev.seq || prev.updatedAtMs || 0)
+    ) {
+      mergedPlayers[uid] = pDoc;
+    }
+  }
+
+  return { room: bestRoom, players: mergedPlayers };
 }
 
 function toFirestoreRoomPayload(room: MatchRoomDoc) {
@@ -214,7 +270,7 @@ async function addRoomIdToFirestoreLobby(roomId: string, uid: string): Promise<v
       const nextIds = [
         roomId,
         ...existingIds.filter((id) => id !== roomId),
-      ].slice(0, 20);
+      ].slice(0, 12);
       await updateDoc(lobbyRef, {
         roomIds: nextIds,
         updatedBy: safeUid,
@@ -235,7 +291,7 @@ async function removeRoomIdFromFirestoreLobby(roomId: string, uid: string): Prom
     const data = snap.data() as LobbyDirectoryDoc;
     const existingIds = Array.isArray(data.roomIds) ? data.roomIds : [];
     if (!existingIds.includes(roomId)) return;
-    const nextIds = existingIds.filter((id) => id !== roomId).slice(0, 20);
+    const nextIds = existingIds.filter((id) => id !== roomId).slice(0, 12);
     await updateDoc(lobbyRef, {
       roomIds: nextIds,
       updatedBy: sanitizeId(uid),
@@ -250,49 +306,43 @@ export function subscribeToLobbyRooms(
   onUpdate: (rooms: MatchRoomDoc[]) => void
 ): () => void {
   let cancelled = false;
-  let firestoreRooms: MatchRoomDoc[] = [];
-  let apiRooms: MatchRoomDoc[] = [];
+  let firestoreRooms: SyncedRoomRecord[] = [];
+  let apiRooms: SyncedRoomRecord[] = [];
 
   const mergeAndEmit = () => {
     if (cancelled) return;
+    const now = Date.now();
     const mergedMap = new Map<string, SyncedRoomRecord>();
 
-    // 1. Local storage rooms
-    for (const r of Object.values(loadLocalRooms())) {
-      if (r.status !== 'finished' && r.memberUids.length > 0) {
+    // Clean stale rooms from memory (> 16 seconds without heartbeat)
+    for (const [id, r] of memoryRooms.entries()) {
+      const hb = r.heartbeatAtMs || r.updatedAtMs || 0;
+      if (r.status === 'finished' || r.memberUids.length === 0 || now - hb > 16000) {
+        memoryRooms.delete(id);
+        memoryPlayers.delete(id);
+      } else {
+        mergedMap.set(id, r);
+      }
+    }
+
+    for (const r of firestoreRooms) {
+      const hb = r.heartbeatAtMs || r.updatedAtMs || 0;
+      if (r.status !== 'finished' && r.memberUids.length > 0 && now - hb <= 20000) {
         mergedMap.set(r.roomId, r);
       }
     }
 
-    // 2. Firestore rooms
-    for (const r of firestoreRooms) {
-      if (r.status !== 'finished' && r.memberUids.length > 0) {
-        const prev = mergedMap.get(r.roomId);
-        const rUp = (r as SyncedRoomRecord).updatedAtMs || Date.now();
-        if (!prev || rUp >= (prev.updatedAtMs || 0)) {
-          mergedMap.set(r.roomId, { ...r, updatedAtMs: rUp });
-        }
-      }
-    }
-
-    // 3. Express API rooms
     for (const r of apiRooms) {
-      if (r.status !== 'finished' && r.memberUids.length > 0) {
-        const prev = mergedMap.get(r.roomId);
-        const rUp = (r as SyncedRoomRecord).updatedAtMs || Date.now();
-        if (!prev || rUp >= (prev.updatedAtMs || 0)) {
-          mergedMap.set(r.roomId, { ...r, updatedAtMs: rUp });
-        }
+      const hb = r.heartbeatAtMs || r.updatedAtMs || now;
+      if (r.status !== 'finished' && r.memberUids.length > 0 && now - hb <= 16000) {
+        mergedMap.set(r.roomId, { ...r, updatedAtMs: hb, heartbeatAtMs: hb });
       }
     }
 
-    // 4. Real-time WebSocket Broker rooms (works across all browsers & GitHub Pages!)
     for (const r of realtimeWsBroker.getActiveLobbyRooms()) {
-      if (r.status !== 'finished' && r.memberUids.length > 0) {
-        const prev = mergedMap.get(r.roomId);
-        if (!prev || (r.updatedAtMs || 0) >= (prev.updatedAtMs || 0) - 500) {
-          mergedMap.set(r.roomId, r);
-        }
+      const hb = r.heartbeatAtMs || r.updatedAtMs || 0;
+      if (r.status !== 'finished' && r.memberUids.length > 0 && now - hb <= 16000) {
+        mergedMap.set(r.roomId, r);
       }
     }
 
@@ -302,12 +352,11 @@ export function subscribeToLobbyRooms(
     onUpdate(sorted);
   };
 
-  // Subscribe to WebSocket Broker updates
   const unsubWs = realtimeWsBroker.subscribe(() => {
     mergeAndEmit();
   });
 
-  // Subscribe to Google Firebase Firestore /lobbies/main
+  // Firestore listener for /lobbies/main (strictly checks actual Firestore updatedAt timestamp!)
   let unsubFirestore: (() => void) | null = null;
   if (!isFirestoreQuotaExceeded) {
     const lobbyRef = doc(db, 'lobbies', 'main');
@@ -321,26 +370,54 @@ export function subscribeToLobbyRooms(
           return;
         }
         const data = snap.data() as LobbyDirectoryDoc;
-        const ids = Array.isArray(data.roomIds) ? data.roomIds.slice(0, 15) : [];
-        const loaded: MatchRoomDoc[] = [];
+        const ids = Array.isArray(data.roomIds) ? data.roomIds.slice(0, 10) : [];
+        const loaded: SyncedRoomRecord[] = [];
+        const staleIds: string[] = [];
+        const now = Date.now();
+
         for (const id of ids) {
           if (isFirestoreQuotaExceeded) break;
           try {
             const rSnap = await getDoc(doc(db, 'rooms', id));
             if (rSnap.exists()) {
               const rData = rSnap.data() as MatchRoomDoc;
-              if (rData.status !== 'finished' && rData.memberUids?.length > 0) {
-                loaded.push(rData);
-                realtimeWsBroker.publishRoom(
-                  { ...rData, updatedAtMs: Date.now() },
-                  true
-                );
+              const docUpdatedMs = extractTimestampMs(rData.updatedAt) || extractTimestampMs(rData.createdAt);
+              // CRITICAL FIX: Never resurrect old Firestore rooms! If older than 20s, mark stale and delete!
+              if (
+                rData.status !== 'finished' &&
+                rData.memberUids?.length > 0 &&
+                docUpdatedMs > 0 &&
+                now - docUpdatedMs <= 20000
+              ) {
+                loaded.push({
+                  ...rData,
+                  updatedAtMs: docUpdatedMs,
+                  heartbeatAtMs: docUpdatedMs,
+                });
+              } else {
+                staleIds.push(id);
               }
+            } else {
+              staleIds.push(id);
             }
           } catch (err) {
             handleFirestoreError(err, OperationType.GET, `rooms/${id}`);
           }
         }
+
+        // Clean up ghost room IDs from /lobbies/main automatically
+        if (staleIds.length > 0 && !isFirestoreQuotaExceeded) {
+          const validIds = ids.filter((id) => !staleIds.includes(id));
+          updateDoc(lobbyRef, {
+            roomIds: validIds,
+            updatedBy: 'system_cleaner',
+            updatedAt: serverTimestamp(),
+          }).catch(() => {});
+          for (const sId of staleIds) {
+            deleteDoc(doc(db, 'rooms', sId)).catch(() => {});
+          }
+        }
+
         firestoreRooms = loaded;
         mergeAndEmit();
       },
@@ -350,10 +427,9 @@ export function subscribeToLobbyRooms(
     );
   }
 
-  // Poll Express API if available
   const fetchLobbyApi = async () => {
     if (cancelled) return;
-    const data = await fetchApiJson<{ rooms?: MatchRoomDoc[] }>('/api/mp/lobby');
+    const data = await fetchApiJson<{ rooms?: SyncedRoomRecord[] }>('/api/mp/lobby');
     if (!cancelled && data && Array.isArray(data.rooms)) {
       apiRooms = data.rooms;
     }
@@ -361,19 +437,13 @@ export function subscribeToLobbyRooms(
   };
 
   fetchLobbyApi();
-  const intervalId = window.setInterval(fetchLobbyApi, 900);
-
-  const handleMessage = () => {
-    mergeAndEmit();
-  };
-  bc?.addEventListener('message', handleMessage);
+  const intervalId = window.setInterval(fetchLobbyApi, 1200);
 
   return () => {
     cancelled = true;
     unsubWs();
     if (unsubFirestore) unsubFirestore();
     window.clearInterval(intervalId);
-    bc?.removeEventListener('message', handleMessage);
   };
 }
 
@@ -386,194 +456,144 @@ export function subscribeToActiveRoom(
 ): () => void {
   let cancelled = false;
   let inFlight = false;
-  let fsRoom: SyncedRoomRecord | null = null;
-  const fsPlayers: Record<string, SyncedPlayerRecord> = {};
-  let apiRoom: SyncedRoomRecord | null = null;
-  let apiPlayers: Record<string, SyncedPlayerRecord> = {};
+  let lastStructuralSig = '';
+  let lastUiEmitMs = 0;
 
-  const mergeRoomAndEmit = () => {
+  const emitIfStructuralOrPeriodic = (force = false) => {
     if (cancelled) return;
-    const localRooms = loadLocalRooms();
-    const localPlayers = loadLocalPlayers()[roomId] || {};
-    const wsRoom = realtimeWsBroker.getRoom(roomId);
-    const wsPlayers = realtimeWsBroker.getRoomPlayers(roomId);
-
-    // Pick freshest room state across WS, API, Firestore, and LocalStorage
-    const candidates = [
-      localRooms[roomId],
-      fsRoom,
-      apiRoom,
-      wsRoom,
-    ].filter(Boolean) as SyncedRoomRecord[];
-
-    if (candidates.length === 0) {
-      onUpdate(null, {});
+    const { room, players } = getLiveMatchSnapshot(roomId);
+    if (!room) {
+      if (lastStructuralSig !== 'null') {
+        lastStructuralSig = 'null';
+        onUpdate(null, {});
+      }
       return;
     }
 
-    candidates.sort((a, b) => (b.updatedAtMs || 0) - (a.updatedAtMs || 0));
-    const bestRoom = { ...candidates[0] };
+    // Build structural signature (status, score, events, teams, nicknames, numbers)
+    // Notice: x, y, vx, vy, ballX, ballY are NOT in this signature so 25Hz physics never triggers React re-renders!
+    const playerMetaSig = Object.values(players)
+      .map((p) => `${p.playerId}:${p.team}:${p.nickname}:${p.jerseyNumber}`)
+      .sort()
+      .join('|');
+    const sig = `${room.status}:${room.redScore}:${room.blueScore}:${room.eventState}:${room.eventTeam}:${room.eventUntilMs}:${room.winnerTeam}:${room.memberUids.join(',')}:${room.redUids.join(',')}:${room.blueUids.join(',')}:${playerMetaSig}`;
 
-    // Always preserve highest goal score & active goal celebration state
-    for (const c of candidates) {
-      if (c.redScore > bestRoom.redScore) bestRoom.redScore = c.redScore;
-      if (c.blueScore > bestRoom.blueScore) bestRoom.blueScore = c.blueScore;
-      if (
-        c.eventState === 'goal' &&
-        c.eventUntilMs > Date.now() &&
-        bestRoom.eventState !== 'goal'
-      ) {
-        bestRoom.eventState = 'goal';
-        bestRoom.eventTeam = c.eventTeam;
-        bestRoom.eventUntilMs = c.eventUntilMs;
-      }
-      if (c.status === 'playing' && bestRoom.status === 'waiting') {
-        bestRoom.status = 'playing';
-        bestRoom.matchStartedAtMs = c.matchStartedAtMs || bestRoom.matchStartedAtMs;
-      }
-      if (c.status === 'finished') {
-        bestRoom.status = 'finished';
-        bestRoom.winnerTeam = c.winnerTeam;
-      }
+    const now = Date.now();
+    // Emit immediately if structural state changed, or every 1500ms to refresh pingMs badges in the UI
+    if (force || sig !== lastStructuralSig || now - lastUiEmitMs >= 1500) {
+      lastStructuralSig = sig;
+      lastUiEmitMs = now;
+      onUpdate({ ...room }, { ...players });
     }
-
-    // Merge players across all sources by freshest updatedAtMs
-    const mergedPlayers: Record<string, SyncedPlayerRecord> = {};
-    const allPlayerMaps = [localPlayers, fsPlayers, apiPlayers, wsPlayers];
-    for (const pMap of allPlayerMaps) {
-      for (const [uid, pDoc] of Object.entries(pMap)) {
-        if (!pDoc) continue;
-        const prev = mergedPlayers[uid];
-        if (!prev || (pDoc.updatedAtMs || 0) >= (prev.updatedAtMs || 0)) {
-          mergedPlayers[uid] = pDoc;
-        }
-      }
-    }
-
-    // Ensure memberUids includes any known active players in waiting state
-    const finalPlayers: Record<string, RoomPlayerDoc> = {};
-    for (const uid of bestRoom.memberUids) {
-      if (mergedPlayers[uid]) {
-        finalPlayers[uid] = mergedPlayers[uid];
-      }
-    }
-    for (const [uid, pDoc] of Object.entries(mergedPlayers)) {
-      if (!finalPlayers[uid] && bestRoom.memberUids.includes(uid)) {
-        finalPlayers[uid] = pDoc;
-      }
-    }
-
-    onUpdate(bestRoom, finalPlayers);
   };
 
-  // 1. Real-time WebSocket Broker listener (instant ~20ms updates)
   const unsubWs = realtimeWsBroker.subscribe((changedRoomId) => {
     if (!changedRoomId || changedRoomId === roomId) {
-      mergeRoomAndEmit();
+      emitIfStructuralOrPeriodic(true);
     }
   });
 
-  // 2. Google Firebase Firestore onSnapshot listener for room + member players
-  let unsubFsRoom: (() => void) | null = null;
-  const playerUnsubs = new Map<string, () => void>();
-
-  if (!isFirestoreQuotaExceeded) {
-    const roomRef = doc(db, 'rooms', roomId);
-    unsubFsRoom = onSnapshot(
-      roomRef,
-      (snap) => {
-        if (cancelled || isFirestoreQuotaExceeded) return;
-        if (!snap.exists()) {
-          fsRoom = null;
-          mergeRoomAndEmit();
-          return;
-        }
-        const data = snap.data() as MatchRoomDoc;
-        fsRoom = { ...data, updatedAtMs: Date.now() };
-
-        const currentMembers = new Set(data.memberUids || []);
-        for (const [uid, unsub] of playerUnsubs.entries()) {
-          if (!currentMembers.has(uid)) {
-            unsub();
-            playerUnsubs.delete(uid);
-            delete fsPlayers[uid];
-          }
-        }
-
-        for (const uid of currentMembers) {
-          if (!playerUnsubs.has(uid) && !isFirestoreQuotaExceeded) {
-            const pRef = doc(db, 'rooms', roomId, 'players', uid);
-            const pUnsub = onSnapshot(
-              pRef,
-              (pSnap) => {
-                if (cancelled) return;
-                if (pSnap.exists()) {
-                  fsPlayers[uid] = {
-                    ...(pSnap.data() as RoomPlayerDoc),
-                    updatedAtMs: Date.now(),
-                  };
-                  mergeRoomAndEmit();
-                }
-              },
-              (err) => {
-                handleFirestoreError(
-                  err,
-                  OperationType.GET,
-                  `rooms/${roomId}/players/${uid}`
-                );
-              }
-            );
-            playerUnsubs.set(uid, pUnsub);
-          }
-        }
-
-        mergeRoomAndEmit();
-      },
-      (err) => {
-        handleFirestoreError(err, OperationType.GET, `rooms/${roomId}`);
-      }
-    );
-  }
-
-  // 3. Express API polling if backend server is reachable
+  // Poll Express API if running on local/AI Studio server
   const fetchRoomApi = async () => {
-    if (cancelled || inFlight) return;
+    if (cancelled || inFlight || !apiReachable) return;
     inFlight = true;
     const data = await fetchApiJson<{
       room: SyncedRoomRecord | null;
       players: Record<string, SyncedPlayerRecord>;
     }>(`/api/mp/room/${encodeURIComponent(roomId)}`);
+
     if (!cancelled && data && data.room) {
-      apiRoom = { ...data.room, updatedAtMs: data.room.updatedAtMs || Date.now() };
-      apiPlayers = data.players || {};
-      mergeRoomAndEmit();
-    } else if (!cancelled) {
-      mergeRoomAndEmit();
+      const prevRoom = memoryRooms.get(roomId);
+      if (
+        !prevRoom ||
+        (data.room.seq || data.room.updatedAtMs || 0) >=
+          (prevRoom.seq || prevRoom.updatedAtMs || 0) ||
+        data.room.status !== prevRoom.status ||
+        data.room.redScore > prevRoom.redScore ||
+        data.room.blueScore > prevRoom.blueScore ||
+        data.room.memberUids.length !== prevRoom.memberUids.length
+      ) {
+        memoryRooms.set(roomId, {
+          ...data.room,
+          updatedAtMs: data.room.updatedAtMs || Date.now(),
+          heartbeatAtMs: Date.now(),
+        });
+      }
+
+      const memP = memoryPlayers.get(roomId) || {};
+      for (const [uid, pDoc] of Object.entries(data.players || {})) {
+        const prevP = memP[uid];
+        if (
+          !prevP ||
+          (pDoc.seq || pDoc.updatedAtMs || 0) >= (prevP.seq || prevP.updatedAtMs || 0)
+        ) {
+          memP[uid] = pDoc;
+        }
+      }
+      memoryPlayers.set(roomId, memP);
+      emitIfStructuralOrPeriodic(false);
     }
     inFlight = false;
   };
 
   fetchRoomApi();
-  const intervalId = window.setInterval(fetchRoomApi, 70);
-
-  const handleMessage = (ev: MessageEvent) => {
-    if (!ev.data?.roomId || ev.data.roomId === roomId) {
-      mergeRoomAndEmit();
-    }
-  };
-  bc?.addEventListener('message', handleMessage);
+  const apiPollId = window.setInterval(fetchRoomApi, 60);
+  const uiPingRefreshId = window.setInterval(() => {
+    emitIfStructuralOrPeriodic(false);
+  }, 1500);
 
   return () => {
     cancelled = true;
     unsubWs();
-    if (unsubFsRoom) unsubFsRoom();
-    for (const unsub of playerUnsubs.values()) {
-      unsub();
-    }
-    playerUnsubs.clear();
-    window.clearInterval(intervalId);
-    bc?.removeEventListener('message', handleMessage);
+    window.clearInterval(apiPollId);
+    window.clearInterval(uiPingRefreshId);
   };
+}
+
+export async function sendRoomHeartbeat(roomId: string, uid: string): Promise<void> {
+  const safeUid = sanitizeId(uid);
+  const pingMs = realtimeWsBroker.getLocalPingMs();
+  const now = Date.now();
+
+  const room = realtimeWsBroker.getRoom(roomId) || memoryRooms.get(roomId);
+  if (room && room.status !== 'finished') {
+    room.updatedAtMs = now;
+    room.heartbeatAtMs = now;
+    memoryRooms.set(roomId, room);
+    // Keep retained room fresh on WebSocket broker while players are inside
+    if (room.hostUid === safeUid || room.memberUids[0] === safeUid) {
+      realtimeWsBroker.publishRoom(room, true);
+    }
+  }
+
+  const pMap = memoryPlayers.get(roomId) || {};
+  if (pMap[safeUid]) {
+    pMap[safeUid].pingMs = pingMs;
+    pMap[safeUid].updatedAtMs = now;
+    memoryPlayers.set(roomId, pMap);
+  }
+
+  postApiJson('/api/mp/room/heartbeat', {
+    roomId,
+    uid: safeUid,
+    pingMs,
+  }).catch(() => {});
+
+  if (!isFirestoreQuotaExceeded && room && room.hostUid === safeUid) {
+    updateDoc(doc(db, 'rooms', roomId), {
+      redScore: clamp(Math.round(room.redScore), 0, 99),
+      blueScore: clamp(Math.round(room.blueScore), 0, 99),
+      ballX: Math.round(clamp(room.ballX, -2000, 2000) * 10) / 10,
+      ballY: Math.round(clamp(room.ballY, -2000, 2000) * 10) / 10,
+      ballVx: Math.round(clamp(room.ballVx, -100, 100) * 100) / 100,
+      ballVy: Math.round(clamp(room.ballVy, -100, 100) * 100) / 100,
+      eventState: room.eventState,
+      eventTeam: room.eventTeam,
+      eventUntilMs: clamp(Math.round(room.eventUntilMs || 0), 0, 9999999999999),
+      lastTouchTeam: room.lastTouchTeam,
+      updatedAt: serverTimestamp(),
+    }).catch(() => {});
+  }
 }
 
 export async function createMatchRoom(
@@ -586,13 +606,13 @@ export async function createMatchRoom(
   const title = sanitizeTitle(customTitle || `Матч игрока ${nickname}`);
   const spawn = getTeamSpawnPosition('red', 0);
   const now = Date.now();
+  const pingMs = realtimeWsBroker.getLocalPingMs();
 
   let roomId = `room_${now}_${Math.random()
     .toString(36)
     .slice(2, 7)
     .replace(/[^a-zA-Z0-9]/g, '')}`;
 
-  // 1. Try Express API
   const apiRes = await postApiJson<{ roomId: string; room: SyncedRoomRecord }>(
     '/api/mp/room/create',
     { profile: { uid: safeUid, nickname, jerseyNumber }, customTitle: title }
@@ -622,7 +642,9 @@ export async function createMatchRoom(
     eventTeam: 'none',
     eventUntilMs: 0,
     lastTouchTeam: 'none',
+    seq: now,
     updatedAtMs: now,
+    heartbeatAtMs: now,
   };
 
   const hostPlayer: SyncedPlayerRecord = {
@@ -636,33 +658,28 @@ export async function createMatchRoom(
     vx: 0,
     vy: 0,
     kicking: false,
+    pingMs,
+    seq: now,
     updatedAtMs: now,
   };
 
-  // 2. Save to LocalStorage & BroadcastChannel
-  const rooms = loadLocalRooms();
-  const players = loadLocalPlayers();
-  rooms[roomId] = newRoom;
-  players[roomId] = { [safeUid]: hostPlayer };
-  saveLocalRooms(rooms);
-  saveLocalPlayers(players);
+  memoryRooms.set(roomId, newRoom);
+  memoryPlayers.set(roomId, { [safeUid]: hostPlayer });
+  bc?.postMessage({ type: 'room', room: newRoom });
+  bc?.postMessage({ type: 'player', player: hostPlayer });
 
-  // 3. Publish to Global Real-Time WebSocket Broker (retained so all clients see it immediately!)
   realtimeWsBroker.publishPlayer(hostPlayer, true);
   realtimeWsBroker.publishRoom(newRoom, true);
 
-  // 4. Write atomically to Google Firebase Firestore
   if (!isFirestoreQuotaExceeded) {
     try {
       const batch = writeBatch(db);
-      const roomRef = doc(db, 'rooms', roomId);
-      const playerRef = doc(db, 'rooms', roomId, 'players', safeUid);
-      batch.set(roomRef, {
+      batch.set(doc(db, 'rooms', roomId), {
         ...toFirestoreRoomPayload(newRoom),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
-      batch.set(playerRef, {
+      batch.set(doc(db, 'rooms', roomId, 'players', safeUid), {
         ...toFirestorePlayerPayload(hostPlayer),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
@@ -674,7 +691,6 @@ export async function createMatchRoom(
     }
   }
 
-  notifyPeers(roomId);
   return roomId;
 }
 
@@ -685,8 +701,8 @@ export async function joinMatchRoom(
   const safeUid = sanitizeId(profile.uid);
   const nickname = sanitizeNickname(profile.nickname);
   const jerseyNumber = clamp(Math.round(profile.jerseyNumber || 10), 1, 99);
+  const pingMs = realtimeWsBroker.getLocalPingMs();
 
-  // 1. Try Express API first if available
   const apiRes = await postApiJson<{
     joined: boolean;
     reason?: string;
@@ -696,13 +712,10 @@ export async function joinMatchRoom(
     profile: { uid: safeUid, nickname, jerseyNumber },
   });
 
-  // 2. Locate room from WebSocket Broker, LocalStorage, API, or Firestore
-  const rooms = loadLocalRooms();
-  const players = loadLocalPlayers();
   let room: SyncedRoomRecord | null =
     apiRes?.room ||
     realtimeWsBroker.getRoom(roomId) ||
-    rooms[roomId] ||
+    memoryRooms.get(roomId) ||
     null;
 
   if (!room && !isFirestoreQuotaExceeded) {
@@ -765,7 +778,9 @@ export async function joinMatchRoom(
     memberUids,
     redUids,
     blueUids,
+    seq: now,
     updatedAtMs: now,
+    heartbeatAtMs: now,
   };
 
   const joinedPlayer: SyncedPlayerRecord = {
@@ -779,26 +794,25 @@ export async function joinMatchRoom(
     vx: 0,
     vy: 0,
     kicking: false,
+    pingMs,
+    seq: now,
     updatedAtMs: now,
   };
 
-  rooms[roomId] = updatedRoom;
-  if (!players[roomId]) players[roomId] = {};
-  players[roomId][safeUid] = joinedPlayer;
-  saveLocalRooms(rooms);
-  saveLocalPlayers(players);
+  memoryRooms.set(roomId, updatedRoom);
+  const pMap = memoryPlayers.get(roomId) || {};
+  pMap[safeUid] = joinedPlayer;
+  memoryPlayers.set(roomId, pMap);
+  bc?.postMessage({ type: 'room', room: updatedRoom });
+  bc?.postMessage({ type: 'player', player: joinedPlayer });
 
-  // Publish to WebSocket Broker
   realtimeWsBroker.publishPlayer(joinedPlayer, true);
   realtimeWsBroker.publishRoom(updatedRoom, true);
 
-  // Sync to Google Firebase Firestore
   if (!isFirestoreQuotaExceeded) {
     try {
       const batch = writeBatch(db);
-      const roomRef = doc(db, 'rooms', roomId);
-      const playerRef = doc(db, 'rooms', roomId, 'players', safeUid);
-      batch.update(roomRef, {
+      batch.update(doc(db, 'rooms', roomId), {
         hostUid: sanitizeId(updatedRoom.hostUid),
         hostName: sanitizeNickname(updatedRoom.hostName),
         memberUids: updatedRoom.memberUids.map(sanitizeId).slice(0, 10),
@@ -806,7 +820,7 @@ export async function joinMatchRoom(
         blueUids: updatedRoom.blueUids.map(sanitizeId).slice(0, 5),
         updatedAt: serverTimestamp(),
       });
-      batch.set(playerRef, {
+      batch.set(doc(db, 'rooms', roomId, 'players', safeUid), {
         ...toFirestorePlayerPayload(joinedPlayer),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
@@ -817,7 +831,6 @@ export async function joinMatchRoom(
     }
   }
 
-  notifyPeers(roomId);
   return { joined: true };
 }
 
@@ -828,6 +841,7 @@ export async function switchPlayerTeam(
   const safeUid = sanitizeId(profile.uid);
   const nickname = sanitizeNickname(profile.nickname);
   const jerseyNumber = clamp(Math.round(profile.jerseyNumber || 10), 1, 99);
+  const pingMs = realtimeWsBroker.getLocalPingMs();
 
   await postApiJson('/api/mp/room/switch-team', {
     roomId: room.roomId,
@@ -836,7 +850,7 @@ export async function switchPlayerTeam(
 
   const currentRoom =
     realtimeWsBroker.getRoom(room.roomId) ||
-    loadLocalRooms()[room.roomId] ||
+    memoryRooms.get(room.roomId) ||
     ({ ...room, updatedAtMs: Date.now() } as SyncedRoomRecord);
 
   if (currentRoom.status !== 'waiting') {
@@ -870,7 +884,9 @@ export async function switchPlayerTeam(
     ...currentRoom,
     redUids: nextRedUids,
     blueUids: nextBlueUids,
+    seq: now,
     updatedAtMs: now,
+    heartbeatAtMs: now,
   };
 
   const updatedPlayer: SyncedPlayerRecord = {
@@ -884,16 +900,17 @@ export async function switchPlayerTeam(
     vx: 0,
     vy: 0,
     kicking: false,
+    pingMs,
+    seq: now,
     updatedAtMs: now,
   };
 
-  const rooms = loadLocalRooms();
-  const players = loadLocalPlayers();
-  rooms[room.roomId] = updatedRoom;
-  if (!players[room.roomId]) players[room.roomId] = {};
-  players[room.roomId][safeUid] = updatedPlayer;
-  saveLocalRooms(rooms);
-  saveLocalPlayers(players);
+  memoryRooms.set(room.roomId, updatedRoom);
+  const pMap = memoryPlayers.get(room.roomId) || {};
+  pMap[safeUid] = updatedPlayer;
+  memoryPlayers.set(room.roomId, pMap);
+  bc?.postMessage({ type: 'room', room: updatedRoom });
+  bc?.postMessage({ type: 'player', player: updatedPlayer });
 
   realtimeWsBroker.publishPlayer(updatedPlayer, true);
   realtimeWsBroker.publishRoom(updatedRoom, true);
@@ -926,7 +943,6 @@ export async function switchPlayerTeam(
     }
   }
 
-  notifyPeers(room.roomId);
   return { switched: true };
 }
 
@@ -952,21 +968,20 @@ export async function startMatchByHost(
     eventTeam: 'none',
     eventUntilMs: 0,
     lastTouchTeam: 'none',
+    seq: now,
     updatedAtMs: now,
+    heartbeatAtMs: now,
   };
 
-  const rooms = loadLocalRooms();
-  const localPlayersAll = loadLocalPlayers();
-  rooms[room.roomId] = updatedRoom;
-  if (!localPlayersAll[room.roomId]) localPlayersAll[room.roomId] = {};
-
+  memoryRooms.set(room.roomId, updatedRoom);
+  const pMap = memoryPlayers.get(room.roomId) || {};
   const resetPlayersList: SyncedPlayerRecord[] = [];
 
   room.redUids.forEach((uid, idx) => {
     const existing =
       playersMap[uid] ||
       realtimeWsBroker.getRoomPlayers(room.roomId)[uid] ||
-      localPlayersAll[room.roomId][uid];
+      pMap[uid];
     const sp = getTeamSpawnPosition('red', idx);
     const pDoc: SyncedPlayerRecord = {
       playerId: uid,
@@ -979,9 +994,11 @@ export async function startMatchByHost(
       vx: 0,
       vy: 0,
       kicking: false,
+      pingMs: existing?.pingMs || 20,
+      seq: now,
       updatedAtMs: now,
     };
-    localPlayersAll[room.roomId][uid] = pDoc;
+    pMap[uid] = pDoc;
     resetPlayersList.push(pDoc);
   });
 
@@ -989,7 +1006,7 @@ export async function startMatchByHost(
     const existing =
       playersMap[uid] ||
       realtimeWsBroker.getRoomPlayers(room.roomId)[uid] ||
-      localPlayersAll[room.roomId][uid];
+      pMap[uid];
     const sp = getTeamSpawnPosition('blue', idx);
     const pDoc: SyncedPlayerRecord = {
       playerId: uid,
@@ -1002,16 +1019,18 @@ export async function startMatchByHost(
       vx: 0,
       vy: 0,
       kicking: false,
+      pingMs: existing?.pingMs || 20,
+      seq: now,
       updatedAtMs: now,
     };
-    localPlayersAll[room.roomId][uid] = pDoc;
+    pMap[uid] = pDoc;
     resetPlayersList.push(pDoc);
   });
 
-  saveLocalRooms(rooms);
-  saveLocalPlayers(localPlayersAll);
-
+  memoryPlayers.set(room.roomId, pMap);
+  bc?.postMessage({ type: 'room', room: updatedRoom });
   for (const pDoc of resetPlayersList) {
+    bc?.postMessage({ type: 'player', player: pDoc });
     realtimeWsBroker.publishPlayer(pDoc, true);
   }
   realtimeWsBroker.publishRoom(updatedRoom, true);
@@ -1047,12 +1066,7 @@ export async function startMatchByHost(
       handleFirestoreError(err, OperationType.UPDATE, `rooms/${room.roomId}`);
     }
   }
-
-  notifyPeers(room.roomId);
 }
-
-let lastFirestorePlayerSyncMs = 0;
-let lastFirestoreBallSyncMs = 0;
 
 export async function syncLocalPlayerDisc(
   roomId: string,
@@ -1070,11 +1084,11 @@ export async function syncLocalPlayerDisc(
     Math.round(clamp(state.vy, -PLAYER_MAX_SPEED * 2, PLAYER_MAX_SPEED * 2) * 100) /
     100;
   const safeKicking = Boolean(state.kicking);
+  const pingMs = realtimeWsBroker.getLocalPingMs();
 
-  const players = loadLocalPlayers();
-  if (!players[roomId]) players[roomId] = {};
+  const pMap = memoryPlayers.get(roomId) || {};
   const existing =
-    realtimeWsBroker.getRoomPlayers(roomId)[uid] || players[roomId][uid];
+    pMap[uid] || realtimeWsBroker.getRoomPlayers(roomId)[uid];
 
   const updatedPlayer: SyncedPlayerRecord = {
     playerId: uid,
@@ -1087,42 +1101,44 @@ export async function syncLocalPlayerDisc(
     vx: safeVx,
     vy: safeVy,
     kicking: safeKicking,
+    pingMs,
+    seq: now,
     updatedAtMs: now,
   };
 
-  players[roomId][uid] = updatedPlayer;
-  saveLocalPlayers(players);
+  pMap[uid] = updatedPlayer;
+  memoryPlayers.set(roomId, pMap);
+  bc?.postMessage({ type: 'player', player: updatedPlayer });
 
-  // Instant WebSocket broadcast (~20ms latency across clients)
-  realtimeWsBroker.publishPlayer(updatedPlayer, true);
-
-  // Fire-and-forget Express API sync
-  postApiJson('/api/mp/room/player-sync', {
+  // Non-retained 80-byte WebSocket fast tick (zero React re-renders, ~15ms delivery!)
+  realtimeWsBroker.publishFastPlayerTick(
     roomId,
     uid,
-    state: { x: safeX, y: safeY, vx: safeVx, vy: safeVy, kicking: safeKicking },
-  }).catch(() => {});
+    safeX,
+    safeY,
+    safeVx,
+    safeVy,
+    safeKicking,
+    pingMs,
+    now,
+    profileFallback
+  );
 
-  // Throttled Firestore update (every 350ms to preserve daily quota)
-  if (!isFirestoreQuotaExceeded && now - lastFirestorePlayerSyncMs >= 350) {
-    lastFirestorePlayerSyncMs = now;
-    updateDoc(doc(db, 'rooms', roomId, 'players', sanitizeId(uid)), {
-      x: safeX,
-      y: safeY,
-      vx: safeVx,
-      vy: safeVy,
-      kicking: safeKicking,
-      updatedAt: serverTimestamp(),
-    }).catch((err) => {
-      handleFirestoreError(
-        err,
-        OperationType.UPDATE,
-        `rooms/${roomId}/players/${uid}`
-      );
-    });
+  if (apiReachable) {
+    postApiJson('/api/mp/room/player-sync', {
+      roomId,
+      uid,
+      state: {
+        x: safeX,
+        y: safeY,
+        vx: safeVx,
+        vy: safeVy,
+        kicking: safeKicking,
+        pingMs,
+        seq: now,
+      },
+    }).catch(() => {});
   }
-
-  notifyPeers(roomId);
 }
 
 export async function syncRoomGameplayState(
@@ -1142,9 +1158,8 @@ export async function syncRoomGameplayState(
   }
 ): Promise<void> {
   const now = Date.now();
-  const rooms = loadLocalRooms();
   const baseRoom =
-    realtimeWsBroker.getRoom(roomId) || rooms[roomId];
+    memoryRooms.get(roomId) || realtimeWsBroker.getRoom(roomId);
 
   const safeBallX = Math.round(clamp(patch.ballX, -100, CANVAS_WIDTH + 100) * 10) / 10;
   const safeBallY = Math.round(clamp(patch.ballY, -100, CANVAS_HEIGHT + 100) * 10) / 10;
@@ -1169,7 +1184,9 @@ export async function syncRoomGameplayState(
           ballVx: safeBallVx,
           ballVy: safeBallVy,
           actorUid: patch.actorUid,
+          seq: now,
           updatedAtMs: now,
+          heartbeatAtMs: now,
         }
       : {
           ...baseRoom,
@@ -1187,24 +1204,19 @@ export async function syncRoomGameplayState(
           eventUntilMs: Math.max(0, Math.round(patch.eventUntilMs)),
           lastTouchTeam: patch.lastTouchTeam,
           actorUid: patch.actorUid,
+          seq: now,
           updatedAtMs: now,
+          heartbeatAtMs: now,
         };
 
-    rooms[roomId] = updatedRoom;
-    saveLocalRooms(rooms);
-    realtimeWsBroker.publishRoom(updatedRoom, true);
+    memoryRooms.set(roomId, updatedRoom);
+    bc?.postMessage({ type: 'room', room: updatedRoom });
   }
 
-  postApiJson('/api/mp/room/game-sync', { roomId, patch }).catch(() => {});
-
-  // Sync to Firestore (immediately on set-piece/state change, or throttled every 350ms)
-  const isImportantEvent = patch.eventState !== 'normal';
-  if (
-    !isFirestoreQuotaExceeded &&
-    (isImportantEvent || now - lastFirestoreBallSyncMs >= 350)
-  ) {
-    lastFirestoreBallSyncMs = now;
-    updateDoc(doc(db, 'rooms', roomId), {
+  realtimeWsBroker.publishFastBallTick(
+    roomId,
+    patch.actorUid || '',
+    {
       redScore: clamp(Math.round(patch.redScore), 0, 99),
       blueScore: clamp(Math.round(patch.blueScore), 0, 99),
       ballX: safeBallX,
@@ -1213,15 +1225,18 @@ export async function syncRoomGameplayState(
       ballVy: safeBallVy,
       eventState: patch.eventState,
       eventTeam: patch.eventTeam,
-      eventUntilMs: clamp(Math.round(patch.eventUntilMs || 0), 0, 9999999999999),
+      eventUntilMs: Math.max(0, Math.round(patch.eventUntilMs)),
       lastTouchTeam: patch.lastTouchTeam,
-      updatedAt: serverTimestamp(),
-    }).catch((err) => {
-      handleFirestoreError(err, OperationType.UPDATE, `rooms/${roomId}`);
-    });
-  }
+    },
+    now
+  );
 
-  notifyPeers(roomId);
+  if (apiReachable) {
+    postApiJson('/api/mp/room/game-sync', {
+      roomId,
+      patch: { ...patch, seq: now },
+    }).catch(() => {});
+  }
 }
 
 export async function registerGoalInNet(
@@ -1243,8 +1258,8 @@ export async function registerGoalInNet(
     Math.round(clamp(ballState.vy, -BALL_MAX_SPEED, BALL_MAX_SPEED) * 100) / 100;
 
   const baseRoom =
+    memoryRooms.get(room.roomId) ||
     realtimeWsBroker.getRoom(room.roomId) ||
-    loadLocalRooms()[room.roomId] ||
     ({ ...room, updatedAtMs: now } as SyncedRoomRecord);
 
   const updatedRoom: SyncedRoomRecord = {
@@ -1259,45 +1274,61 @@ export async function registerGoalInNet(
     eventTeam: scoringTeam,
     eventUntilMs: Math.round(goalPauseUntilMs),
     lastTouchTeam: 'none',
+    seq: now,
     updatedAtMs: now,
+    heartbeatAtMs: now,
   };
 
-  const rooms = loadLocalRooms();
-  rooms[room.roomId] = updatedRoom;
-  saveLocalRooms(rooms);
+  memoryRooms.set(room.roomId, updatedRoom);
+  bc?.postMessage({ type: 'room', room: updatedRoom });
 
   realtimeWsBroker.publishRoom(updatedRoom, true);
+  realtimeWsBroker.publishFastBallTick(
+    room.roomId,
+    room.hostUid,
+    {
+      redScore: safeRed,
+      blueScore: safeBlue,
+      ballX: safeX,
+      ballY: safeY,
+      ballVx: safeVx,
+      ballVy: safeVy,
+      eventState: 'goal',
+      eventTeam: scoringTeam,
+      eventUntilMs: Math.round(goalPauseUntilMs),
+      lastTouchTeam: 'none',
+    },
+    now
+  );
 
-  postApiJson('/api/mp/room/goal', {
-    roomId: room.roomId,
-    scoringTeam,
-    newRedScore: safeRed,
-    newBlueScore: safeBlue,
-    goalPauseUntilMs,
-    ballState: { x: safeX, y: safeY, vx: safeVx, vy: safeVy },
-  }).catch(() => {});
-
-  if (!isFirestoreQuotaExceeded) {
-    try {
-      await updateDoc(doc(db, 'rooms', room.roomId), {
-        redScore: safeRed,
-        blueScore: safeBlue,
-        ballX: safeX,
-        ballY: safeY,
-        ballVx: safeVx,
-        ballVy: safeVy,
-        eventState: 'goal',
-        eventTeam: scoringTeam,
-        eventUntilMs: Math.round(goalPauseUntilMs),
-        lastTouchTeam: 'none',
-        updatedAt: serverTimestamp(),
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `rooms/${room.roomId}`);
-    }
+  if (apiReachable) {
+    postApiJson('/api/mp/room/goal', {
+      roomId: room.roomId,
+      scoringTeam,
+      newRedScore: safeRed,
+      newBlueScore: safeBlue,
+      goalPauseUntilMs,
+      ballState: { x: safeX, y: safeY, vx: safeVx, vy: safeVy },
+    }).catch(() => {});
   }
 
-  notifyPeers(room.roomId);
+  if (!isFirestoreQuotaExceeded) {
+    updateDoc(doc(db, 'rooms', room.roomId), {
+      redScore: safeRed,
+      blueScore: safeBlue,
+      ballX: safeX,
+      ballY: safeY,
+      ballVx: safeVx,
+      ballVy: safeVy,
+      eventState: 'goal',
+      eventTeam: scoringTeam,
+      eventUntilMs: Math.round(goalPauseUntilMs),
+      lastTouchTeam: 'none',
+      updatedAt: serverTimestamp(),
+    }).catch((err) => {
+      handleFirestoreError(err, OperationType.UPDATE, `rooms/${room.roomId}`);
+    });
+  }
 }
 
 export async function resetFormationAfterGoalDelay(
@@ -1309,8 +1340,8 @@ export async function resetFormationAfterGoalDelay(
 
   const now = Date.now();
   const baseRoom =
+    memoryRooms.get(room.roomId) ||
     realtimeWsBroker.getRoom(room.roomId) ||
-    loadLocalRooms()[room.roomId] ||
     ({ ...room, updatedAtMs: now } as SyncedRoomRecord);
 
   const updatedRoom: SyncedRoomRecord = {
@@ -1323,21 +1354,20 @@ export async function resetFormationAfterGoalDelay(
     eventTeam: 'none',
     eventUntilMs: 0,
     lastTouchTeam: 'none',
+    seq: now,
     updatedAtMs: now,
+    heartbeatAtMs: now,
   };
 
-  const rooms = loadLocalRooms();
-  const localPlayersAll = loadLocalPlayers();
-  rooms[room.roomId] = updatedRoom;
-  if (!localPlayersAll[room.roomId]) localPlayersAll[room.roomId] = {};
-
+  memoryRooms.set(room.roomId, updatedRoom);
+  const pMap = memoryPlayers.get(room.roomId) || {};
   const resetPlayersList: SyncedPlayerRecord[] = [];
 
   updatedRoom.redUids.forEach((uid, idx) => {
     const existing =
       playersMap[uid] ||
       realtimeWsBroker.getRoomPlayers(room.roomId)[uid] ||
-      localPlayersAll[room.roomId][uid];
+      pMap[uid];
     if (existing) {
       const sp = getTeamSpawnPosition('red', idx);
       const pDoc: SyncedPlayerRecord = {
@@ -1347,9 +1377,10 @@ export async function resetFormationAfterGoalDelay(
         vx: 0,
         vy: 0,
         kicking: false,
+        seq: now,
         updatedAtMs: now,
       };
-      localPlayersAll[room.roomId][uid] = pDoc;
+      pMap[uid] = pDoc;
       resetPlayersList.push(pDoc);
     }
   });
@@ -1358,7 +1389,7 @@ export async function resetFormationAfterGoalDelay(
     const existing =
       playersMap[uid] ||
       realtimeWsBroker.getRoomPlayers(room.roomId)[uid] ||
-      localPlayersAll[room.roomId][uid];
+      pMap[uid];
     if (existing) {
       const sp = getTeamSpawnPosition('blue', idx);
       const pDoc: SyncedPlayerRecord = {
@@ -1368,56 +1399,27 @@ export async function resetFormationAfterGoalDelay(
         vx: 0,
         vy: 0,
         kicking: false,
+        seq: now,
         updatedAtMs: now,
       };
-      localPlayersAll[room.roomId][uid] = pDoc;
+      pMap[uid] = pDoc;
       resetPlayersList.push(pDoc);
     }
   });
 
-  saveLocalRooms(rooms);
-  saveLocalPlayers(localPlayersAll);
-
+  memoryPlayers.set(room.roomId, pMap);
+  bc?.postMessage({ type: 'room', room: updatedRoom });
   for (const pDoc of resetPlayersList) {
+    bc?.postMessage({ type: 'player', player: pDoc });
     realtimeWsBroker.publishPlayer(pDoc, true);
   }
   realtimeWsBroker.publishRoom(updatedRoom, true);
 
-  postApiJson('/api/mp/room/reset-formation', { roomId: room.roomId }).catch(() => {});
-
-  if (!isFirestoreQuotaExceeded) {
-    try {
-      const batch = writeBatch(db);
-      batch.update(doc(db, 'rooms', room.roomId), {
-        redScore: updatedRoom.redScore,
-        blueScore: updatedRoom.blueScore,
-        ballX: FIELD_CENTER_X,
-        ballY: FIELD_CENTER_Y,
-        ballVx: 0,
-        ballVy: 0,
-        eventState: 'normal',
-        eventTeam: 'none',
-        eventUntilMs: 0,
-        lastTouchTeam: 'none',
-        updatedAt: serverTimestamp(),
-      });
-      for (const pDoc of resetPlayersList) {
-        batch.update(doc(db, 'rooms', room.roomId, 'players', pDoc.playerId), {
-          x: pDoc.x,
-          y: pDoc.y,
-          vx: 0,
-          vy: 0,
-          kicking: false,
-          updatedAt: serverTimestamp(),
-        });
-      }
-      await batch.commit();
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `rooms/${room.roomId}`);
-    }
+  if (apiReachable) {
+    postApiJson('/api/mp/room/reset-formation', { roomId: room.roomId }).catch(
+      () => {}
+    );
   }
-
-  notifyPeers(room.roomId);
 }
 
 export async function finishMatchRoom(
@@ -1442,16 +1444,20 @@ export async function finishMatchRoom(
     eventState: 'normal',
     eventTeam: 'none',
     eventUntilMs: 0,
+    seq: now,
     updatedAtMs: now,
+    heartbeatAtMs: now,
   };
 
-  const rooms = loadLocalRooms();
-  rooms[room.roomId] = updatedRoom;
-  saveLocalRooms(rooms);
+  memoryRooms.set(room.roomId, updatedRoom);
+  bc?.postMessage({ type: 'room', room: updatedRoom });
 
-  realtimeWsBroker.publishRoom(updatedRoom, true);
+  realtimeWsBroker.publishRoom(updatedRoom, false);
+  realtimeWsBroker.deleteRoom(room.roomId, room.memberUids);
 
-  postApiJson('/api/mp/room/finish', { roomId: room.roomId }).catch(() => {});
+  if (apiReachable) {
+    postApiJson('/api/mp/room/finish', { roomId: room.roomId }).catch(() => {});
+  }
 
   if (!isFirestoreQuotaExceeded) {
     try {
@@ -1474,8 +1480,6 @@ export async function finishMatchRoom(
       handleFirestoreError(err, OperationType.UPDATE, `rooms/${room.roomId}`);
     }
   }
-
-  notifyPeers(room.roomId);
 }
 
 export async function deleteOrLeaveMatchRoom(
@@ -1484,16 +1488,16 @@ export async function deleteOrLeaveMatchRoom(
 ): Promise<void> {
   const safeUid = sanitizeId(currentUid);
 
-  postApiJson('/api/mp/room/leave', {
-    roomId: room.roomId,
-    uid: safeUid,
-  }).catch(() => {});
+  if (apiReachable) {
+    postApiJson('/api/mp/room/leave', {
+      roomId: room.roomId,
+      uid: safeUid,
+    }).catch(() => {});
+  }
 
-  const rooms = loadLocalRooms();
-  const players = loadLocalPlayers();
   const currentRoom =
     realtimeWsBroker.getRoom(room.roomId) ||
-    rooms[room.roomId] ||
+    memoryRooms.get(room.roomId) ||
     ({ ...room, updatedAtMs: Date.now() } as SyncedRoomRecord);
 
   const remainingMembers = (currentRoom.memberUids || []).filter(
@@ -1506,10 +1510,9 @@ export async function deleteOrLeaveMatchRoom(
     currentRoom.hostUid === safeUid;
 
   if (shouldDestroy) {
-    delete rooms[room.roomId];
-    delete players[room.roomId];
-    saveLocalRooms(rooms);
-    saveLocalPlayers(players);
+    memoryRooms.delete(room.roomId);
+    memoryPlayers.delete(room.roomId);
+    bc?.postMessage({ type: 'delete_room', roomId: room.roomId });
 
     realtimeWsBroker.deleteRoom(room.roomId, currentRoom.memberUids || [safeUid]);
 
@@ -1527,18 +1530,17 @@ export async function deleteOrLeaveMatchRoom(
   } else {
     const nextRed = (currentRoom.redUids || []).filter((id) => id !== safeUid);
     const nextBlue = (currentRoom.blueUids || []).filter((id) => id !== safeUid);
-    const rPlayers =
-      realtimeWsBroker.getRoomPlayers(room.roomId) ||
-      players[room.roomId] ||
-      {};
-    delete rPlayers[safeUid];
+    const pMap = memoryPlayers.get(room.roomId) || {};
+    delete pMap[safeUid];
+    memoryPlayers.set(room.roomId, pMap);
 
     const nextHostUid =
       currentRoom.hostUid === safeUid ? remainingMembers[0] : currentRoom.hostUid;
     const nextHostName =
       currentRoom.hostUid === safeUid
-        ? rPlayers[nextHostUid]?.nickname || 'Хост'
+        ? pMap[nextHostUid]?.nickname || 'Хост'
         : currentRoom.hostName;
+    const now = Date.now();
 
     const updatedRoom: SyncedRoomRecord = {
       ...currentRoom,
@@ -1547,13 +1549,13 @@ export async function deleteOrLeaveMatchRoom(
       memberUids: remainingMembers,
       redUids: nextRed,
       blueUids: nextBlue,
-      updatedAtMs: Date.now(),
+      seq: now,
+      updatedAtMs: now,
+      heartbeatAtMs: now,
     };
 
-    rooms[room.roomId] = updatedRoom;
-    players[room.roomId] = rPlayers;
-    saveLocalRooms(rooms);
-    saveLocalPlayers(players);
+    memoryRooms.set(room.roomId, updatedRoom);
+    bc?.postMessage({ type: 'room', room: updatedRoom });
 
     realtimeWsBroker.deletePlayer(room.roomId, safeUid);
     realtimeWsBroker.publishRoom(updatedRoom, true);
@@ -1576,8 +1578,30 @@ export async function deleteOrLeaveMatchRoom(
       }
     }
   }
+}
 
-  notifyPeers(room.roomId);
+export async function clearAllStaleRooms(
+  roomsList: MatchRoomDoc[],
+  currentUid: string
+): Promise<void> {
+  if (apiReachable) {
+    postApiJson('/api/mp/lobby/clear', {}).catch(() => {});
+  }
+  for (const r of roomsList) {
+    memoryRooms.delete(r.roomId);
+    memoryPlayers.delete(r.roomId);
+    realtimeWsBroker.deleteRoom(r.roomId, r.memberUids);
+    if (!isFirestoreQuotaExceeded) {
+      deleteDoc(doc(db, 'rooms', r.roomId)).catch(() => {});
+    }
+  }
+  if (!isFirestoreQuotaExceeded) {
+    updateDoc(doc(db, 'lobbies', 'main'), {
+      roomIds: [],
+      updatedBy: sanitizeId(currentUid),
+      updatedAt: serverTimestamp(),
+    }).catch(() => {});
+  }
 }
 
 export async function pruneStaleRoomsFromLobby(
@@ -1591,5 +1615,4 @@ export async function pruneStaleRoomsFromLobby(
       currentUid
     ).catch(() => {});
   }
-  notifyPeers();
 }

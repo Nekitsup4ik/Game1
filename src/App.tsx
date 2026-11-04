@@ -7,6 +7,7 @@ import {
   Trophy,
   Trash2,
   UserCheck,
+  Wifi,
 } from 'lucide-react';
 import {
   MatchRoomDoc,
@@ -14,8 +15,10 @@ import {
   RoomPlayerDoc,
 } from './types/game';
 import {
+  clearAllStaleRooms,
   createMatchRoom,
   deleteOrLeaveMatchRoom,
+  getLocalPingMs,
   joinMatchRoom,
   subscribeToActiveRoom,
   subscribeToLobbyRooms,
@@ -96,7 +99,7 @@ export default function App() {
     return () => unsub();
   }, [profileConfirmed]);
 
-  // 2. Subscribe to Active Room Document & Players in Real Time (20Hz)
+  // 2. Subscribe to Active Room Document & Players in Real Time
   useEffect(() => {
     if (!profileConfirmed || !activeRoomId) {
       setActiveRoom(null);
@@ -117,6 +120,16 @@ export default function App() {
 
     return () => unsub();
   }, [profileConfirmed, activeRoomId]);
+
+  // Automatically leave/delete room if player closes or refreshes the browser tab
+  useEffect(() => {
+    if (!activeRoom) return;
+    const handleBeforeUnload = () => {
+      deleteOrLeaveMatchRoom(activeRoom, playerUid).catch(() => {});
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [activeRoom, playerUid]);
 
   const handleSignOut = async () => {
     if (activeRoomId) {
@@ -818,8 +831,11 @@ export default function App() {
                   {currentProfile.jerseyNumber}
                 </div>
                 <div>
-                  <div className="flex items-center gap-2 text-xs text-slate-400">
-                    <span>Игрок авторизован</span>
+                  <div className="flex items-center gap-2 text-xs text-slate-400 flex-wrap">
+                    <span className="inline-flex items-center gap-1 text-emerald-400 font-mono-tabular font-semibold">
+                      <Wifi className="w-3.5 h-3.5" />
+                      {getLocalPingMs()} мс
+                    </span>
                     <span aria-hidden="true">·</span>
                     <span>Номер #{currentProfile.jerseyNumber}</span>
                     <span aria-hidden="true">·</span>
@@ -871,13 +887,30 @@ export default function App() {
             <div className="mt-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
               {/* Left 8 Columns: Active Match Rooms */}
               <div className="lg:col-span-8">
-                <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center justify-between gap-3 mb-4">
                   <h2 className="font-display font-bold text-lg text-white">
                     Доступные комнаты ({sortedRooms.length})
                   </h2>
-                  <span className="text-xs text-slate-400">
-                    Обновление списка комнат в реальном времени
-                  </span>
+                  <div className="flex items-center gap-3">
+                    {sortedRooms.length > 0 && (
+                      <button
+                        type="button"
+                        disabled={lobbyBusy}
+                        onClick={async () => {
+                          setLobbyBusy(true);
+                          await clearAllStaleRooms(sortedRooms, playerUid);
+                          setLobbyBusy(false);
+                        }}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 hover:border-red-500/40 text-xs text-slate-400 hover:text-red-300 transition-colors cursor-pointer"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <span>Очистить комнаты</span>
+                      </button>
+                    )}
+                    <span className="hidden sm:inline text-xs text-slate-400">
+                      Автоочистка пустых через 15 сек
+                    </span>
+                  </div>
                 </div>
 
                 {sortedRooms.length === 0 ? (
@@ -941,17 +974,15 @@ export default function App() {
                           </div>
 
                           <div className="flex items-center gap-2.5 shrink-0">
-                            {(r.hostUid === currentProfile.uid || isMember) && (
-                              <button
-                                type="button"
-                                disabled={lobbyBusy}
-                                onClick={() => handleDeleteLobbyRoom(r)}
-                                title="Удалить комнату"
-                                className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 hover:border-red-500/50 text-slate-400 hover:text-red-400 transition-colors cursor-pointer"
-                              >
-                                <Trash2 className="w-4 h-4" />
-                              </button>
-                            )}
+                            <button
+                              type="button"
+                              disabled={lobbyBusy}
+                              onClick={() => handleDeleteLobbyRoom(r)}
+                              title="Удалить комнату"
+                              className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 hover:border-red-500/50 text-slate-400 hover:text-red-400 transition-colors cursor-pointer"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
                             <button
                               type="button"
                               disabled={lobbyBusy || (!isWaiting && !isMember)}

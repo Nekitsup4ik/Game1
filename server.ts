@@ -49,14 +49,29 @@ function sanitizeJerseyNumber(num: number): number {
 function cleanupStaleRooms() {
   const now = Date.now();
   for (const [roomId, room] of roomsStore.entries()) {
-    const isStaleWaiting = room.status === 'waiting' && now - room.updatedAtMs > 25 * 60 * 1000;
-    const isStalePlaying = room.status === 'playing' && now - room.updatedAtMs > 10 * 60 * 1000;
-    const isFinishedOld = room.status === 'finished' && now - room.updatedAtMs > 15 * 1000;
+    const roomPlayers = playersStore.get(roomId) || {};
+    // Remove any individual player who hasn't sent a heartbeat/sync in 16 seconds
+    let membersChanged = false;
+    for (const uid of [...room.memberUids]) {
+      const p = roomPlayers[uid];
+      if (!p || now - p.updatedAtMs > 16000) {
+        room.memberUids = room.memberUids.filter((id) => id !== uid);
+        room.redUids = room.redUids.filter((id) => id !== uid);
+        room.blueUids = room.blueUids.filter((id) => id !== uid);
+        delete roomPlayers[uid];
+        membersChanged = true;
+      }
+    }
+    if (membersChanged && room.memberUids.length > 0 && !room.memberUids.includes(room.hostUid)) {
+      room.hostUid = room.memberUids[0];
+      room.hostName = roomPlayers[room.hostUid]?.nickname || 'Хост';
+    }
+
+    const age = now - room.updatedAtMs;
     if (
       room.memberUids.length === 0 ||
-      isStaleWaiting ||
-      isStalePlaying ||
-      isFinishedOld
+      room.status === 'finished' ||
+      age > 16000
     ) {
       roomsStore.delete(roomId);
       playersStore.delete(roomId);
@@ -93,10 +108,41 @@ async function startServer() {
 
   // 2. Get specific room and its players
   app.get('/api/mp/room/:roomId', (req, res) => {
+    cleanupStaleRooms();
     const { roomId } = req.params;
     const room = roomsStore.get(roomId) || null;
     const players = playersStore.get(roomId) || {};
-    res.json({ room, players });
+    res.json({ room, players, ts: Date.now() });
+  });
+
+  // 2b. Room & Player Heartbeat + Ping Update
+  app.post('/api/mp/room/heartbeat', (req, res) => {
+    const { roomId, uid, pingMs } = req.body as {
+      roomId: string;
+      uid: string;
+      pingMs?: number;
+    };
+    const now = Date.now();
+    const room = roomsStore.get(roomId);
+    if (room) {
+      room.updatedAtMs = now;
+      room.heartbeatAtMs = now;
+    }
+    const roomPlayers = playersStore.get(roomId);
+    if (roomPlayers && roomPlayers[uid]) {
+      roomPlayers[uid].updatedAtMs = now;
+      if (typeof pingMs === 'number' && Number.isFinite(pingMs)) {
+        roomPlayers[uid].pingMs = clamp(Math.round(pingMs), 1, 999);
+      }
+    }
+    res.json({ ok: true, ts: now });
+  });
+
+  // 2c. Clear all rooms on request
+  app.post('/api/mp/lobby/clear', (_req, res) => {
+    roomsStore.clear();
+    playersStore.clear();
+    res.json({ ok: true });
   });
 
   // 3. Create a new match room
@@ -385,7 +431,15 @@ async function startServer() {
     const { roomId, uid, state } = req.body as {
       roomId: string;
       uid: string;
-      state: { x: number; y: number; vx: number; vy: number; kicking: boolean };
+      state: {
+        x: number;
+        y: number;
+        vx: number;
+        vy: number;
+        kicking: boolean;
+        pingMs?: number;
+        seq?: number;
+      };
     };
     const roomPlayers = playersStore.get(roomId);
     if (!roomPlayers || !roomPlayers[uid]) {
@@ -393,6 +447,11 @@ async function startServer() {
       return;
     }
     const now = Date.now();
+    const prevSeq = roomPlayers[uid].seq || 0;
+    if (state.seq && state.seq < prevSeq) {
+      res.json({ ok: true, ts: now });
+      return;
+    }
     roomPlayers[uid] = {
       ...roomPlayers[uid],
       x: Math.round(clamp(state.x, 0, CANVAS_WIDTH) * 10) / 10,
@@ -406,11 +465,19 @@ async function startServer() {
           clamp(state.vy, -PLAYER_MAX_SPEED * 2, PLAYER_MAX_SPEED * 2) * 100
         ) / 100,
       kicking: Boolean(state.kicking),
+      pingMs:
+        typeof state.pingMs === 'number'
+          ? clamp(Math.round(state.pingMs), 1, 999)
+          : roomPlayers[uid].pingMs || 18,
+      seq: state.seq || now,
       updatedAtMs: now,
     };
     const room = roomsStore.get(roomId);
-    if (room) room.updatedAtMs = now;
-    res.json({ ok: true });
+    if (room) {
+      room.updatedAtMs = now;
+      room.heartbeatAtMs = now;
+    }
+    res.json({ ok: true, ts: now });
   });
 
   // 8. Sync Gameplay & Ball State
@@ -428,6 +495,8 @@ async function startServer() {
         eventTeam: EventTeam;
         eventUntilMs: number;
         lastTouchTeam: EventTeam;
+        actorUid?: string;
+        seq?: number;
       };
     };
     const room = roomsStore.get(roomId);
@@ -449,7 +518,13 @@ async function startServer() {
           clamp(patch.ballVy, -BALL_MAX_SPEED * 2, BALL_MAX_SPEED * 2) * 100
         ) / 100;
       room.updatedAtMs = now;
-      res.json({ ok: true, room });
+      room.heartbeatAtMs = now;
+      res.json({ ok: true, room, ts: now });
+      return;
+    }
+
+    if (patch.seq && room.seq && patch.seq < room.seq && patch.eventState === 'normal') {
+      res.json({ ok: true, room, ts: now });
       return;
     }
 
@@ -469,8 +544,11 @@ async function startServer() {
     room.eventTeam = patch.eventTeam;
     room.eventUntilMs = Math.max(0, Math.round(patch.eventUntilMs));
     room.lastTouchTeam = patch.lastTouchTeam;
+    room.actorUid = patch.actorUid;
+    room.seq = patch.seq || now;
     room.updatedAtMs = now;
-    res.json({ ok: true, room });
+    room.heartbeatAtMs = now;
+    res.json({ ok: true, room, ts: now });
   });
 
   // 9. Register Goal in Net
