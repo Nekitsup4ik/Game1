@@ -5,6 +5,7 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
+    base: './', // <-- ДОБАВИЛИ ЭТУ СТРОЧКУ ДЛЯ ИСПРАВЛЕНИЯ БЕЛОГО ЭКРАНА
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
