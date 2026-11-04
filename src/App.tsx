@@ -1,19 +1,13 @@
 import React, { useEffect, useState } from 'react';
-import { onAuthStateChanged, signInWithPopup, signOut, User } from 'firebase/auth';
 import {
   ArrowRight,
   Gamepad2,
-  LogIn,
   LogOut,
   Plus,
   Trophy,
   Trash2,
   UserCheck,
 } from 'lucide-react';
-import {
-  auth,
-  googleProvider,
-} from './firebase';
 import {
   MatchRoomDoc,
   PlayerProfile,
@@ -31,28 +25,21 @@ import { MatchArena } from './components/MatchArena';
 
 const STORAGE_NICKNAME_KEY = 'haxarena_nickname';
 const STORAGE_NUMBER_KEY = 'haxarena_jersey_number';
-const STORAGE_FALLBACK_UID_KEY = 'haxarena_fallback_uid';
+const STORAGE_PLAYER_UID_KEY = 'haxarena_player_uid';
 
 type NavTab = 'lobby' | 'profile' | 'rules' | 'controls';
 
-interface AuthSessionUser {
-  uid: string;
-  displayName: string | null;
+function getOrCreatePlayerUid(): string {
+  let uid = localStorage.getItem(STORAGE_PLAYER_UID_KEY);
+  if (!uid) {
+    uid = `player_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    localStorage.setItem(STORAGE_PLAYER_UID_KEY, uid);
+  }
+  return uid;
 }
 
 export default function App() {
-  const [firebaseUser, setFirebaseUser] = useState<AuthSessionUser | null>(() => {
-    const savedUid = localStorage.getItem(STORAGE_FALLBACK_UID_KEY);
-    if (savedUid) {
-      return {
-        uid: savedUid,
-        displayName: localStorage.getItem(STORAGE_NICKNAME_KEY) || 'Игрок',
-      };
-    }
-    return null;
-  });
-  const [authReady, setAuthReady] = useState<boolean>(false);
-  const [activeTab, setActiveTab] = useState<NavTab>('profile');
+  const [playerUid] = useState<string>(() => getOrCreatePlayerUid());
 
   // Start Screen Form State (Никнейм + Игровой номер 1..99)
   const [nicknameInput, setNicknameInput] = useState<string>(() => {
@@ -63,7 +50,12 @@ export default function App() {
   });
   const [previewTeam, setPreviewTeam] = useState<'red' | 'blue'>('red');
   const [profileConfirmed, setProfileConfirmed] = useState<boolean>(() => {
-    return Boolean(localStorage.getItem(STORAGE_NICKNAME_KEY));
+    const saved = localStorage.getItem(STORAGE_NICKNAME_KEY);
+    return Boolean(saved && saved.trim().length > 0);
+  });
+  const [activeTab, setActiveTab] = useState<NavTab>(() => {
+    const saved = localStorage.getItem(STORAGE_NICKNAME_KEY);
+    return saved && saved.trim().length > 0 ? 'lobby' : 'profile';
   });
   const [formError, setFormError] = useState<string | null>(null);
 
@@ -80,46 +72,9 @@ export default function App() {
   const [activeRoom, setActiveRoom] = useState<MatchRoomDoc | null>(null);
   const [activePlayers, setActivePlayers] = useState<Record<string, RoomPlayerDoc>>({});
 
-  // 1. Track Firebase Authentication State (with fallback support for GitHub Pages / external domains)
+  // 1. Subscribe to Active Lobby Rooms in Real Time once nickname is confirmed
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (user: User | null) => {
-      setAuthReady(true);
-      if (user) {
-        localStorage.removeItem(STORAGE_FALLBACK_UID_KEY);
-        setFirebaseUser({ uid: user.uid, displayName: user.displayName });
-        const savedNick = localStorage.getItem(STORAGE_NICKNAME_KEY);
-        if (!savedNick && user.displayName) {
-          setNicknameInput(user.displayName.slice(0, 20));
-        }
-        if (savedNick) {
-          setProfileConfirmed(true);
-          setActiveTab('lobby');
-        }
-      } else {
-        const fallbackUid = localStorage.getItem(STORAGE_FALLBACK_UID_KEY);
-        if (fallbackUid) {
-          const savedNick = localStorage.getItem(STORAGE_NICKNAME_KEY);
-          setFirebaseUser({
-            uid: fallbackUid,
-            displayName: savedNick || 'Игрок',
-          });
-          if (savedNick) {
-            setProfileConfirmed(true);
-            setActiveTab('lobby');
-          }
-        } else {
-          setFirebaseUser(null);
-          setProfileConfirmed(false);
-          setActiveTab('profile');
-        }
-      }
-    });
-    return () => unsub();
-  }, []);
-
-  // 2. Subscribe to Active Lobby Rooms in Real Time
-  useEffect(() => {
-    if (!authReady || !firebaseUser) {
+    if (!profileConfirmed) {
       setRoomIds([]);
       setLobbyRooms({});
       return;
@@ -139,11 +94,11 @@ export default function App() {
     });
 
     return () => unsub();
-  }, [authReady, firebaseUser]);
+  }, [profileConfirmed]);
 
-  // 3. Subscribe to Active Room Document & Players in Real Time (20Hz)
+  // 2. Subscribe to Active Room Document & Players in Real Time (20Hz)
   useEffect(() => {
-    if (!authReady || !firebaseUser || !activeRoomId) {
+    if (!profileConfirmed || !activeRoomId) {
       setActiveRoom(null);
       setActivePlayers({});
       return;
@@ -161,64 +116,21 @@ export default function App() {
     });
 
     return () => unsub();
-  }, [authReady, firebaseUser, activeRoomId]);
-
-  const activateFallbackDomainSession = () => {
-    let fallbackUid = localStorage.getItem(STORAGE_FALLBACK_UID_KEY);
-    if (!fallbackUid) {
-      fallbackUid = `player_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      localStorage.setItem(STORAGE_FALLBACK_UID_KEY, fallbackUid);
-    }
-    const savedNick = localStorage.getItem(STORAGE_NICKNAME_KEY) || nicknameInput.trim() || 'Игрок';
-    if (!nicknameInput.trim()) {
-      setNicknameInput(savedNick);
-    }
-    setFirebaseUser({ uid: fallbackUid, displayName: savedNick });
-    setFormError(null);
-  };
-
-  const handleGoogleSignIn = async () => {
-    setFormError(null);
-    try {
-      await signInWithPopup(auth, googleProvider);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      // If hosted on an external domain not yet added to Firebase Console (e.g. GitHub Pages *.github.io),
-      // seamlessly activate a persistent session so the player is never blocked by auth/unauthorized-domain!
-      if (
-        msg.includes('auth/unauthorized-domain') ||
-        msg.includes('auth/operation-not-supported-in-this-environment') ||
-        msg.includes('auth/popup-blocked')
-      ) {
-        activateFallbackDomainSession();
-        return;
-      }
-      setFormError(
-        err instanceof Error ? err.message : 'Не удалось выполнить вход через Google.'
-      );
-    }
-  };
+  }, [profileConfirmed, activeRoomId]);
 
   const handleSignOut = async () => {
     if (activeRoomId) {
       await handleLeaveCurrentRoom();
     }
-    localStorage.removeItem(STORAGE_FALLBACK_UID_KEY);
+    localStorage.removeItem(STORAGE_NICKNAME_KEY);
     setActiveRoomId(null);
-    setFirebaseUser(null);
     setProfileConfirmed(false);
     setActiveTab('profile');
-    await signOut(auth).catch(() => {});
   };
 
   const handleConfirmProfileForm = (e: React.FormEvent) => {
     e.preventDefault();
     setFormError(null);
-
-    if (!firebaseUser) {
-      setFormError('Сначала авторизуйтесь через аккаунт Google.');
-      return;
-    }
 
     const trimmedNick = nicknameInput.trim();
     if (trimmedNick.length < 1 || trimmedNick.length > 24) {
@@ -241,17 +153,7 @@ export default function App() {
   };
 
   const handleOpenLobbyTab = () => {
-    if (!firebaseUser) return;
-    const fallbackNick =
-      nicknameInput.trim() ||
-      firebaseUser.displayName?.slice(0, 20) ||
-      'Игрок';
-    const parsedNum = Math.max(1, Math.min(99, parseInt(jerseyInput, 10) || 10));
-    localStorage.setItem(STORAGE_NICKNAME_KEY, fallbackNick);
-    localStorage.setItem(STORAGE_NUMBER_KEY, String(parsedNum));
-    setNicknameInput(fallbackNick);
-    setJerseyInput(String(parsedNum));
-    setProfileConfirmed(true);
+    if (!profileConfirmed) return;
     if (activeRoomId) {
       handleLeaveCurrentRoom();
     }
@@ -279,13 +181,10 @@ export default function App() {
     setActiveTab('controls');
   };
 
-  const currentProfile: PlayerProfile | null = firebaseUser
+  const currentProfile: PlayerProfile | null = profileConfirmed
     ? {
-        uid: firebaseUser.uid,
-        nickname:
-          nicknameInput.trim() ||
-          firebaseUser.displayName?.slice(0, 20) ||
-          'Игрок',
+        uid: playerUid,
+        nickname: nicknameInput.trim() || 'Игрок',
         jerseyNumber: Math.max(1, Math.min(99, parseInt(jerseyInput, 10) || 10)),
       }
     : null;
@@ -335,20 +234,18 @@ export default function App() {
 
   const handleLeaveCurrentRoom = async () => {
     const roomToLeave = activeRoom;
-    const uid = firebaseUser?.uid;
     setActiveRoomId(null);
     setActiveRoom(null);
     setActivePlayers({});
-    if (roomToLeave && uid) {
-      await deleteOrLeaveMatchRoom(roomToLeave, uid).catch(() => {});
+    if (roomToLeave) {
+      await deleteOrLeaveMatchRoom(roomToLeave, playerUid).catch(() => {});
     }
   };
 
   const handleDeleteLobbyRoom = async (roomToDelete: MatchRoomDoc) => {
-    if (!firebaseUser) return;
     setLobbyBusy(true);
     try {
-      await deleteOrLeaveMatchRoom(roomToDelete, firebaseUser.uid);
+      await deleteOrLeaveMatchRoom(roomToDelete, playerUid);
     } catch {
       // ignore if already deleted
     } finally {
@@ -367,7 +264,7 @@ export default function App() {
   const previewNumber = Math.max(1, Math.min(99, parseInt(jerseyInput, 10) || 1));
   const previewNick = nicknameInput.trim() || 'Игрок';
   const isInActiveMatch = Boolean(
-    firebaseUser &&
+    profileConfirmed &&
       currentProfile &&
       activeRoom &&
       activeRoom.status !== 'waiting'
@@ -382,7 +279,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => {
-              if (firebaseUser && profileConfirmed) {
+              if (profileConfirmed) {
                 handleOpenLobbyTab();
               } else {
                 handleOpenProfileTab();
@@ -393,9 +290,9 @@ export default function App() {
             HaxArena 2D
           </button>
 
-          {/* Zone 2: Concise Single-Line Navigation Links ("Лобби матчей" shown ONLY when signed in with Google) */}
+          {/* Zone 2: Concise Single-Line Navigation Links ("Лобби матчей" shown once player entered nickname) */}
           <nav className="flex flex-wrap items-center gap-5 sm:gap-6 text-sm font-medium">
-            {firebaseUser && (
+            {profileConfirmed && (
               <button
                 type="button"
                 onClick={handleOpenLobbyTab}
@@ -445,23 +342,23 @@ export default function App() {
 
           {/* Zone 3: 1 Primary Action */}
           <div className="flex items-center shrink-0">
-            {firebaseUser ? (
+            {profileConfirmed ? (
               <button
                 type="button"
                 onClick={handleSignOut}
                 className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-slate-200 bg-slate-900 border border-slate-800 rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 <LogOut className="w-3.5 h-3.5" />
-                <span>Выйти</span>
+                <span>Сменить ник</span>
               </button>
             ) : (
               <button
                 type="button"
-                onClick={handleGoogleSignIn}
+                onClick={handleOpenProfileTab}
                 className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-slate-950 bg-emerald-500 rounded-lg hover:bg-emerald-400 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
-                <LogIn className="w-3.5 h-3.5" />
-                <span>Войти через Google</span>
+                <UserCheck className="w-3.5 h-3.5" />
+                <span>Ввести ник</span>
               </button>
             )}
           </div>
@@ -470,11 +367,7 @@ export default function App() {
 
       {/* Main Content Area */}
       <main className="flex-1 flex flex-col">
-        {!authReady ? (
-          <div className="flex-1 flex items-center justify-center p-8 text-sm text-slate-400">
-            Подключение к серверу...
-          </div>
-        ) : activeRoomId && activeRoom && currentProfile ? (
+        {activeRoomId && activeRoom && currentProfile ? (
           /* АКТИВНАЯ КОМНАТА ИЛИ МАТЧ */
           activeRoom.status === 'waiting' ? (
             <RoomLobbyView
@@ -510,7 +403,7 @@ export default function App() {
                   Полное описание правил игры, стартовых позиций, физики ворот, повершота, угловых и боковых аутов.
                 </p>
               </div>
-              {firebaseUser ? (
+              {profileConfirmed ? (
                 <button
                   type="button"
                   onClick={handleOpenLobbyTab}
@@ -525,7 +418,7 @@ export default function App() {
                   onClick={handleOpenProfileTab}
                   className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-display font-bold text-sm transition-colors cursor-pointer"
                 >
-                  <span>Настроить профиль и войти</span>
+                  <span>Ввести ник и играть</span>
                   <ArrowRight className="w-4 h-4" />
                 </button>
               )}
@@ -628,7 +521,7 @@ export default function App() {
                   Как двигаться по газону, мягко вести мяч кружком, пробивать по воротам, подавать угловые и заряжать Повершот.
                 </p>
               </div>
-              {firebaseUser ? (
+              {profileConfirmed ? (
                 <button
                   type="button"
                   onClick={handleOpenLobbyTab}
@@ -643,7 +536,7 @@ export default function App() {
                   onClick={handleOpenProfileTab}
                   className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-display font-bold text-sm transition-colors cursor-pointer"
                 >
-                  <span>Настроить профиль и войти</span>
+                  <span>Ввести ник и играть</span>
                   <ArrowRight className="w-4 h-4" />
                 </button>
               )}
@@ -728,18 +621,18 @@ export default function App() {
               </div>
             </div>
           </div>
-        ) : !firebaseUser || !profileConfirmed || !currentProfile || activeTab === 'profile' ? (
-          /* ВКЛАДКА «ПРОФИЛЬ И НОМЕР» (Авторизация Google + Никнейм и Игровой номер 1..99) */
+        ) : !profileConfirmed || !currentProfile || activeTab === 'profile' ? (
+          /* ВКЛАДКА «ПРОФИЛЬ И НОМЕР» (Вход сразу по Никнейму и Игровому номеру 1..99 без Google) */
           <div className="flex-1 flex items-center justify-center px-6 py-10">
             <div className="w-full max-w-4xl grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch">
-              {/* Left Column: Mandatory Registration Form */}
+              {/* Left Column: Direct Nickname & Jersey Registration Form */}
               <div className="lg:col-span-7 rounded-2xl bg-slate-900 border border-slate-800 p-6 sm:p-8 flex flex-col justify-between shadow-2xl">
                 <div>
                   <div className="text-xs font-medium text-emerald-400">
                     Командный 2D-мультиплеер · 4 на 4 · Матч 5 минут
                   </div>
                   <h1 className="mt-2 font-display font-extrabold text-2xl sm:text-3xl text-white text-balance">
-                    Карточка игрока перед выходом на поле
+                    Вход в игру по никнейму
                   </h1>
                   <p className="mt-2 text-sm text-slate-400">
                     Введите свой игровой никнейм и выберите номер на футболке от 1 до 99. Никнейм отображается над вашей фишкой, а номер — внутри кружка.
@@ -751,88 +644,72 @@ export default function App() {
                     </div>
                   )}
 
-                  {!firebaseUser ? (
-                    <div className="mt-6 p-5 rounded-xl bg-slate-950 border border-slate-800">
-                      <p className="text-xs text-slate-300 leading-relaxed">
-                        Для доступа к вкладке «Лобби матчей» и синхронизации игры подключите учётную запись Google, затем выберите ваш никнейм и игровой номер.
-                      </p>
-                      <button
-                        type="button"
-                        onClick={handleGoogleSignIn}
-                        className="mt-4 w-full flex items-center justify-center gap-2.5 px-5 py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-display font-bold text-sm transition-colors cursor-pointer"
+                  <form onSubmit={handleConfirmProfileForm} className="mt-6 space-y-5">
+                    <div>
+                      <label
+                        htmlFor="nickname-input"
+                        className="block text-xs font-semibold text-slate-300 mb-2"
                       >
-                        <LogIn className="w-4 h-4" />
-                        <span>Авторизоваться через Google</span>
-                      </button>
+                        Никнейм игрока (отображается над фишкой) *
+                      </label>
+                      <input
+                        id="nickname-input"
+                        type="text"
+                        required
+                        maxLength={24}
+                        value={nicknameInput}
+                        onChange={(e) => setNicknameInput(e.target.value)}
+                        placeholder="Например: Striker_RU"
+                        className="w-full px-4 py-3 rounded-xl bg-slate-950 border border-slate-800 focus:border-emerald-500 focus:outline-none text-sm text-white placeholder:text-slate-600"
+                      />
                     </div>
-                  ) : (
-                    <form onSubmit={handleConfirmProfileForm} className="mt-6 space-y-5">
-                      <div>
-                        <label
-                          htmlFor="nickname-input"
-                          className="block text-xs font-semibold text-slate-300 mb-2"
-                        >
-                          Никнейм игрока (отображается над фишкой) *
-                        </label>
-                        <input
-                          id="nickname-input"
-                          type="text"
-                          required
-                          maxLength={24}
-                          value={nicknameInput}
-                          onChange={(e) => setNicknameInput(e.target.value)}
-                          placeholder="Например: Striker_RU"
-                          className="w-full px-4 py-3 rounded-xl bg-slate-950 border border-slate-800 focus:border-emerald-500 focus:outline-none text-sm text-white placeholder:text-slate-600"
-                        />
-                      </div>
 
-                      <div>
-                        <label
-                          htmlFor="jersey-input"
-                          className="block text-xs font-semibold text-slate-300 mb-2"
-                        >
-                          Игровой номер от 1 до 99 (белым цветом внутри фишки) *
-                        </label>
-                        <div className="flex items-center gap-3">
-                          <input
-                            id="jersey-input"
-                            type="number"
-                            required
-                            min={1}
-                            max={99}
-                            value={jerseyInput}
-                            onChange={(e) => setJerseyInput(e.target.value)}
-                            className="w-32 px-4 py-3 rounded-xl bg-slate-950 border border-slate-800 focus:border-emerald-500 focus:outline-none font-mono-tabular font-bold text-lg text-white text-center"
-                          />
-                          <div className="flex flex-wrap gap-1.5">
-                            {[7, 9, 10, 11, 23, 77, 99].map((preset) => (
-                              <button
-                                key={preset}
-                                type="button"
-                                onClick={() => setJerseyInput(String(preset))}
-                                className={`px-2.5 py-1.5 rounded-lg font-mono-tabular text-xs font-semibold border transition-colors cursor-pointer ${
-                                  Number(jerseyInput) === preset
-                                    ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
-                                    : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
-                                }`}
-                              >
-                                #{preset}
-                              </button>
-                            ))}
-                          </div>
+                    <div>
+                      <label
+                        htmlFor="jersey-input"
+                        className="block text-xs font-semibold text-slate-300 mb-2"
+                      >
+                        Игровой номер от 1 до 99 (белым цветом внутри фишки) *
+                      </label>
+                      <div className="flex items-center gap-3">
+                        <input
+                          id="jersey-input"
+                          type="number"
+                          required
+                          min={1}
+                          max={99}
+                          value={jerseyInput}
+                          onChange={(e) => setJerseyInput(e.target.value)}
+                          className="w-32 px-4 py-3 rounded-xl bg-slate-950 border border-slate-800 focus:border-emerald-500 focus:outline-none font-mono-tabular font-bold text-lg text-white text-center"
+                        />
+                        <div className="flex flex-wrap gap-1.5">
+                          {[7, 9, 10, 11, 23, 77, 99].map((preset) => (
+                            <button
+                              key={preset}
+                              type="button"
+                              onClick={() => setJerseyInput(String(preset))}
+                              className={`px-2.5 py-1.5 rounded-lg font-mono-tabular text-xs font-semibold border transition-colors cursor-pointer ${
+                                Number(jerseyInput) === preset
+                                  ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
+                                  : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
+                              }`}
+                            >
+                              #{preset}
+                            </button>
+                          ))}
                         </div>
                       </div>
+                    </div>
 
-                      <button
-                        type="submit"
-                        className="w-full flex items-center justify-center gap-2 px-6 py-3.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-display font-bold text-base shadow-lg shadow-emerald-500/20 transition-colors cursor-pointer"
-                      >
-                        <UserCheck className="w-5 h-5" />
-                        <span>Сохранить и открыть лобби матчей</span>
-                        <ArrowRight className="w-4 h-4" />
-                      </button>
-                    </form>
-                  )}
+                    <button
+                      type="submit"
+                      className="w-full flex items-center justify-center gap-2 px-6 py-3.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-display font-bold text-base shadow-lg shadow-emerald-500/20 transition-colors cursor-pointer"
+                    >
+                      <UserCheck className="w-5 h-5" />
+                      <span>Войти в лобби матчей</span>
+                      <ArrowRight className="w-4 h-4" />
+                    </button>
+                  </form>
                 </div>
 
                 <div className="mt-6 pt-4 border-t border-slate-800/80 flex items-center justify-between text-xs text-slate-500">
