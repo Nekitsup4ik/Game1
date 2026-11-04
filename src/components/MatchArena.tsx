@@ -568,6 +568,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   const soundEnabledRef = useRef<boolean>(soundEnabled);
   const lastPlayerSyncMsRef = useRef<number>(0);
   const lastBallSyncMsRef = useRef<number>(0);
+  const lastLocalBallTouchMsRef = useRef<number>(0);
+  const remoteBallGraceUntilMsRef = useRef<number>(0);
   const lastHandledEventUntilRef = useRef<number>(0);
   const finishTriggeredRef = useRef<boolean>(false);
 
@@ -652,19 +654,34 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       p.myY = spawn.y;
       p.myVx = 0;
       p.myVy = 0;
-    } else if (room.hostUid !== profile.uid) {
-      // Non-host smoothly reconciles ball coordinates with snapshot
-      const dist = Math.hypot(room.ballX - p.ballX, room.ballY - p.ballY);
-      if (dist > 48 || room.eventState !== 'normal') {
-        p.ballX = room.ballX;
-        p.ballY = room.ballY;
-      } else {
-        p.ballX += (room.ballX - p.ballX) * 0.35;
-        p.ballY += (room.ballY - p.ballY) * 0.35;
+    } else {
+      const incomingActorUid = (room as MatchRoomDoc & { actorUid?: string }).actorUid;
+      const isFromOtherPlayer = Boolean(
+        incomingActorUid && incomingActorUid !== profile.uid
+      );
+      const recentlyTouchedLocally = now - lastLocalBallTouchMsRef.current < 150;
+
+      if (isFromOtherPlayer) {
+        remoteBallGraceUntilMsRef.current = now + 160;
       }
-      p.ballVx = room.ballVx;
-      p.ballVy = room.ballVy;
-      p.lastTouchTeam = room.lastTouchTeam;
+
+      if (
+        !recentlyTouchedLocally &&
+        (room.hostUid !== profile.uid || isFromOtherPlayer)
+      ) {
+        // Smoothly reconcile ball coordinates and velocity across all clients
+        const dist = Math.hypot(room.ballX - p.ballX, room.ballY - p.ballY);
+        if (dist > 44 || room.eventState !== 'normal' || isFromOtherPlayer) {
+          p.ballX = room.ballX;
+          p.ballY = room.ballY;
+        } else {
+          p.ballX += (room.ballX - p.ballX) * 0.42;
+          p.ballY += (room.ballY - p.ballY) * 0.42;
+        }
+        p.ballVx = room.ballVx;
+        p.ballVy = room.ballVy;
+        p.lastTouchTeam = room.lastTouchTeam;
+      }
     }
   }, [room, profile.uid]);
 
@@ -1364,29 +1381,44 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         }
       }
 
-      // 6. Network Synchronization to Firebase Firestore (Throttled to ~16Hz for zero lag)
+      // 6. Real-Time Network Synchronization (WebSocket + Firestore + Express API)
       if (!isMatchFinished) {
-        if (localMovedOrChanged && now - lastPlayerSyncMsRef.current >= 60) {
-          lastPlayerSyncMsRef.current = now;
-          syncLocalPlayerDisc(currentRoom.roomId, profile.uid, {
-            x: p.myX,
-            y: p.myY,
-            vx: p.myVx,
-            vy: p.myVy,
-            kicking: p.myKicking,
-          }).catch(() => {});
+        if (localTouchedBall) {
+          lastLocalBallTouchMsRef.current = now;
         }
 
-        const isBallAuthority =
-          currentRoom.hostUid === profile.uid || localTouchedBall;
+        if (localMovedOrChanged && now - lastPlayerSyncMsRef.current >= 50) {
+          lastPlayerSyncMsRef.current = now;
+          syncLocalPlayerDisc(
+            currentRoom.roomId,
+            profile.uid,
+            {
+              x: p.myX,
+              y: p.myY,
+              vx: p.myVx,
+              vy: p.myVy,
+              kicking: p.myKicking,
+            },
+            {
+              nickname: profile.nickname,
+              jerseyNumber: profile.jerseyNumber,
+              team: localTeam,
+            }
+          ).catch(() => {});
+        }
+
+        const isHostAuthority =
+          currentRoom.hostUid === profile.uid &&
+          now >= remoteBallGraceUntilMsRef.current;
+        const isBallAuthority = isHostAuthority || localTouchedBall;
         const ballMoving =
-          Math.abs(p.ballVx) > 0.05 || Math.abs(p.ballVy) > 0.05 || localTouchedBall;
+          Math.abs(p.ballVx) > 0.04 || Math.abs(p.ballVy) > 0.04 || localTouchedBall;
 
         if (
           isBallAuthority &&
           ballMoving &&
           p.eventState === 'normal' &&
-          now - lastBallSyncMsRef.current >= 65
+          (localTouchedBall || now - lastBallSyncMsRef.current >= 55)
         ) {
           lastBallSyncMsRef.current = now;
           syncRoomGameplayState(currentRoom.roomId, {
@@ -1400,6 +1432,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             eventTeam: p.eventTeam,
             eventUntilMs: p.eventUntilMs,
             lastTouchTeam: p.lastTouchTeam,
+            actorUid: localTouchedBall ? profile.uid : undefined,
           }).catch(() => {});
         }
       }

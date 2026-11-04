@@ -24,23 +24,15 @@ service cloud.firestore {
       return resource.data;
     }
 
-    function isSignedIn() {
-      return request.auth != null;
-    }
-
-    function isVerified() {
-      return isSignedIn() && request.auth.token.email_verified == true;
-    }
-
     // Master Gate Relational Helpers
-    function isCurrentRoomMember(roomId) {
+    function isRoomTargetMember(roomId, playerId) {
       return exists(/databases/$(database)/documents/rooms/$(roomId)) &&
-        request.auth.uid in get(/databases/$(database)/documents/rooms/$(roomId)).data.memberUids;
+        playerId in get(/databases/$(database)/documents/rooms/$(roomId)).data.memberUids;
     }
 
-    function isRoomMemberAfter(roomId) {
+    function isRoomTargetMemberAfter(roomId, playerId) {
       return existsAfter(/databases/$(database)/documents/rooms/$(roomId)) &&
-        request.auth.uid in getAfter(/databases/$(database)/documents/rooms/$(roomId)).data.memberUids;
+        playerId in getAfter(/databases/$(database)/documents/rooms/$(roomId)).data.memberUids;
     }
 
     // Validation Blueprint: LobbyDirectory
@@ -53,7 +45,6 @@ service cloud.firestore {
         data.roomIds.size() <= 20 &&
         (data.roomIds.size() == 0 || (data.roomIds[0] is string && data.roomIds[0].size() >= 1 && data.roomIds[0].size() <= 64)) &&
         isValidId(data.updatedBy) &&
-        data.updatedBy == request.auth.uid &&
         data.updatedAt is timestamp;
     }
 
@@ -130,15 +121,13 @@ service cloud.firestore {
 
     // Collection: /lobbies/{lobbyId}
     match /lobbies/{lobbyId} {
-      allow get: if isVerified() && isValidId(lobbyId);
+      allow get: if isValidId(lobbyId);
       allow list: if false;
-      allow create: if isVerified() &&
-        isValidId(lobbyId) &&
+      allow create: if isValidId(lobbyId) &&
         isValidLobbyDirectory(incoming()) &&
         incoming().lobbyId == lobbyId &&
         incoming().updatedAt == request.time;
-      allow update: if isVerified() &&
-        isValidId(lobbyId) &&
+      allow update: if isValidId(lobbyId) &&
         isValidLobbyDirectory(incoming()) &&
         incoming().lobbyId == existing().lobbyId &&
         incoming().updatedAt == request.time &&
@@ -148,42 +137,37 @@ service cloud.firestore {
 
     // Collection: /rooms/{roomId}
     match /rooms/{roomId} {
-      allow get: if isVerified() && isValidId(roomId);
+      allow get: if isValidId(roomId);
       allow list: if false;
-      allow create: if isVerified() &&
-        isValidId(roomId) &&
+      allow create: if isValidId(roomId) &&
         isValidMatchRoom(incoming()) &&
         incoming().roomId == roomId &&
-        incoming().hostUid == request.auth.uid &&
         incoming().status == 'waiting' &&
         incoming().winnerTeam == 'none' &&
-        request.auth.uid in incoming().memberUids &&
+        incoming().hostUid in incoming().memberUids &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time &&
-        existsAfter(/databases/$(database)/documents/rooms/$(roomId)/players/$(request.auth.uid));
+        existsAfter(/databases/$(database)/documents/rooms/$(roomId)/players/$(incoming().hostUid));
 
-      allow update: if isVerified() &&
-        isValidId(roomId) &&
+      allow update: if isValidId(roomId) &&
         isValidMatchRoom(incoming()) &&
         existing().status != 'finished' &&
         incoming().roomId == existing().roomId &&
         incoming().title == existing().title &&
-        incoming().hostUid == existing().hostUid &&
-        incoming().hostName == existing().hostName &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time && (
-          // Action 1: Join, Leave, or Switch Team
+          // Action 1: Join, Leave, Host Transfer, or Switch Team
           (
             existing().status in ['waiting', 'playing'] &&
             incoming().status == existing().status &&
-            (request.auth.uid in incoming().memberUids || request.auth.uid in existing().memberUids) &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['memberUids', 'redUids', 'blueUids', 'updatedAt'])
+            incoming().diff(existing()).affectedKeys().hasOnly(['hostUid', 'hostName', 'memberUids', 'redUids', 'blueUids', 'updatedAt'])
           ) ||
           // Action 2: Host Starts the Match
           (
             existing().status == 'waiting' &&
             incoming().status == 'playing' &&
-            existing().hostUid == request.auth.uid &&
+            incoming().hostUid == existing().hostUid &&
+            incoming().hostName == existing().hostName &&
             incoming().diff(existing()).affectedKeys().hasOnly([
               'status', 'matchStartedAtMs',
               'ballX', 'ballY', 'ballVx', 'ballVy',
@@ -195,7 +179,8 @@ service cloud.firestore {
           (
             existing().status == 'playing' &&
             incoming().status == 'playing' &&
-            request.auth.uid in existing().memberUids &&
+            incoming().hostUid == existing().hostUid &&
+            incoming().hostName == existing().hostName &&
             incoming().diff(existing()).affectedKeys().hasOnly([
               'redScore', 'blueScore',
               'ballX', 'ballY', 'ballVx', 'ballVy',
@@ -207,7 +192,8 @@ service cloud.firestore {
           (
             existing().status == 'playing' &&
             incoming().status == 'finished' &&
-            request.auth.uid in existing().memberUids &&
+            incoming().hostUid == existing().hostUid &&
+            incoming().hostName == existing().hostName &&
             incoming().diff(existing()).affectedKeys().hasOnly([
               'status', 'winnerTeam',
               'ballX', 'ballY', 'ballVx', 'ballVy',
@@ -217,38 +203,32 @@ service cloud.firestore {
           )
         );
 
-      allow delete: if isVerified() &&
-        isValidId(roomId) &&
-        (existing().hostUid == request.auth.uid || request.auth.uid in existing().memberUids || existing().status == 'finished');
+      allow delete: if isValidId(roomId);
 
       // Subcollection: /rooms/{roomId}/players/{playerId}
       match /players/{playerId} {
-        allow get: if isVerified() && isValidId(roomId) && isValidId(playerId) && isCurrentRoomMember(roomId);
+        allow get: if isValidId(roomId) && isValidId(playerId) && isRoomTargetMember(roomId, playerId);
         allow list: if false;
-        allow create: if isVerified() &&
-          isValidId(roomId) &&
+        allow create: if isValidId(roomId) &&
           isValidId(playerId) &&
-          playerId == request.auth.uid &&
           isValidRoomPlayer(incoming()) &&
           incoming().playerId == playerId &&
           incoming().roomId == roomId &&
           incoming().createdAt == request.time &&
           incoming().updatedAt == request.time &&
-          isRoomMemberAfter(roomId);
+          isRoomTargetMemberAfter(roomId, playerId);
 
-        allow update: if isVerified() &&
-          isValidId(roomId) &&
+        allow update: if isValidId(roomId) &&
           isValidId(playerId) &&
           isValidRoomPlayer(incoming()) &&
           incoming().playerId == existing().playerId &&
           incoming().roomId == existing().roomId &&
           incoming().createdAt == existing().createdAt &&
           incoming().updatedAt == request.time &&
-          isCurrentRoomMember(roomId) &&
+          isRoomTargetMember(roomId, playerId) &&
           get(/databases/$(database)/documents/rooms/$(roomId)).data.status != 'finished' && (
             // Action 1: Player updates own team, profile, or spawn in Lobby
             (
-              playerId == request.auth.uid &&
               get(/databases/$(database)/documents/rooms/$(roomId)).data.status == 'waiting' &&
               incoming().diff(existing()).affectedKeys().hasOnly([
                 'team', 'nickname', 'jerseyNumber', 'x', 'y', 'vx', 'vy', 'kicking', 'updatedAt'
@@ -256,17 +236,13 @@ service cloud.firestore {
             ) ||
             // Action 2: Player moves own disc OR Host resets player positions on Goal / Start / Out
             (
-              (playerId == request.auth.uid || get(/databases/$(database)/documents/rooms/$(roomId)).data.hostUid == request.auth.uid) &&
               incoming().diff(existing()).affectedKeys().hasOnly([
                 'x', 'y', 'vx', 'vy', 'kicking', 'updatedAt'
               ])
             )
           );
 
-        allow delete: if isVerified() &&
-          isValidId(roomId) &&
-          isValidId(playerId) &&
-          playerId == request.auth.uid;
+        allow delete: if isValidId(roomId) && isValidId(playerId);
       }
     }
   }

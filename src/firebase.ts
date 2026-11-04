@@ -1,9 +1,9 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider } from 'firebase/auth';
-import { getFirestore, setLogLevel } from 'firebase/firestore';
+import { doc, getDocFromServer, getFirestore, setLogLevel } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 
-// Silence internal Firestore CChannel backoff logs when free-tier daily quota is reached
+// Silence internal Firestore backoff noise if free-tier daily quota is reached
 setLogLevel('silent');
 
 const app = initializeApp(firebaseConfig);
@@ -11,7 +11,7 @@ export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 
-export let isFirestoreQuotaExceeded = true;
+export let isFirestoreQuotaExceeded = false;
 
 export function markFirestoreQuotaExceeded() {
   isFirestoreQuotaExceeded = true;
@@ -83,3 +83,18 @@ export function handleFirestoreError(
   console.warn('Firestore Notice:', JSON.stringify(errInfo));
 }
 
+async function testConnection() {
+  try {
+    await getDocFromServer(doc(db, 'lobbies', 'main'));
+  } catch (error) {
+    if (isQuotaError(error)) {
+      isFirestoreQuotaExceeded = true;
+      return;
+    }
+    if (error instanceof Error && error.message.includes('the client is offline')) {
+      console.error('Please check your Firebase configuration.');
+    }
+  }
+}
+
+testConnection();
