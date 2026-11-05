@@ -639,6 +639,9 @@ export function subscribeToActiveRoom(
     inFlight = false;
   };
 
+  // Emit immediately from in-memory / WebSocket store so entering a room takes 0ms!
+  emitIfStructuralOrPeriodic(true);
+
   fetchRoomApi();
   const apiPollId = window.setInterval(fetchRoomApi, 2500);
   const uiPingRefreshId = window.setInterval(() => {
@@ -711,18 +714,10 @@ export async function createMatchRoom(
   const now = Date.now();
   const pingMs = realtimeWsBroker.getLocalPingMs();
 
-  let roomId = `room_${now}_${Math.random()
+  const roomId = `room_${now}_${Math.random()
     .toString(36)
     .slice(2, 7)
     .replace(/[^a-zA-Z0-9]/g, '')}`;
-
-  const apiRes = await postApiJson<{ roomId: string; room: SyncedRoomRecord }>(
-    '/api/mp/room/create',
-    { profile: { uid: safeUid, nickname, jerseyNumber }, customTitle: title }
-  );
-  if (apiRes?.roomId) {
-    roomId = apiRes.roomId;
-  }
 
   const newRoom: SyncedRoomRecord = {
     roomId,
@@ -766,6 +761,7 @@ export async function createMatchRoom(
     updatedAtMs: now,
   };
 
+  // 1. Immediately store in memory & publish over /ws so the host enters the lobby in 0ms!
   memoryRooms.set(roomId, newRoom);
   memoryPlayers.set(roomId, { [safeUid]: hostPlayer });
   bc?.postMessage({ type: 'room', room: newRoom });
@@ -773,6 +769,16 @@ export async function createMatchRoom(
 
   realtimeWsBroker.publishPlayer(hostPlayer, true);
   realtimeWsBroker.publishRoom(newRoom, true);
+
+  // 2. Sync to Express API & Firestore in background without blocking lobby transition
+  postApiJson<{ roomId: string; room: SyncedRoomRecord }>(
+    '/api/mp/room/create',
+    {
+      roomId,
+      profile: { uid: safeUid, nickname, jerseyNumber },
+      customTitle: title,
+    }
+  ).catch(() => {});
 
   if (!isFirestoreQuotaExceeded) {
     try {
@@ -787,8 +793,12 @@ export async function createMatchRoom(
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
-      await batch.commit();
-      await addRoomIdToFirestoreLobby(roomId, safeUid);
+      batch
+        .commit()
+        .then(() => addRoomIdToFirestoreLobby(roomId, safeUid))
+        .catch((err) => {
+          handleFirestoreError(err, OperationType.CREATE, `rooms/${roomId}`);
+        });
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, `rooms/${roomId}`);
     }
@@ -806,20 +816,30 @@ export async function joinMatchRoom(
   const jerseyNumber = clamp(Math.round(profile.jerseyNumber || 10), 1, 99);
   const pingMs = realtimeWsBroker.getLocalPingMs();
 
-  const apiRes = await postApiJson<{
-    joined: boolean;
-    reason?: string;
-    room?: SyncedRoomRecord;
-  }>('/api/mp/room/join', {
-    roomId,
-    profile: { uid: safeUid, nickname, jerseyNumber },
-  });
-
   let room: SyncedRoomRecord | null =
-    apiRes?.room ||
-    realtimeWsBroker.getRoom(roomId) ||
-    memoryRooms.get(roomId) ||
-    null;
+    realtimeWsBroker.getRoom(roomId) || memoryRooms.get(roomId) || null;
+
+  if (room) {
+    // Room is already known via /ws broker: fire HTTP join in background for zero wait!
+    postApiJson('/api/mp/room/join', {
+      roomId,
+      profile: { uid: safeUid, nickname, jerseyNumber },
+    }).catch(() => {});
+  } else {
+    const apiRes = await postApiJson<{
+      joined: boolean;
+      reason?: string;
+      room?: SyncedRoomRecord;
+    }>('/api/mp/room/join', {
+      roomId,
+      profile: { uid: safeUid, nickname, jerseyNumber },
+    });
+    room =
+      apiRes?.room ||
+      realtimeWsBroker.getRoom(roomId) ||
+      memoryRooms.get(roomId) ||
+      null;
+  }
 
   if (!room && !isFirestoreQuotaExceeded) {
     try {
@@ -928,7 +948,9 @@ export async function joinMatchRoom(
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
-      await batch.commit();
+      batch.commit().catch((err) => {
+        handleFirestoreError(err, OperationType.UPDATE, `rooms/${roomId}`);
+      });
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `rooms/${roomId}`);
     }
@@ -946,10 +968,10 @@ export async function switchPlayerTeam(
   const jerseyNumber = clamp(Math.round(profile.jerseyNumber || 10), 1, 99);
   const pingMs = realtimeWsBroker.getLocalPingMs();
 
-  await postApiJson('/api/mp/room/switch-team', {
+  postApiJson('/api/mp/room/switch-team', {
     roomId: room.roomId,
     profile: { uid: safeUid, nickname, jerseyNumber },
-  });
+  }).catch(() => {});
 
   const currentRoom =
     realtimeWsBroker.getRoom(room.roomId) ||
@@ -1040,7 +1062,9 @@ export async function switchPlayerTeam(
         kicking: false,
         updatedAt: serverTimestamp(),
       });
-      await batch.commit();
+      batch.commit().catch((err) => {
+        handleFirestoreError(err, OperationType.UPDATE, `rooms/${room.roomId}`);
+      });
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `rooms/${room.roomId}`);
     }
@@ -1053,7 +1077,7 @@ export async function startMatchByHost(
   room: MatchRoomDoc,
   playersMap: Record<string, RoomPlayerDoc>
 ): Promise<void> {
-  await postApiJson('/api/mp/room/start', { roomId: room.roomId });
+  postApiJson('/api/mp/room/start', { roomId: room.roomId }).catch(() => {});
 
   const now = Date.now();
   const updatedRoom: SyncedRoomRecord = {
@@ -1164,7 +1188,9 @@ export async function startMatchByHost(
           updatedAt: serverTimestamp(),
         });
       }
-      await batch.commit();
+      batch.commit().catch((err) => {
+        handleFirestoreError(err, OperationType.UPDATE, `rooms/${room.roomId}`);
+      });
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `rooms/${room.roomId}`);
     }
@@ -1239,6 +1265,36 @@ export async function syncLocalPlayerDisc(
   );
 }
 
+const hostAuthoritativePlayers = new Map<
+  string,
+  Record<
+    string,
+    {
+      x: number;
+      y: number;
+      vx: number;
+      vy: number;
+      kicking: boolean;
+      ts: number;
+    }
+  >
+>();
+
+export function getHostAuthoritativePlayerState(
+  roomId: string,
+  uid: string
+): {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  kicking: boolean;
+  ts: number;
+} | null {
+  const rMap = hostAuthoritativePlayers.get(roomId);
+  return rMap ? rMap[uid] || null : null;
+}
+
 export function applyWebRTCAuthoritativeSnapshot(
   roomId: string,
   hostUid: string,
@@ -1248,28 +1304,41 @@ export function applyWebRTCAuthoritativeSnapshot(
   const now = Date.now();
   const nextSeq = realtimeWsBroker.nextMonotonicSeq();
   const baseRoom = memoryRooms.get(roomId) || realtimeWsBroker.getRoom(roomId);
+  const isEchoOfLocalBall = Boolean(localUid && snap.actorUid === localUid);
+
   if (baseRoom) {
     memoryRooms.set(roomId, {
       ...baseRoom,
       redScore: Math.max(baseRoom.redScore, snap.redScore),
       blueScore: Math.max(baseRoom.blueScore, snap.blueScore),
-      ballX: snap.ballX,
-      ballY: snap.ballY,
-      ballVx: snap.ballVx,
-      ballVy: snap.ballVy,
+      ballX: isEchoOfLocalBall ? baseRoom.ballX : snap.ballX,
+      ballY: isEchoOfLocalBall ? baseRoom.ballY : snap.ballY,
+      ballVx: isEchoOfLocalBall ? baseRoom.ballVx : snap.ballVx,
+      ballVy: isEchoOfLocalBall ? baseRoom.ballVy : snap.ballVy,
       eventState: snap.eventState,
       eventTeam: snap.eventTeam,
       eventUntilMs: snap.eventUntilMs,
-      lastTouchTeam: snap.lastTouchTeam,
-      actorUid: hostUid,
-      seq: nextSeq,
+      lastTouchTeam: isEchoOfLocalBall
+        ? baseRoom.lastTouchTeam
+        : snap.lastTouchTeam,
+      actorUid: snap.actorUid,
+      seq: isEchoOfLocalBall ? baseRoom.seq : nextSeq,
       updatedAtMs: now,
       heartbeatAtMs: now,
     });
   }
 
+  const authMap = hostAuthoritativePlayers.get(roomId) || {};
   const pMap = memoryPlayers.get(roomId) || {};
   for (const [uid, pState] of Object.entries(snap.players)) {
+    authMap[uid] = {
+      x: pState.x,
+      y: pState.y,
+      vx: pState.vx,
+      vy: pState.vy,
+      kicking: pState.kicking,
+      ts: now,
+    };
     if (localUid && uid === localUid) continue;
     if (uid !== hostUid) continue;
     const existing = pMap[uid] || realtimeWsBroker.getRoomPlayers(roomId)[uid];
@@ -1289,6 +1358,7 @@ export function applyWebRTCAuthoritativeSnapshot(
       updatedAtMs: now,
     };
   }
+  hostAuthoritativePlayers.set(roomId, authMap);
   memoryPlayers.set(roomId, pMap);
 }
 

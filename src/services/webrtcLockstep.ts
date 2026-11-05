@@ -709,6 +709,7 @@ export interface FastAuthoritativeSnapshot {
   eventTeam: EventTeam;
   eventUntilMs: number;
   lastTouchTeam: EventTeam;
+  actorUid?: string;
   players: Record<
     string,
     {

@@ -18,6 +18,7 @@ import {
   clearAllStaleRooms,
   createMatchRoom,
   deleteOrLeaveMatchRoom,
+  getLiveMatchSnapshot,
   joinMatchRoom,
   refreshLobbyRoomsNow,
   subscribeToActiveRoom,
@@ -210,6 +211,11 @@ export default function App() {
     setLobbyBusy(true);
     try {
       const roomId = await createMatchRoom(currentProfile, newRoomTitle);
+      const snap = getLiveMatchSnapshot(roomId);
+      if (snap.room) {
+        setActiveRoom({ ...snap.room });
+        setActivePlayers({ ...snap.players });
+      }
       setNewRoomTitle('');
       setActiveRoomId(roomId);
       setActiveTab('lobby');
@@ -233,6 +239,11 @@ export default function App() {
       if (!res.joined) {
         setLobbyError(res.reason || 'Не удалось войти в комнату.');
       } else {
+        const snap = getLiveMatchSnapshot(cleanId);
+        if (snap.room) {
+          setActiveRoom({ ...snap.room });
+          setActivePlayers({ ...snap.players });
+        }
         setActiveRoomId(cleanId);
         setJoinCodeInput('');
         setActiveTab('lobby');

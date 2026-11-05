@@ -42,6 +42,7 @@ import {
 import {
   applyWebRTCAuthoritativeSnapshot,
   finishMatchRoom,
+  getHostAuthoritativePlayerState,
   getLiveMatchSnapshot,
   getLocalPingMs,
   registerGoalInNet,
@@ -84,6 +85,8 @@ interface GoalNetNode {
 interface LocalPhysicsState {
   myX: number;
   myY: number;
+  myOffsetX: number;
+  myOffsetY: number;
   myVx: number;
   myVy: number;
   myKicking: boolean;
@@ -567,6 +570,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   const physRef = useRef<LocalPhysicsState>({
     myX: players[profile.uid]?.x ?? initialSpawn.x,
     myY: players[profile.uid]?.y ?? initialSpawn.y,
+    myOffsetX: 0,
+    myOffsetY: 0,
     myVx: 0,
     myVy: 0,
     myKicking: false,
@@ -601,6 +606,15 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   const lastBallSyncMsRef = useRef<number>(0);
   const lastLocalBallTouchMsRef = useRef<number>(0);
   const remoteBallGraceUntilMsRef = useRef<number>(0);
+  const remoteBallActorUidRef = useRef<string>('');
+  const lastPlayerCollisionMsRef = useRef<number>(0);
+  const lastSentPosRef = useRef<{
+    x: number;
+    y: number;
+    vx: number;
+    vy: number;
+    keyMask: number;
+  }>({ x: -1, y: -1, vx: 0, vy: 0, keyMask: -1 });
   const lastAppliedBallSeqRef = useRef<number>(room.seq || 0);
   const lastHandledEventUntilRef = useRef<number>(0);
   const finishTriggeredRef = useRef<boolean>(false);
@@ -640,6 +654,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         }
       },
       onClientBall: (pkt) => {
+        const nowMs = Date.now();
+        // If Host itself is actively kicking/touching the ball at this exact instant, resolve smoothly
         const p = physRef.current;
         const prevVisX = p.ballX + p.ballOffsetX;
         const prevVisY = p.ballY + p.ballOffsetY;
@@ -651,13 +667,14 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         const errX = prevVisX - p.ballX;
         const errY = prevVisY - p.ballY;
         if (Math.hypot(errX, errY) < 95) {
-          p.ballOffsetX = round4(errX * 0.45);
-          p.ballOffsetY = round4(errY * 0.45);
+          p.ballOffsetX = round4(errX * 0.42);
+          p.ballOffsetY = round4(errY * 0.42);
         } else {
           p.ballOffsetX = 0;
           p.ballOffsetY = 0;
         }
-        remoteBallGraceUntilMsRef.current = Date.now() + 200;
+        remoteBallGraceUntilMsRef.current = nowMs + 380;
+        remoteBallActorUidRef.current = pkt.playerId;
       },
     });
     webrtcSessionRef.current = session;
@@ -808,6 +825,33 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
 
       // Direct 60 FPS Zero-Lag Snapshot Pull (Bypasses React state re-renders!)
       const liveSnap = getLiveMatchSnapshot(roomRef.current.roomId);
+      if (Object.keys(liveSnap.players).length > 0) {
+        const nextPlayers = { ...playersRef.current };
+        for (const [uid, pl] of Object.entries(liveSnap.players)) {
+          if (uid === profile.uid) continue;
+          nextPlayers[uid] = pl;
+        }
+        playersRef.current = nextPlayers;
+      }
+
+      // Check distances to ball to protect local dribble control from delayed network echoes
+      const myDistToBallBefore = Math.hypot(p.ballX - p.myX, p.ballY - p.myY);
+      let closestRemoteDistToBall = Infinity;
+      for (const rp of Object.values(playersRef.current)) {
+        if (rp.playerId === profile.uid) continue;
+        const rPos = p.remoteRenderPos[rp.playerId] || rp;
+        const d = Math.hypot(p.ballX - rPos.x, p.ballY - rPos.y);
+        if (d < closestRemoteDistToBall) closestRemoteDistToBall = d;
+      }
+
+      const isLocalSoleDribbler =
+        myDistToBallBefore <= PLAYER_RADIUS + BALL_RADIUS + 18 &&
+        myDistToBallBefore < closestRemoteDistToBall - 4;
+      const recentlyTouchedLocally =
+        now - lastLocalBallTouchMsRef.current < 360 || isLocalSoleDribbler;
+      const isRemoteContestingClose =
+        closestRemoteDistToBall <= PLAYER_RADIUS + BALL_RADIUS + 10;
+
       if (liveSnap.room) {
         const netRoom = liveSnap.room;
         const prevEventState = roomRef.current.eventState;
@@ -873,33 +917,33 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             const isFromOtherPlayer = Boolean(
               netRoom.actorUid && netRoom.actorUid !== profile.uid
             );
-            const recentlyTouchedLocally =
-              now - lastLocalBallTouchMsRef.current < 160;
 
             if (isFromOtherPlayer) {
-              remoteBallGraceUntilMsRef.current = now + 200;
+              remoteBallGraceUntilMsRef.current = now + 380;
+              remoteBallActorUidRef.current = netRoom.actorUid || '';
             }
 
-            if (
-              isFromOtherPlayer ||
-              (!recentlyTouchedLocally && netRoom.hostUid !== profile.uid)
-            ) {
+            // Never overwrite the ball while the local player is sole dribbler / just kicked it,
+            // UNLESS another player is physically contesting the ball right next to it!
+            const shouldApplyRemoteBall =
+              (isFromOtherPlayer && (!recentlyTouchedLocally || isRemoteContestingClose)) ||
+              (!recentlyTouchedLocally && netRoom.hostUid !== profile.uid);
+
+            if (shouldApplyRemoteBall) {
               const prevVisX = p.ballX + p.ballOffsetX;
               const prevVisY = p.ballY + p.ballOffsetY;
 
-              // 1. Immediately apply 100% of the authoritative ball position & velocity (no artificial forward shift ahead of dribbler!)
               p.ballX = round4(netRoom.ballX);
               p.ballY = round4(netRoom.ballY);
               p.ballVx = netRoom.ballVx;
               p.ballVy = netRoom.ballVy;
               p.lastTouchTeam = netRoom.lastTouchTeam;
 
-              // 2. Absorb visual discrepancy into ballOffsetX/ballOffsetY so it glides with zero teleport!
               const errX = prevVisX - p.ballX;
               const errY = prevVisY - p.ballY;
               const errDist = Math.hypot(errX, errY);
               if (errDist < 95) {
-                const keep = isFromOtherPlayer ? 0.45 : 0.65;
+                const keep = isFromOtherPlayer ? 0.42 : 0.62;
                 p.ballOffsetX = round4(errX * keep);
                 p.ballOffsetY = round4(errY * keep);
               } else {
@@ -911,20 +955,15 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         }
       }
 
-      // Decay visual smoothing offset on every 60Hz frame
+      // Decay visual smoothing offsets on every 60Hz frame
       p.ballOffsetX =
         Math.abs(p.ballOffsetX) > 0.25 ? round4(p.ballOffsetX * 0.72) : 0;
       p.ballOffsetY =
         Math.abs(p.ballOffsetY) > 0.25 ? round4(p.ballOffsetY * 0.72) : 0;
-
-      if (Object.keys(liveSnap.players).length > 0) {
-        const nextPlayers = { ...playersRef.current };
-        for (const [uid, pl] of Object.entries(liveSnap.players)) {
-          if (uid === profile.uid) continue;
-          nextPlayers[uid] = pl;
-        }
-        playersRef.current = nextPlayers;
-      }
+      p.myOffsetX =
+        Math.abs(p.myOffsetX) > 0.2 ? round4(p.myOffsetX * 0.72) : 0;
+      p.myOffsetY =
+        Math.abs(p.myOffsetY) > 0.2 ? round4(p.myOffsetY * 0.72) : 0;
 
       const currentRoom = roomRef.current;
       const allPlayers = playersRef.current;
@@ -950,7 +989,6 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         p.eventUntilMs = 0;
 
         if (finishedEvent === 'goal') {
-          // 3 seconds after goal: reset ball to center and reset players to starting formation
           p.ballX = FIELD_CENTER_X;
           p.ballY = FIELD_CENTER_Y;
           p.ballVx = 0;
@@ -962,6 +1000,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           const spawn = getTeamSpawnPosition(localTeam, localSlotIdx);
           p.myX = spawn.x;
           p.myY = spawn.y;
+          p.myOffsetX = 0;
+          p.myOffsetY = 0;
           p.myVx = 0;
           p.myVy = 0;
 
@@ -1002,7 +1042,6 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         const playerDamp = Math.pow(PLAYER_DAMPING, dtScale);
 
         if (dirX !== 0 || dirY !== 0) {
-          // Force vector via Math.atan2 -> Math.cos / Math.sin with 4-decimal rounding
           const moveAngle = Math.atan2(dirY, dirX);
           const ax = round4(Math.cos(moveAngle) * accel);
           const ay = round4(Math.sin(moveAngle) * accel);
@@ -1019,7 +1058,6 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           p.myVx = round4(Math.cos(sAngle) * PLAYER_MAX_SPEED);
           p.myVy = round4(Math.sin(sAngle) * PLAYER_MAX_SPEED);
         }
-        // Subtle football turf glide: allow natural deceleration down to 0.012 before stopping
         if (speed < 0.012 && dirX === 0 && dirY === 0) {
           p.myVx = 0;
           p.myVy = 0;
@@ -1042,7 +1080,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         p.myKicking = false;
       }
 
-      // Continuous 60fps HaxBall Dead-Reckoning + Visual Offset Smoothing for Remote Players (Zero shudder!)
+      // Continuous 60fps HaxBall Dead-Reckoning + Visual Offset Smoothing for Remote Players
       const remotePlayerDamp = Math.pow(PLAYER_DAMPING, dtScale);
 
       Object.values(allPlayers).forEach((rp) => {
@@ -1085,8 +1123,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           const errY = prevVisY - state.y;
           const errDist = Math.hypot(errX, errY);
           if (errDist < 95) {
-            state.offsetX = round4(errX * 0.65);
-            state.offsetY = round4(errY * 0.65);
+            state.offsetX = round4(errX * 0.62);
+            state.offsetY = round4(errY * 0.62);
           } else {
             state.offsetX = 0;
             state.offsetY = 0;
@@ -1163,7 +1201,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         state.simY = state.y;
       });
 
-      // 1b. Player-to-Player Disc Collisions (Фишки игроков сталкиваются и толкают друг друга!)
+      // 1b. Player-to-Player Disc Collisions + Coordinate Convergence (Фишки сталкиваются без рассинхрона координат!)
       if (!isMatchFinished && !isPausedForOutOrCorner) {
         const minPlayerDist = PLAYER_RADIUS * 2; // 38px
         Object.values(allPlayers).forEach((rp) => {
@@ -1181,27 +1219,55 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             const ny = round4(Math.sin(pAngle));
             const overlap = minPlayerDist - distP;
 
-            // Push both discs apart symmetrically so players can block and push each other
-            p.myX = round4(p.myX + nx * overlap * 0.52);
-            p.myY = round4(p.myY + ny * overlap * 0.52);
-            rState.x = round4(rState.x - nx * overlap * 0.48);
-            rState.y = round4(rState.y - ny * overlap * 0.48);
+            // Resolve overlap primarily on local player (75%) and only slightly on remote render (25%)
+            // so local player immediately broadcasts its true pushed coordinates without creating a fake remote offset!
+            p.myX = round4(p.myX + nx * overlap * 0.75);
+            p.myY = round4(p.myY + ny * overlap * 0.75);
+            rState.x = round4(rState.x - nx * overlap * 0.25);
+            rState.y = round4(rState.y - ny * overlap * 0.25);
 
             // Elastic 2D momentum transfer between equal-mass player discs
             const relVx = p.myVx - rState.vx;
             const relVy = p.myVy - rState.vy;
             const normalVel = relVx * nx + relVy * ny;
             if (normalVel < 0) {
-              const playerRestitution = 0.28;
-              const impulse = -(1 + playerRestitution) * normalVel * 0.5;
+              const playerRestitution = 0.16;
+              const impulse = -(1 + playerRestitution) * normalVel * 0.55;
               p.myVx = round4(p.myVx + impulse * nx);
               p.myVy = round4(p.myVy + impulse * ny);
-              rState.vx = round4(rState.vx - impulse * nx);
-              rState.vy = round4(rState.vy - impulse * ny);
+              rState.vx = round4(rState.vx - impulse * nx * 0.45);
+              rState.vy = round4(rState.vy - impulse * ny * 0.45);
             }
+            lastPlayerCollisionMsRef.current = now;
             localMovedOrChanged = true;
           }
         });
+
+        // If Client recently collided with another player, smoothly reconcile with Host's authoritative coordinates
+        // so both screens converge to 100% identical player coordinates!
+        if (
+          currentRoom.hostUid !== profile.uid &&
+          now - lastPlayerCollisionMsRef.current < 260
+        ) {
+          const hostAuthMe = getHostAuthoritativePlayerState(
+            currentRoom.roomId,
+            profile.uid
+          );
+          if (hostAuthMe && now - hostAuthMe.ts < 180) {
+            const diffX = hostAuthMe.x - p.myX;
+            const diffY = hostAuthMe.y - p.myY;
+            const diffDist = Math.hypot(diffX, diffY);
+            if (diffDist > 4 && diffDist < 90) {
+              const prevVisX = p.myX + p.myOffsetX;
+              const prevVisY = p.myY + p.myOffsetY;
+              p.myX = round4(p.myX + diffX * 0.28);
+              p.myY = round4(p.myY + diffY * 0.28);
+              p.myOffsetX = round4((prevVisX - p.myX) * 0.65);
+              p.myOffsetY = round4((prevVisY - p.myY) * 0.65);
+              localMovedOrChanged = true;
+            }
+          }
+        }
 
         // Keep local player within outer arena walls & goalposts after player-to-player push
         p.myX = round4(
@@ -1589,7 +1655,6 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         }
 
         // During the 3-second post-goal window, the ball is free to rebound or be kicked out of the goal!
-        // Keep it inside the outer stadium perimeter so it stays in the arena until the 3s reset.
         if (p.eventState === 'goal') {
           if (p.ballX - BALL_RADIUS < 3) {
             p.ballX = 3 + BALL_RADIUS;
@@ -1719,23 +1784,41 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         }
       }
 
-      // 6. Real-Time Network Synchronization (60Hz WebRTC Lockstep + 50Hz /ws Direct Fast Channel)
+      // 6. Real-Time Network Synchronization (60Hz WebRTC Lockstep + 60Hz /ws Direct Fast Channel)
       if (!isMatchFinished) {
-        if (localTouchedBall) {
+        const myDistAfter = Math.hypot(p.ballX - p.myX, p.ballY - p.myY);
+        const isDribblingNow =
+          myDistAfter <= PLAYER_RADIUS + BALL_RADIUS + 16 &&
+          myDistAfter < closestRemoteDistToBall - 4 &&
+          now - lastLocalBallTouchMsRef.current < 900;
+
+        if (localTouchedBall || isDribblingNow) {
           lastLocalBallTouchMsRef.current = now;
-          if (rtcSession && !rtcSession.isHost) {
-            rtcSession.sendClientBallTouch({
-              ballX: p.ballX,
-              ballY: p.ballY,
-              ballVx: p.ballVx,
-              ballVy: p.ballVy,
-              lastTouchTeam: p.lastTouchTeam,
-            });
-          }
+          remoteBallGraceUntilMsRef.current = 0;
+          remoteBallActorUidRef.current = profile.uid;
+        }
+
+        const isClientActivelyControllingBall =
+          currentRoom.hostUid !== profile.uid &&
+          (localTouchedBall ||
+            isDribblingNow ||
+            now - lastLocalBallTouchMsRef.current < 340);
+
+        if (
+          rtcSession &&
+          !rtcSession.isHost &&
+          (localTouchedBall || isClientActivelyControllingBall)
+        ) {
+          rtcSession.sendClientBallTouch({
+            ballX: p.ballX,
+            ballY: p.ballY,
+            ballVx: p.ballVx,
+            ballVy: p.ballVy,
+            lastTouchTeam: p.lastTouchTeam,
+          });
         }
 
         // Broadcast 60Hz authoritative lockstep frame over WebRTC DataChannel when Host
-        // Only send Host's own authoritative disc in snapPlayers so Host never echoes stale client positions back to clients!
         if (rtcSession && rtcSession.isHost) {
           const snapPlayers: Record<
             string,
@@ -1749,6 +1832,25 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               kicking: p.myKicking,
             },
           };
+          Object.values(allPlayers).forEach((rp) => {
+            if (rp.playerId === profile.uid) return;
+            const rState = p.remoteRenderPos[rp.playerId];
+            snapPlayers[rp.playerId] = {
+              x: rState ? rState.x : rp.x,
+              y: rState ? rState.y : rp.y,
+              vx: rState ? rState.vx : rp.vx || 0,
+              vy: rState ? rState.vy : rp.vy || 0,
+              kicking: rp.kicking || false,
+            };
+          });
+
+          const activeBallActor =
+            now < remoteBallGraceUntilMsRef.current
+              ? remoteBallActorUidRef.current
+              : now - lastLocalBallTouchMsRef.current < 360
+                ? profile.uid
+                : undefined;
+
           const resolved = rtcSession.resolveHostLockstepFrame(
             currentTick,
             { ...keysRef.current },
@@ -1764,6 +1866,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               eventTeam: p.eventTeam,
               eventUntilMs: p.eventUntilMs,
               lastTouchTeam: p.lastTouchTeam,
+              actorUid: activeBallActor,
               players: snapPlayers,
             }
           );
@@ -1780,11 +1883,28 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           (k.right ? 8 : 0) |
           (k.kick ? 16 : 0);
 
+        const lastSent = lastSentPosRef.current;
+        const posDelta = Math.hypot(p.myX - lastSent.x, p.myY - lastSent.y);
+        const velDelta = Math.hypot(p.myVx - lastSent.vx, p.myVy - lastSent.vy);
+        const needFastSync =
+          localMovedOrChanged ||
+          posDelta > 0.04 ||
+          velDelta > 0.01 ||
+          keyMask !== lastSent.keyMask;
+        const needIdleBeacon = now - lastPlayerSyncMsRef.current >= 120;
+
         if (
-          (localMovedOrChanged || keyMask !== 0) &&
-          now - lastPlayerSyncMsRef.current >= 20
+          (needFastSync && now - lastPlayerSyncMsRef.current >= 16) ||
+          needIdleBeacon
         ) {
           lastPlayerSyncMsRef.current = now;
+          lastSentPosRef.current = {
+            x: p.myX,
+            y: p.myY,
+            vx: p.myVx,
+            vy: p.myVy,
+            keyMask,
+          };
           syncLocalPlayerDisc(
             currentRoom.roomId,
             profile.uid,
@@ -1807,15 +1927,19 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         const isHostAuthority =
           currentRoom.hostUid === profile.uid &&
           now >= remoteBallGraceUntilMsRef.current;
-        const isBallAuthority = isHostAuthority || localTouchedBall;
+        const isBallAuthority =
+          isHostAuthority || localTouchedBall || isClientActivelyControllingBall;
         const ballMoving =
-          Math.abs(p.ballVx) > 0.03 || Math.abs(p.ballVy) > 0.03 || localTouchedBall;
+          Math.abs(p.ballVx) > 0.02 ||
+          Math.abs(p.ballVy) > 0.02 ||
+          localTouchedBall ||
+          isClientActivelyControllingBall;
 
         if (
           isBallAuthority &&
           ballMoving &&
           p.eventState === 'normal' &&
-          (localTouchedBall || now - lastBallSyncMsRef.current >= 20)
+          (localTouchedBall || now - lastBallSyncMsRef.current >= 16)
         ) {
           lastBallSyncMsRef.current = now;
           syncRoomGameplayState(currentRoom.roomId, {
@@ -1829,7 +1953,10 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             eventTeam: p.eventTeam,
             eventUntilMs: p.eventUntilMs,
             lastTouchTeam: p.lastTouchTeam,
-            actorUid: localTouchedBall ? profile.uid : undefined,
+            actorUid:
+              localTouchedBall || isClientActivelyControllingBall
+                ? profile.uid
+                : undefined,
           }).catch(() => {});
         }
       }
@@ -2409,8 +2536,8 @@ function drawArena(
     jerseyNumber:
       players[localProfile.uid]?.jerseyNumber || localProfile.jerseyNumber,
     team: localTeam,
-    x: phys.myX,
-    y: phys.myY,
+    x: phys.myX + (phys.myOffsetX || 0),
+    y: phys.myY + (phys.myOffsetY || 0),
     kicking: phys.myKicking,
     pingMs: getLocalPingMs(),
     isMe: true,

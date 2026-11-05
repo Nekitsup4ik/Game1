@@ -188,7 +188,8 @@ async function startServer() {
   // 3. Create a new match room
   app.post('/api/mp/room/create', (req, res) => {
     cleanupStaleRooms();
-    const { profile, customTitle } = req.body as {
+    const { roomId: requestedRoomId, profile, customTitle } = req.body as {
+      roomId?: string;
       profile: PlayerProfile;
       customTitle?: string;
     };
@@ -197,10 +198,13 @@ async function startServer() {
       return;
     }
 
-    const roomId = `room_${Date.now()}_${Math.random()
-      .toString(36)
-      .slice(2, 7)
-      .replace(/[^a-zA-Z0-9]/g, '')}`;
+    const roomId =
+      typeof requestedRoomId === 'string' && /^room_[a-zA-Z0-9_]{4,48}$/.test(requestedRoomId)
+        ? requestedRoomId
+        : `room_${Date.now()}_${Math.random()
+            .toString(36)
+            .slice(2, 7)
+            .replace(/[^a-zA-Z0-9]/g, '')}`;
     const nickname = sanitizeNickname(profile.nickname);
     const jerseyNumber = sanitizeJerseyNumber(profile.jerseyNumber);
     const title = sanitizeRoomTitle(customTitle || `Матч игрока ${nickname}`);
