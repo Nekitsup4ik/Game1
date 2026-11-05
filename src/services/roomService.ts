@@ -1643,7 +1643,6 @@ export async function resetFormationAfterGoalDelay(
   bc?.postMessage({ type: 'room', room: updatedRoom });
   for (const pDoc of resetPlayersList) {
     bc?.postMessage({ type: 'player', player: pDoc });
-    realtimeWsBroker.publishPlayer(pDoc, true);
   }
   realtimeWsBroker.publishRoom(updatedRoom, true);
 

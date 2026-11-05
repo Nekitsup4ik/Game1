@@ -476,10 +476,6 @@ class RealtimeMultiplayerBroker {
 
     const fastPrefix = `${TOPIC_PREFIX}/fast/`;
     if (topic.startsWith(fastPrefix)) {
-      // Never accept delayed 250ms+ MQTT echoes when directWs (<5ms) is active!
-      if (!fromDirectWs && this.directWsConnected) {
-        return;
-      }
       const roomId = topic.slice(fastPrefix.length);
       if (!roomId || payloadBytes.length === 0) return;
       if (this.deletedRoomIds.has(roomId)) return;
@@ -515,7 +511,7 @@ class RealtimeMultiplayerBroker {
           const km = typeof pkt.km === 'number' ? pkt.km : pkt.k === 1 ? 16 : 0;
           const isKickingNow = pkt.k === 1 || (km & 16) !== 0;
           const kickUntilMs = isKickingNow
-            ? nowMs + 140
+            ? nowMs + 160
             : existing?.kickUntilMs || 0;
 
           rPlayers[pkt.u] = {
@@ -584,12 +580,11 @@ class RealtimeMultiplayerBroker {
       if (!roomId) return;
 
       const existing = this.rooms.get(roomId);
-      // Block delayed external MQTT echoes or stale retained deletions when directWs (<5ms) is active for an ongoing match
-      if (!fromDirectWs && this.directWsConnected && existing) {
-        return;
-      }
 
       if (payloadBytes.length === 0) {
+        if (existing && existing.status === 'playing' && !fromDirectWs) {
+          return;
+        }
         this.deletedRoomIds.set(roomId, Date.now());
         this.rooms.delete(roomId);
         this.players.delete(roomId);
@@ -693,10 +688,8 @@ class RealtimeMultiplayerBroker {
         }
 
         const existing = rPlayers[uid];
-        // Block delayed external MQTT echoes when ultra-fast directWs (<5ms) is active
-        if (!fromDirectWs && this.directWsConnected && existing) {
-          return;
-        }
+        const room = this.rooms.get(roomId);
+        const isPlayingMatch = room && room.status === 'playing';
 
         const structuralChanged =
           !existing ||
@@ -704,19 +697,20 @@ class RealtimeMultiplayerBroker {
           existing.nickname !== parsed.nickname ||
           existing.jerseyNumber !== parsed.jerseyNumber;
 
-        const isFormationOrSpawnReset =
-          !existing ||
-          structuralChanged ||
-          (parsed.vx === 0 && parsed.vy === 0);
+        // During an active 'playing' match, NEVER let a retained players/ metadata packet overwrite live 60Hz coordinates!
+        const shouldAcceptCoords = !existing || !isPlayingMatch || structuralChanged;
 
         const localRxSeq = this.nextMonotonicSeq();
         rPlayers[uid] = {
           ...parsed,
-          x: isFormationOrSpawnReset ? parsed.x : existing.x,
-          y: isFormationOrSpawnReset ? parsed.y : existing.y,
-          vx: isFormationOrSpawnReset ? parsed.vx : existing.vx,
-          vy: isFormationOrSpawnReset ? parsed.vy : existing.vy,
-          seq: isFormationOrSpawnReset ? localRxSeq : existing.seq || localRxSeq,
+          x: shouldAcceptCoords ? parsed.x : existing.x,
+          y: shouldAcceptCoords ? parsed.y : existing.y,
+          vx: shouldAcceptCoords ? parsed.vx : existing.vx,
+          vy: shouldAcceptCoords ? parsed.vy : existing.vy,
+          kicking: shouldAcceptCoords ? parsed.kicking : existing.kicking,
+          kickUntilMs: existing?.kickUntilMs,
+          keyMask: existing?.keyMask,
+          seq: shouldAcceptCoords ? localRxSeq : existing.seq || localRxSeq,
           updatedAtMs: Date.now(),
         };
         this.players.set(roomId, rPlayers);
@@ -747,7 +741,7 @@ class RealtimeMultiplayerBroker {
   private broadcastMqtt(topic: string, payload: Uint8Array, retain: boolean) {
     this.start();
 
-    // 1. Always send over direct same-origin WebSocket (/ws) first (<5ms latency, zero throttling!)
+    // 1. Send over direct same-origin WebSocket (/ws) when connected (<5ms latency)
     if (
       this.directWsConnected &&
       this.directWs &&
@@ -760,16 +754,13 @@ class RealtimeMultiplayerBroker {
             payload: decoder.decode(payload),
           })
         );
-        // For non-retained fast ticks, never send to slow external MQTT brokers when directWs is open!
-        if (!retain) {
-          return;
-        }
       } catch {
         // ignore
       }
     }
 
-    // 2. Send to primary connected external broker for lobby discovery or GitHub Pages fallback
+    // 2. Always also send to primary connected external broker so players across ais-dev / ais-pre / Cloud Run instances / GitHub Pages
+    // receive 60Hz fast ticks and WebRTC signals! (lastSenderSeq automatically deduplicates whichever arrives second!)
     let sent = false;
     for (const entry of this.sockets) {
       if (entry.connected && entry.ws?.readyState === WebSocket.OPEN) {

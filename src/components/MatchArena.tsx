@@ -976,6 +976,31 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           p.myVx = 0;
           p.myVy = 0;
 
+          currentRoom.redUids.forEach((uid, idx) => {
+            if (uid === profile.uid) return;
+            const rSp = getTeamSpawnPosition('red', idx);
+            if (p.remoteRenderPos[uid]) {
+              p.remoteRenderPos[uid].x = rSp.x;
+              p.remoteRenderPos[uid].y = rSp.y;
+              p.remoteRenderPos[uid].offsetX = 0;
+              p.remoteRenderPos[uid].offsetY = 0;
+              p.remoteRenderPos[uid].vx = 0;
+              p.remoteRenderPos[uid].vy = 0;
+            }
+          });
+          currentRoom.blueUids.forEach((uid, idx) => {
+            if (uid === profile.uid) return;
+            const bSp = getTeamSpawnPosition('blue', idx);
+            if (p.remoteRenderPos[uid]) {
+              p.remoteRenderPos[uid].x = bSp.x;
+              p.remoteRenderPos[uid].y = bSp.y;
+              p.remoteRenderPos[uid].offsetX = 0;
+              p.remoteRenderPos[uid].offsetY = 0;
+              p.remoteRenderPos[uid].vx = 0;
+              p.remoteRenderPos[uid].vy = 0;
+            }
+          });
+
           resetFormationAfterGoalDelay(currentRoom, allPlayers, profile.uid).catch(
             () => {}
           );
@@ -1172,10 +1197,9 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           }
         }
 
-        // STEP 2: Reconcile when a new network packet arrives AFTER stepping dead-reckoning!
+        // STEP 2: Reconcile ONLY when a genuinely new network packet arrives (pktSeq !== state.lastSeq) AFTER stepping dead-reckoning!
         // Absorbing 100% (1.0) of (prevVisX - state.x) guarantees 0.000px instantaneous jump on packet arrival!
-        const driftFromAuth = Math.hypot(rp.x - state.x, rp.y - state.y);
-        if (pktSeq !== state.lastSeq || driftFromAuth > 2.5) {
+        if (pktSeq !== state.lastSeq) {
           const prevVisX = state.x + state.offsetX;
           const prevVisY = state.y + state.offsetY;
           state.lastSeq = pktSeq;
@@ -1187,7 +1211,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           const errX = prevVisX - state.x;
           const errY = prevVisY - state.y;
           const errDist = Math.hypot(errX, errY);
-          if (errDist < 120) {
+          if (errDist < 260) {
             state.offsetX = round4(errX);
             state.offsetY = round4(errY);
           } else {
