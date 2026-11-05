@@ -697,12 +697,37 @@ export interface WebRTCSignalMessage {
   ts: number;
 }
 
+export interface FastAuthoritativeSnapshot {
+  tick: number;
+  ballX: number;
+  ballY: number;
+  ballVx: number;
+  ballVy: number;
+  redScore: number;
+  blueScore: number;
+  eventState: EventState;
+  eventTeam: EventTeam;
+  eventUntilMs: number;
+  lastTouchTeam: EventTeam;
+  players: Record<
+    string,
+    {
+      x: number;
+      y: number;
+      vx: number;
+      vy: number;
+      kicking: boolean;
+    }
+  >;
+}
+
 type DataChannelPacket =
   | ({ kind: 'input' } & InputPacket)
   | {
       kind: 'frame';
       tick: number;
       inputs: Record<string, PlayerInputKeys>;
+      snap?: FastAuthoritativeSnapshot;
     }
   | {
       kind: 'state_seed';
@@ -734,6 +759,7 @@ export class WebRTCLockstepSession {
   private extrapolationMs = 20;
   private desynced = false;
   private desyncReason = '';
+  private targetMemberUids: string[] = [];
 
   // Map of peerUid -> RTCPeerConnection & RTCDataChannel
   private peers = new Map<
@@ -742,8 +768,10 @@ export class WebRTCLockstepSession {
       pc: RTCPeerConnection;
       dc: RTCDataChannel | null;
       open: boolean;
+      pendingCandidates: RTCIceCandidateInit[];
       missingTicks: number;
       waitTicksForCurrentFrame: number;
+      lastInputAtPerf: number;
       lastInputKeys: PlayerInputKeys;
       inputBuffer: Map<number, PlayerInputKeys>;
       pingMs: number;
@@ -752,7 +780,11 @@ export class WebRTCLockstepSession {
 
   private playerPings: Record<string, number> = {};
   private onFrameInputsCallback:
-    | ((tick: number, inputs: Record<string, PlayerInputKeys>) => void)
+    | ((
+        tick: number,
+        inputs: Record<string, PlayerInputKeys>,
+        snap?: FastAuthoritativeSnapshot
+      ) => void)
     | null = null;
   private onStateSeedCallback:
     | ((world: DeterministicWorldState) => void)
@@ -760,13 +792,18 @@ export class WebRTCLockstepSession {
   private onPeerDisconnectedCallback: ((peerUid: string) => void) | null = null;
   private onSignalOut: (msg: WebRTCSignalMessage) => void;
   private pingIntervalId: number | null = null;
+  private handshakeRetryId: number | null = null;
 
   constructor(opts: {
     roomId: string;
     localUid: string;
     isHost: boolean;
     onSignalOut: (msg: WebRTCSignalMessage) => void;
-    onFrameInputs?: (tick: number, inputs: Record<string, PlayerInputKeys>) => void;
+    onFrameInputs?: (
+      tick: number,
+      inputs: Record<string, PlayerInputKeys>,
+      snap?: FastAuthoritativeSnapshot
+    ) => void;
     onStateSeed?: (world: DeterministicWorldState) => void;
     onPeerDisconnected?: (peerUid: string) => void;
   }) {
@@ -784,6 +821,25 @@ export class WebRTCLockstepSession {
       this.pingIntervalId = window.setInterval(() => {
         this.sendPingProbes();
       }, PING_INTERVAL_MS);
+
+      // Automatic WebRTC Handshake Retry if any peer DataChannel is not open yet
+      this.handshakeRetryId = window.setInterval(() => {
+        for (const uid of this.targetMemberUids) {
+          if (uid === this.localUid) continue;
+          const entry = this.peers.get(uid);
+          if (!entry || !entry.open) {
+            if (!this.isHost) {
+              this.onSignalOut({
+                roomId: this.roomId,
+                fromUid: this.localUid,
+                toUid: uid,
+                type: 'join_request',
+                ts: Date.now(),
+              });
+            }
+          }
+        }
+      }, 1800);
     }
   }
 
@@ -820,9 +876,11 @@ export class WebRTCLockstepSession {
   }
 
   public connectToMemberPeers(memberUids: string[]) {
+    this.targetMemberUids = [...memberUids];
     for (const uid of memberUids) {
       if (uid === this.localUid) continue;
-      if (!this.peers.has(uid)) {
+      const existing = this.peers.get(uid);
+      if (!existing) {
         if (this.isHost) {
           this.initiateHostPeerConnection(uid);
         } else {
@@ -848,6 +906,7 @@ export class WebRTCLockstepSession {
     const existing = this.peers.get(peerUid);
     if (existing) {
       try {
+        existing.dc?.close();
         existing.pc.close();
       } catch {
         // ignore
@@ -862,8 +921,10 @@ export class WebRTCLockstepSession {
       pc,
       dc: null as RTCDataChannel | null,
       open: false,
+      pendingCandidates: [] as RTCIceCandidateInit[],
       missingTicks: 0,
       waitTicksForCurrentFrame: 0,
+      lastInputAtPerf: performance.now(),
       lastInputKeys: { ...EMPTY_INPUT_KEYS },
       inputBuffer: new Map<number, PlayerInputKeys>(),
       pingMs: 24,
@@ -907,6 +968,7 @@ export class WebRTCLockstepSession {
     dc.onopen = () => {
       entry.open = true;
       entry.missingTicks = 0;
+      entry.lastInputAtPerf = performance.now();
       this.sendPingProbes();
     };
     dc.onclose = () => {
@@ -923,7 +985,26 @@ export class WebRTCLockstepSession {
     };
   }
 
+  private async flushPendingCandidates(
+    entry: NonNullable<ReturnType<typeof this.peers.get>>
+  ) {
+    if (!entry.pc.remoteDescription || entry.pendingCandidates.length === 0) {
+      return;
+    }
+    const queue = entry.pendingCandidates.splice(0, entry.pendingCandidates.length);
+    for (const cand of queue) {
+      try {
+        await entry.pc.addIceCandidate(new RTCIceCandidate(cand));
+      } catch {
+        // ignore
+      }
+    }
+  }
+
   private async initiateHostPeerConnection(clientUid: string) {
+    const existing = this.peers.get(clientUid);
+    if (existing && existing.open) return;
+
     const entry = this.createPeerEntry(clientUid);
     try {
       const offer = await entry.pc.createOffer();
@@ -955,9 +1036,13 @@ export class WebRTCLockstepSession {
     }
 
     if (msg.type === 'offer' && !this.isHost && msg.sdp) {
+      const existing = this.peers.get(msg.fromUid);
+      if (existing && existing.open) return;
+
       const entry = this.createPeerEntry(msg.fromUid);
       try {
         await entry.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        await this.flushPendingCandidates(entry);
         const answer = await entry.pc.createAnswer();
         await entry.pc.setLocalDescription(answer);
         this.onSignalOut({
@@ -984,6 +1069,7 @@ export class WebRTCLockstepSession {
       if (entry && entry.pc.signalingState === 'have-local-offer') {
         try {
           await entry.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+          await this.flushPendingCandidates(entry);
         } catch {
           // ignore
         }
@@ -992,14 +1078,39 @@ export class WebRTCLockstepSession {
     }
 
     if (msg.type === 'ice' && msg.candidate) {
-      const entry = this.peers.get(msg.fromUid);
-      if (entry && entry.pc.remoteDescription) {
-        try {
-          await entry.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-        } catch {
-          // ignore
+      let entry = this.peers.get(msg.fromUid);
+      if (!entry && !this.isHost) {
+        entry = this.createPeerEntry(msg.fromUid);
+      }
+      if (entry) {
+        if (entry.pc.remoteDescription && entry.pc.remoteDescription.type) {
+          try {
+            await entry.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+          } catch {
+            // ignore
+          }
+        } else {
+          // Queue ICE candidate until remoteDescription is set!
+          entry.pendingCandidates.push(msg.candidate);
         }
       }
+    }
+  }
+
+  public receiveExternalInput(pkt: InputPacket) {
+    if (!this.isHost) return;
+    let entry = this.peers.get(pkt.playerId);
+    if (!entry) {
+      entry = this.createPeerEntry(pkt.playerId);
+    }
+    entry.missingTicks = 0;
+    entry.waitTicksForCurrentFrame = 0;
+    entry.lastInputAtPerf = performance.now();
+    entry.lastInputKeys = pkt.keys;
+    entry.inputBuffer.set(pkt.tick, pkt.keys);
+    if (entry.inputBuffer.size > 120) {
+      const firstKey = entry.inputBuffer.keys().next().value;
+      if (typeof firstKey === 'number') entry.inputBuffer.delete(firstKey);
     }
   }
 
@@ -1011,16 +1122,16 @@ export class WebRTCLockstepSession {
     if (pkt.kind === 'input' && this.isHost) {
       entry.missingTicks = 0;
       entry.waitTicksForCurrentFrame = 0;
+      entry.lastInputAtPerf = performance.now();
       entry.lastInputKeys = pkt.keys;
       entry.inputBuffer.set(pkt.tick, pkt.keys);
-      // Keep buffer bounded
       if (entry.inputBuffer.size > 120) {
         const firstKey = entry.inputBuffer.keys().next().value;
         if (typeof firstKey === 'number') entry.inputBuffer.delete(firstKey);
       }
     } else if (pkt.kind === 'frame' && !this.isHost) {
       if (this.onFrameInputsCallback) {
-        this.onFrameInputsCallback(pkt.tick, pkt.inputs);
+        this.onFrameInputsCallback(pkt.tick, pkt.inputs, pkt.snap);
       }
     } else if (pkt.kind === 'state_seed' && !this.isHost) {
       if (this.onStateSeedCallback) {
@@ -1077,7 +1188,8 @@ export class WebRTCLockstepSession {
    */
   public resolveHostLockstepFrame(
     targetTick: number,
-    hostKeys: PlayerInputKeys
+    hostKeys: PlayerInputKeys,
+    snap?: FastAuthoritativeSnapshot
   ): {
     ready: boolean;
     frameInputs: Record<string, PlayerInputKeys>;
@@ -1085,43 +1197,47 @@ export class WebRTCLockstepSession {
     const frameInputs: Record<string, PlayerInputKeys> = {
       [this.localUid]: hostKeys,
     };
+    const nowPerf = performance.now();
 
     for (const [peerUid, entry] of this.peers.entries()) {
-      if (!entry.open) {
-        frameInputs[peerUid] = entry.lastInputKeys || EMPTY_INPUT_KEYS;
-        continue;
-      }
-
       const buffered = entry.inputBuffer.get(targetTick);
       if (buffered) {
         entry.inputBuffer.delete(targetTick);
         entry.waitTicksForCurrentFrame = 0;
         entry.missingTicks = 0;
+        entry.lastInputKeys = buffered;
         frameInputs[peerUid] = buffered;
-      } else {
-        entry.waitTicksForCurrentFrame += 1;
-        entry.missingTicks += 1;
+        continue;
+      }
 
-        // 6. If inputs are missing for 60 consecutive ticks (1 second), close RTCPeerConnection and remove peer
-        if (entry.missingTicks >= LOCKSTEP_DISCONNECT_TIMEOUT_TICKS) {
+      // Check how many ticks (~16.67ms each) since the peer last sent an input packet
+      const silenceMs = nowPerf - entry.lastInputAtPerf;
+      const silenceTicks = Math.floor(silenceMs / (1000 / LOCKSTEP_FPS));
+
+      if (silenceTicks < LOCKSTEP_WAIT_TIMEOUT_TICKS) {
+        // Peer is actively streaming 60Hz inputs; use latest received input for smooth 60Hz lockstep
+        entry.missingTicks = 0;
+        frameInputs[peerUid] = entry.lastInputKeys || { ...EMPTY_INPUT_KEYS };
+      } else {
+        entry.missingTicks = silenceTicks;
+
+        // 6. If inputs are missing for 60 consecutive ticks (1 second) on an open WebRTC channel, close RTCPeerConnection
+        if (entry.open && entry.missingTicks >= LOCKSTEP_DISCONNECT_TIMEOUT_TICKS) {
           this.closeAndRemovePeer(peerUid);
           continue;
         }
 
-        // 6. Wait up to 5 frames (83 ms) for Client's input; after 5 frames, substitute empty input
-        if (entry.waitTicksForCurrentFrame < LOCKSTEP_WAIT_TIMEOUT_TICKS) {
-          return { ready: false, frameInputs: {} };
-        }
-
+        // 6. After 5 frames (83 ms) without input, substitute empty input so simulation never freezes
         frameInputs[peerUid] = { ...EMPTY_INPUT_KEYS };
       }
     }
 
-    // Broadcast confirmed inputs of all players to every Client
+    // Broadcast confirmed inputs of all players (+ authoritative snapshot) to every Client over WebRTC DataChannel
     this.broadcastToPeers({
       kind: 'frame',
       tick: targetTick,
       inputs: frameInputs,
+      snap,
     });
 
     return { ready: true, frameInputs };
@@ -1194,6 +1310,10 @@ export class WebRTCLockstepSession {
     if (this.pingIntervalId) {
       window.clearInterval(this.pingIntervalId);
       this.pingIntervalId = null;
+    }
+    if (this.handshakeRetryId) {
+      window.clearInterval(this.handshakeRetryId);
+      this.handshakeRetryId = null;
     }
     for (const [peerUid] of this.peers.entries()) {
       this.closeAndRemovePeer(peerUid);

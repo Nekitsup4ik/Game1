@@ -38,7 +38,10 @@ import {
   SyncedPlayerRecord,
   SyncedRoomRecord,
 } from './realtimeWsBroker';
-import { WebRTCSignalMessage } from './webrtcLockstep';
+import {
+  FastAuthoritativeSnapshot,
+  WebRTCSignalMessage,
+} from './webrtcLockstep';
 
 // Clear legacy localStorage keys that previously caused ghost rooms & JSON freeze
 if (typeof window !== 'undefined') {
@@ -454,7 +457,7 @@ export function subscribeToLobbyRooms(
   };
 
   fetchLobbyApi();
-  const intervalId = window.setInterval(fetchLobbyApi, 1200);
+  const intervalId = window.setInterval(fetchLobbyApi, 2500);
 
   return () => {
     cancelled = true;
@@ -462,6 +465,88 @@ export function subscribeToLobbyRooms(
     if (unsubFirestore) unsubFirestore();
     window.clearInterval(intervalId);
   };
+}
+
+/**
+ * Manual on-demand refresh of Lobby Rooms («Обновить список» button)
+ */
+export async function refreshLobbyRoomsNow(): Promise<MatchRoomDoc[]> {
+  const now = Date.now();
+  const mergedMap = new Map<string, SyncedRoomRecord>();
+
+  // 1. Check local memory rooms
+  for (const [id, r] of memoryRooms.entries()) {
+    const hb = r.heartbeatAtMs || r.updatedAtMs || 0;
+    if (r.status === 'finished' || r.memberUids.length === 0 || now - hb > 16000) {
+      memoryRooms.delete(id);
+      memoryPlayers.delete(id);
+    } else {
+      mergedMap.set(id, r);
+    }
+  }
+
+  // 2. Check WebSocket broker active rooms
+  for (const r of realtimeWsBroker.getActiveLobbyRooms()) {
+    const hb = r.heartbeatAtMs || r.updatedAtMs || 0;
+    if (r.status !== 'finished' && r.memberUids.length > 0 && now - hb <= 16000) {
+      mergedMap.set(r.roomId, r);
+    }
+  }
+
+  // 3. Check Express API if available
+  const apiData = await fetchApiJson<{ rooms?: SyncedRoomRecord[] }>('/api/mp/lobby');
+  if (apiData && Array.isArray(apiData.rooms)) {
+    for (const r of apiData.rooms) {
+      const hb = r.heartbeatAtMs || r.updatedAtMs || now;
+      if (r.status !== 'finished' && r.memberUids.length > 0 && now - hb <= 16000) {
+        mergedMap.set(r.roomId, { ...r, updatedAtMs: hb, heartbeatAtMs: hb });
+      }
+    }
+  }
+
+  // 4. Check Firestore /lobbies/main if quota available
+  if (!isFirestoreQuotaExceeded) {
+    try {
+      const lobbyRef = doc(db, 'lobbies', 'main');
+      const snap = await getDoc(lobbyRef);
+      if (snap.exists()) {
+        const data = snap.data() as LobbyDirectoryDoc;
+        const ids = Array.isArray(data.roomIds) ? data.roomIds.slice(0, 10) : [];
+        for (const id of ids) {
+          if (isFirestoreQuotaExceeded) break;
+          try {
+            const rSnap = await getDoc(doc(db, 'rooms', id));
+            if (rSnap.exists()) {
+              const rData = rSnap.data() as MatchRoomDoc;
+              const docUpdatedMs =
+                extractTimestampMs(rData.updatedAt) ||
+                extractTimestampMs(rData.createdAt);
+              if (
+                rData.status !== 'finished' &&
+                rData.memberUids?.length > 0 &&
+                docUpdatedMs > 0 &&
+                now - docUpdatedMs <= 20000
+              ) {
+                mergedMap.set(rData.roomId, {
+                  ...rData,
+                  updatedAtMs: docUpdatedMs,
+                  heartbeatAtMs: docUpdatedMs,
+                });
+              }
+            }
+          } catch {
+            // ignore
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return Array.from(mergedMap.values()).sort(
+    (a, b) => (b.updatedAtMs || 0) - (a.updatedAtMs || 0)
+  );
 }
 
 export function subscribeToActiveRoom(
@@ -510,9 +595,14 @@ export function subscribeToActiveRoom(
     }
   });
 
-  // Poll Express API if running on local/AI Studio server
+  // Poll Express API only at a slow 2.5s interval for room status/roster changes (NEVER overwrite live 60Hz positions!)
   const fetchRoomApi = async () => {
     if (cancelled || inFlight || !apiReachable) return;
+    const existingLocal = memoryRooms.get(roomId) || realtimeWsBroker.getRoom(roomId);
+    if (existingLocal && existingLocal.status === 'playing') {
+      // During active gameplay, WebRTC DataChannel & WebSocket handle 60Hz ticks; avoid HTTP polling lag!
+      return;
+    }
     inFlight = true;
     const data = await fetchApiJson<{
       room: SyncedRoomRecord | null;
@@ -523,12 +613,10 @@ export function subscribeToActiveRoom(
       const prevRoom = memoryRooms.get(roomId);
       if (
         !prevRoom ||
-        (data.room.seq || data.room.updatedAtMs || 0) >=
-          (prevRoom.seq || prevRoom.updatedAtMs || 0) ||
         data.room.status !== prevRoom.status ||
-        data.room.redScore > prevRoom.redScore ||
-        data.room.blueScore > prevRoom.blueScore ||
-        data.room.memberUids.length !== prevRoom.memberUids.length
+        data.room.memberUids.length !== prevRoom.memberUids.length ||
+        data.room.redUids.length !== prevRoom.redUids.length ||
+        data.room.blueUids.length !== prevRoom.blueUids.length
       ) {
         memoryRooms.set(roomId, {
           ...data.room,
@@ -539,11 +627,7 @@ export function subscribeToActiveRoom(
 
       const memP = memoryPlayers.get(roomId) || {};
       for (const [uid, pDoc] of Object.entries(data.players || {})) {
-        const prevP = memP[uid];
-        if (
-          !prevP ||
-          (pDoc.seq || pDoc.updatedAtMs || 0) >= (prevP.seq || prevP.updatedAtMs || 0)
-        ) {
+        if (!memP[uid]) {
           memP[uid] = pDoc;
         }
       }
@@ -554,7 +638,7 @@ export function subscribeToActiveRoom(
   };
 
   fetchRoomApi();
-  const apiPollId = window.setInterval(fetchRoomApi, 60);
+  const apiPollId = window.setInterval(fetchRoomApi, 2500);
   const uiPingRefreshId = window.setInterval(() => {
     emitIfStructuralOrPeriodic(false);
   }, 3000);
@@ -1140,22 +1224,55 @@ export async function syncLocalPlayerDisc(
     now,
     profileFallback
   );
+}
 
-  if (apiReachable) {
-    postApiJson('/api/mp/room/player-sync', {
-      roomId,
-      uid,
-      state: {
-        x: safeX,
-        y: safeY,
-        vx: safeVx,
-        vy: safeVy,
-        kicking: safeKicking,
-        pingMs,
-        seq: now,
-      },
-    }).catch(() => {});
+export function applyWebRTCAuthoritativeSnapshot(
+  roomId: string,
+  hostUid: string,
+  snap: FastAuthoritativeSnapshot
+): void {
+  const now = Date.now();
+  const baseRoom = memoryRooms.get(roomId) || realtimeWsBroker.getRoom(roomId);
+  if (baseRoom) {
+    memoryRooms.set(roomId, {
+      ...baseRoom,
+      redScore: Math.max(baseRoom.redScore, snap.redScore),
+      blueScore: Math.max(baseRoom.blueScore, snap.blueScore),
+      ballX: snap.ballX,
+      ballY: snap.ballY,
+      ballVx: snap.ballVx,
+      ballVy: snap.ballVy,
+      eventState: snap.eventState,
+      eventTeam: snap.eventTeam,
+      eventUntilMs: snap.eventUntilMs,
+      lastTouchTeam: snap.lastTouchTeam,
+      actorUid: hostUid,
+      seq: now,
+      updatedAtMs: now,
+      heartbeatAtMs: now,
+    });
   }
+
+  const pMap = memoryPlayers.get(roomId) || {};
+  for (const [uid, pState] of Object.entries(snap.players)) {
+    const existing = pMap[uid] || realtimeWsBroker.getRoomPlayers(roomId)[uid];
+    pMap[uid] = {
+      playerId: uid,
+      roomId,
+      nickname: existing?.nickname || 'Player',
+      jerseyNumber: existing?.jerseyNumber || 10,
+      team: existing?.team || 'red',
+      x: pState.x,
+      y: pState.y,
+      vx: pState.vx,
+      vy: pState.vy,
+      kicking: pState.kicking,
+      pingMs: existing?.pingMs || 24,
+      seq: now,
+      updatedAtMs: now,
+    };
+  }
+  memoryPlayers.set(roomId, pMap);
 }
 
 export async function syncRoomGameplayState(
@@ -1247,13 +1364,6 @@ export async function syncRoomGameplayState(
     },
     now
   );
-
-  if (apiReachable) {
-    postApiJson('/api/mp/room/game-sync', {
-      roomId,
-      patch: { ...patch, seq: now },
-    }).catch(() => {});
-  }
 }
 
 export async function registerGoalInNet(

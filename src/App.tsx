@@ -4,6 +4,7 @@ import {
   Gamepad2,
   LogOut,
   Plus,
+  RefreshCw,
   Trophy,
   Trash2,
   UserCheck,
@@ -18,6 +19,7 @@ import {
   createMatchRoom,
   deleteOrLeaveMatchRoom,
   joinMatchRoom,
+  refreshLobbyRoomsNow,
   subscribeToActiveRoom,
   subscribeToLobbyRooms,
 } from './services/roomService';
@@ -66,6 +68,7 @@ export default function App() {
   const [newRoomTitle, setNewRoomTitle] = useState<string>('');
   const [joinCodeInput, setJoinCodeInput] = useState<string>('');
   const [lobbyBusy, setLobbyBusy] = useState<boolean>(false);
+  const [refreshingLobby, setRefreshingLobby] = useState<boolean>(false);
   const [lobbyError, setLobbyError] = useState<string | null>(null);
 
   // Active Room & Match State
@@ -250,6 +253,29 @@ export default function App() {
     setActivePlayers({});
     if (roomToLeave) {
       await deleteOrLeaveMatchRoom(roomToLeave, playerUid).catch(() => {});
+    }
+  };
+
+  const handleRefreshLobbyRooms = async () => {
+    if (refreshingLobby) return;
+    setRefreshingLobby(true);
+    setLobbyError(null);
+    try {
+      const rooms = await refreshLobbyRoomsNow();
+      const nextMap: Record<string, MatchRoomDoc> = {};
+      const nextIds: string[] = [];
+      rooms.forEach((r) => {
+        if (r.status !== 'finished' && r.memberUids.length > 0) {
+          nextMap[r.roomId] = r;
+          nextIds.push(r.roomId);
+        }
+      });
+      setLobbyRooms(nextMap);
+      setRoomIds(nextIds);
+    } catch {
+      // Ignore transient errors
+    } finally {
+      setTimeout(() => setRefreshingLobby(false), 260);
     }
   };
 
@@ -884,7 +910,20 @@ export default function App() {
                   <h2 className="font-display font-bold text-lg text-white">
                     Доступные комнаты ({sortedRooms.length})
                   </h2>
-                  <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-2.5">
+                    <button
+                      type="button"
+                      disabled={refreshingLobby}
+                      onClick={handleRefreshLobbyRooms}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 hover:border-emerald-500/50 text-xs font-medium text-slate-300 hover:text-emerald-300 transition-colors cursor-pointer disabled:opacity-60"
+                    >
+                      <RefreshCw
+                        className={`w-3.5 h-3.5 ${
+                          refreshingLobby ? 'animate-spin text-emerald-400' : ''
+                        }`}
+                      />
+                      <span>Обновить список</span>
+                    </button>
                     {sortedRooms.length > 0 && (
                       <button
                         type="button"
@@ -910,17 +949,32 @@ export default function App() {
                       Пока нет активных комнат
                     </h3>
                     <p className="mt-1 text-xs text-slate-400 max-w-md mx-auto">
-                      Нажмите кнопку «Создать матч», чтобы открыть новую комнату 4×4 и пригласить игроков.
+                      Нажмите кнопку «Создать матч», чтобы открыть новую комнату 4×4 и пригласить игроков, или обновите список комнат.
                     </p>
-                    <button
-                      type="button"
-                      disabled={lobbyBusy}
-                      onClick={() => handleCreateRoom()}
-                      className="mt-5 inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-display font-bold text-xs transition-colors cursor-pointer"
-                    >
-                      <Plus className="w-4 h-4" />
-                      <span>Создать первый матч</span>
-                    </button>
+                    <div className="mt-5 flex flex-wrap items-center justify-center gap-3">
+                      <button
+                        type="button"
+                        disabled={lobbyBusy}
+                        onClick={() => handleCreateRoom()}
+                        className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-display font-bold text-xs transition-colors cursor-pointer"
+                      >
+                        <Plus className="w-4 h-4" />
+                        <span>Создать первый матч</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={refreshingLobby}
+                        onClick={handleRefreshLobbyRooms}
+                        className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-display font-semibold text-xs transition-colors cursor-pointer"
+                      >
+                        <RefreshCw
+                          className={`w-3.5 h-3.5 ${
+                            refreshingLobby ? 'animate-spin text-emerald-400' : ''
+                          }`}
+                        />
+                        <span>Обновить список</span>
+                      </button>
+                    </div>
                   </div>
                 ) : (
                   <div className="space-y-3">
