@@ -112,6 +112,7 @@ export type SyncedPlayerRecord = RoomPlayerDoc & {
   pingMs?: number;
   seq?: number;
   keyMask?: number;
+  kickUntilMs?: number;
 };
 
 interface FastPlayerTickPacket {
@@ -508,8 +509,15 @@ class RealtimeMultiplayerBroker {
         const localRxSeq = this.nextMonotonicSeq();
 
         if (pkt.t === 'p') {
+          const nowMs = Date.now();
           const rPlayers = this.players.get(roomId) || {};
           const existing = rPlayers[pkt.u];
+          const km = typeof pkt.km === 'number' ? pkt.km : pkt.k === 1 ? 16 : 0;
+          const isKickingNow = pkt.k === 1 || (km & 16) !== 0;
+          const kickUntilMs = isKickingNow
+            ? nowMs + 140
+            : existing?.kickUntilMs || 0;
+
           rPlayers[pkt.u] = {
             ...(existing || {
               playerId: pkt.u,
@@ -522,16 +530,17 @@ class RealtimeMultiplayerBroker {
             y: pkt.y,
             vx: pkt.vx,
             vy: pkt.vy,
-            kicking: pkt.k === 1,
-            keyMask: typeof pkt.km === 'number' ? pkt.km : pkt.k === 1 ? 16 : 0,
+            kicking: isKickingNow || nowMs < kickUntilMs,
+            kickUntilMs,
+            keyMask: km,
             pingMs: pkt.p,
             seq: localRxSeq,
-            updatedAtMs: Date.now(),
+            updatedAtMs: nowMs,
           };
           this.players.set(roomId, rPlayers);
           const room = this.rooms.get(roomId);
           if (room) {
-            room.heartbeatAtMs = Date.now();
+            room.heartbeatAtMs = nowMs;
           }
         } else if (pkt.t === 'b') {
           const room = this.rooms.get(roomId);
@@ -574,6 +583,12 @@ class RealtimeMultiplayerBroker {
       const roomId = topic.slice(roomsPrefix.length);
       if (!roomId) return;
 
+      const existing = this.rooms.get(roomId);
+      // Block delayed external MQTT echoes or stale retained deletions when directWs (<5ms) is active for an ongoing match
+      if (!fromDirectWs && this.directWsConnected && existing) {
+        return;
+      }
+
       if (payloadBytes.length === 0) {
         this.deletedRoomIds.set(roomId, Date.now());
         this.rooms.delete(roomId);
@@ -588,15 +603,16 @@ class RealtimeMultiplayerBroker {
         };
         const now = Date.now();
         const hb = parsed.heartbeatAtMs || parsed.updatedAtMs || 0;
+        const isActiveLocalMatch = existing && existing.status === 'playing';
 
-        // Immediately reject and clean up stale/ghost rooms older than 18 seconds!
+        // Never delete an active playing room due to sender clock skew or old MQTT retained messages!
         if (
           parsed.deleted ||
           !parsed.roomId ||
           parsed.status === 'finished' ||
-          now - hb > 18000
+          (!isActiveLocalMatch && !fromDirectWs && now - hb > 18000)
         ) {
-          if (now - hb > 18000 && !parsed.deleted) {
+          if (now - hb > 18000 && !parsed.deleted && !fromDirectWs) {
             this.broadcastMqtt(
               `${TOPIC_PREFIX}/rooms/${roomId}`,
               new Uint8Array(0),
@@ -610,11 +626,10 @@ class RealtimeMultiplayerBroker {
         }
 
         const deletedAt = this.deletedRoomIds.get(roomId) || 0;
-        if ((parsed.updatedAtMs || 0) < deletedAt) {
+        if (deletedAt > 0 && now - deletedAt < 5000) {
           return;
         }
 
-        const existing = this.rooms.get(roomId);
         const localRxSeq = this.nextMonotonicSeq();
         this.rooms.set(roomId, {
           ...parsed,
@@ -634,9 +649,14 @@ class RealtimeMultiplayerBroker {
             existing && existing.status === 'playing' && parsed.eventState === 'normal'
               ? existing.ballVy
               : parsed.ballVy,
-          seq: existing && existing.status === 'playing' && parsed.eventState === 'normal'
-            ? existing.seq || localRxSeq
-            : localRxSeq,
+          seq:
+            existing &&
+            existing.status === 'playing' &&
+            parsed.eventState === 'normal' &&
+            existing.seq &&
+            existing.seq < 1000000000
+              ? existing.seq
+              : localRxSeq,
           updatedAtMs: now,
           heartbeatAtMs: now,
         });
@@ -938,6 +958,7 @@ class RealtimeMultiplayerBroker {
     const rPlayers = this.players.get(player.roomId) || {};
     rPlayers[player.playerId] = {
       ...player,
+      seq: this.nextMonotonicSeq(),
       pingMs: player.pingMs ?? this.localPingMs,
       updatedAtMs: Date.now(),
     };

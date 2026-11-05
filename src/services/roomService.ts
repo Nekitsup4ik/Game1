@@ -200,14 +200,14 @@ export function getLiveMatchSnapshot(roomId: string): {
   room: SyncedRoomRecord | null;
   players: Record<string, SyncedPlayerRecord>;
 } {
+  const normSeq = (s?: number) => (s && s < 1000000000 ? s : 0);
   const memRoom = memoryRooms.get(roomId);
   const wsRoom = realtimeWsBroker.getRoom(roomId);
 
   let bestRoom: SyncedRoomRecord | null = memRoom || wsRoom || null;
   if (memRoom && wsRoom) {
     bestRoom =
-      (wsRoom.seq || wsRoom.updatedAtMs || 0) >=
-      (memRoom.seq || memRoom.updatedAtMs || 0)
+      normSeq(wsRoom.seq) >= normSeq(memRoom.seq)
         ? wsRoom
         : memRoom;
     if (memRoom.redScore > bestRoom.redScore) bestRoom.redScore = memRoom.redScore;
@@ -224,7 +224,7 @@ export function getLiveMatchSnapshot(roomId: string): {
     const prev = mergedPlayers[uid];
     if (
       !prev ||
-      (pDoc.seq || pDoc.updatedAtMs || 0) >= (prev.seq || prev.updatedAtMs || 0)
+      normSeq(pDoc.seq) >= normSeq(prev.seq)
     ) {
       mergedPlayers[uid] = pDoc;
     }
@@ -740,7 +740,7 @@ export async function createMatchRoom(
     eventTeam: 'none',
     eventUntilMs: 0,
     lastTouchTeam: 'none',
-    seq: now,
+    seq: realtimeWsBroker.nextMonotonicSeq(),
     updatedAtMs: now,
     heartbeatAtMs: now,
   };
@@ -757,7 +757,7 @@ export async function createMatchRoom(
     vy: 0,
     kicking: false,
     pingMs,
-    seq: now,
+    seq: realtimeWsBroker.nextMonotonicSeq(),
     updatedAtMs: now,
   };
 
@@ -901,7 +901,7 @@ export async function joinMatchRoom(
     memberUids,
     redUids,
     blueUids,
-    seq: now,
+    seq: realtimeWsBroker.nextMonotonicSeq(),
     updatedAtMs: now,
     heartbeatAtMs: now,
   };
@@ -918,7 +918,7 @@ export async function joinMatchRoom(
     vy: 0,
     kicking: false,
     pingMs,
-    seq: now,
+    seq: realtimeWsBroker.nextMonotonicSeq(),
     updatedAtMs: now,
   };
 
@@ -1009,7 +1009,7 @@ export async function switchPlayerTeam(
     ...currentRoom,
     redUids: nextRedUids,
     blueUids: nextBlueUids,
-    seq: now,
+    seq: realtimeWsBroker.nextMonotonicSeq(),
     updatedAtMs: now,
     heartbeatAtMs: now,
   };
@@ -1026,7 +1026,7 @@ export async function switchPlayerTeam(
     vy: 0,
     kicking: false,
     pingMs,
-    seq: now,
+    seq: realtimeWsBroker.nextMonotonicSeq(),
     updatedAtMs: now,
   };
 
@@ -1095,7 +1095,7 @@ export async function startMatchByHost(
     eventTeam: 'none',
     eventUntilMs: 0,
     lastTouchTeam: 'none',
-    seq: now,
+    seq: realtimeWsBroker.nextMonotonicSeq(),
     updatedAtMs: now,
     heartbeatAtMs: now,
   };
@@ -1122,7 +1122,7 @@ export async function startMatchByHost(
       vy: 0,
       kicking: false,
       pingMs: existing?.pingMs || 20,
-      seq: now,
+      seq: realtimeWsBroker.nextMonotonicSeq(),
       updatedAtMs: now,
     };
     pMap[uid] = pDoc;
@@ -1147,7 +1147,7 @@ export async function startMatchByHost(
       vy: 0,
       kicking: false,
       pingMs: existing?.pingMs || 20,
-      seq: now,
+      seq: realtimeWsBroker.nextMonotonicSeq(),
       updatedAtMs: now,
     };
     pMap[uid] = pDoc;
@@ -1313,24 +1313,21 @@ export function applyWebRTCAuthoritativeSnapshot(
       snap.eventState === 'normal'
   );
 
-  if (baseRoom) {
+  if (baseRoom && !isEchoOfLocalBall && !wsBallFresh) {
     memoryRooms.set(roomId, {
       ...baseRoom,
       redScore: Math.max(baseRoom.redScore, snap.redScore),
       blueScore: Math.max(baseRoom.blueScore, snap.blueScore),
-      ballX: isEchoOfLocalBall || wsBallFresh ? baseRoom.ballX : snap.ballX,
-      ballY: isEchoOfLocalBall || wsBallFresh ? baseRoom.ballY : snap.ballY,
-      ballVx: isEchoOfLocalBall || wsBallFresh ? baseRoom.ballVx : snap.ballVx,
-      ballVy: isEchoOfLocalBall || wsBallFresh ? baseRoom.ballVy : snap.ballVy,
+      ballX: snap.ballX,
+      ballY: snap.ballY,
+      ballVx: snap.ballVx,
+      ballVy: snap.ballVy,
       eventState: snap.eventState,
       eventTeam: snap.eventTeam,
       eventUntilMs: snap.eventUntilMs,
-      lastTouchTeam:
-        isEchoOfLocalBall || wsBallFresh
-          ? baseRoom.lastTouchTeam
-          : snap.lastTouchTeam,
+      lastTouchTeam: snap.lastTouchTeam,
       actorUid: snap.actorUid,
-      seq: isEchoOfLocalBall || wsBallFresh ? baseRoom.seq : nextSeq,
+      seq: nextSeq,
       updatedAtMs: now,
       heartbeatAtMs: now,
     });
@@ -1509,7 +1506,7 @@ export async function registerGoalInNet(
     eventTeam: scoringTeam,
     eventUntilMs: Math.round(goalPauseUntilMs),
     lastTouchTeam: 'none',
-    seq: now,
+    seq: realtimeWsBroker.nextMonotonicSeq(),
     updatedAtMs: now,
     heartbeatAtMs: now,
   };
@@ -1589,7 +1586,7 @@ export async function resetFormationAfterGoalDelay(
     eventTeam: 'none',
     eventUntilMs: 0,
     lastTouchTeam: 'none',
-    seq: now,
+    seq: realtimeWsBroker.nextMonotonicSeq(),
     updatedAtMs: now,
     heartbeatAtMs: now,
   };
@@ -1612,7 +1609,7 @@ export async function resetFormationAfterGoalDelay(
         vx: 0,
         vy: 0,
         kicking: false,
-        seq: now,
+        seq: realtimeWsBroker.nextMonotonicSeq(),
         updatedAtMs: now,
       };
       pMap[uid] = pDoc;
@@ -1634,7 +1631,7 @@ export async function resetFormationAfterGoalDelay(
         vx: 0,
         vy: 0,
         kicking: false,
-        seq: now,
+        seq: realtimeWsBroker.nextMonotonicSeq(),
         updatedAtMs: now,
       };
       pMap[uid] = pDoc;
@@ -1679,7 +1676,7 @@ export async function finishMatchRoom(
     eventState: 'normal',
     eventTeam: 'none',
     eventUntilMs: 0,
-    seq: now,
+    seq: realtimeWsBroker.nextMonotonicSeq(),
     updatedAtMs: now,
     heartbeatAtMs: now,
   };
@@ -1784,7 +1781,7 @@ export async function deleteOrLeaveMatchRoom(
       memberUids: remainingMembers,
       redUids: nextRed,
       blueUids: nextBlue,
-      seq: now,
+      seq: realtimeWsBroker.nextMonotonicSeq(),
       updatedAtMs: now,
       heartbeatAtMs: now,
     };
