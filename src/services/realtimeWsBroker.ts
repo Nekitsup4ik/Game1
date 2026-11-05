@@ -111,6 +111,7 @@ export type SyncedPlayerRecord = RoomPlayerDoc & {
   updatedAtMs: number;
   pingMs?: number;
   seq?: number;
+  keyMask?: number;
 };
 
 interface FastPlayerTickPacket {
@@ -121,6 +122,7 @@ interface FastPlayerTickPacket {
   vx: number;
   vy: number;
   k: number;
+  km?: number;
   p: number;
   s: number;
 }
@@ -150,7 +152,12 @@ class RealtimeMultiplayerBroker {
   private deletedRoomIds = new Map<string, number>();
   private structuralListeners = new Set<(roomId?: string) => void>();
   private rtcSignalListeners = new Set<(roomId: string, signal: unknown) => void>();
-  private localPingMs = 24;
+  private localPingMs = 18;
+  private rxSeqCounter = 1000;
+  private directWs: WebSocket | null = null;
+  private directWsConnected = false;
+  private directWsPingTimer: number | null = null;
+  private directWsReconnectTimer: number | null = null;
   private sockets: Array<{
     url: string;
     ws: WebSocket | null;
@@ -167,6 +174,17 @@ class RealtimeMultiplayerBroker {
     }
     this.started = true;
 
+    // 1. Connect to ultra-fast direct same-origin WebSocket (/ws on port 3000) when available
+    const host = window.location.hostname;
+    if (
+      host.endsWith('.run.app') ||
+      host === 'localhost' ||
+      host === '127.0.0.1'
+    ) {
+      this.connectDirectWs();
+    }
+
+    // 2. Also connect to global WebSocket brokers for cross-network / GitHub Pages support
     for (const url of BROKER_URLS) {
       const entry = {
         url,
@@ -181,14 +199,99 @@ class RealtimeMultiplayerBroker {
     }
   }
 
+  public nextMonotonicSeq(): number {
+    this.rxSeqCounter += 1;
+    return this.rxSeqCounter;
+  }
+
+  private connectDirectWs() {
+    if (this.directWsReconnectTimer) {
+      window.clearTimeout(this.directWsReconnectTimer);
+      this.directWsReconnectTimer = null;
+    }
+    try {
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${proto}//${window.location.host}/ws`;
+      const ws = new WebSocket(wsUrl);
+      this.directWs = ws;
+      this.directWsConnected = false;
+
+      ws.onopen = () => {
+        this.directWsConnected = true;
+        if (this.directWsPingTimer) window.clearInterval(this.directWsPingTimer);
+        // Probe RTT immediately on open, then strictly every 3000ms (3s)
+        try {
+          ws.send(JSON.stringify({ pingT0: performance.now() }));
+        } catch {
+          // ignore
+        }
+        this.directWsPingTimer = window.setInterval(() => {
+          if (this.directWsConnected && ws.readyState === WebSocket.OPEN) {
+            try {
+              ws.send(JSON.stringify({ pingT0: performance.now() }));
+            } catch {
+              // ignore
+            }
+          }
+        }, 3000);
+      };
+
+      ws.onmessage = (ev) => {
+        if (typeof ev.data !== 'string') return;
+        try {
+          const msg = JSON.parse(ev.data) as {
+            topic?: string;
+            payload?: string;
+            pongT0?: number;
+          };
+          if (typeof msg.pongT0 === 'number') {
+            this.updateMeasuredPing(performance.now() - msg.pongT0);
+            return;
+          }
+          if (msg.topic && typeof msg.payload === 'string') {
+            this.handleIncomingPublish(
+              msg.topic,
+              encoder.encode(msg.payload)
+            );
+          }
+        } catch {
+          // ignore
+        }
+      };
+
+      ws.onclose = () => {
+        this.directWsConnected = false;
+        if (this.directWsPingTimer) {
+          window.clearInterval(this.directWsPingTimer);
+          this.directWsPingTimer = null;
+        }
+        this.directWsReconnectTimer = window.setTimeout(() => {
+          this.connectDirectWs();
+        }, 1500);
+      };
+
+      ws.onerror = () => {
+        try {
+          ws.close();
+        } catch {
+          // ignore
+        }
+      };
+    } catch {
+      this.directWsReconnectTimer = window.setTimeout(() => {
+        this.connectDirectWs();
+      }, 2000);
+    }
+  }
+
   public getLocalPingMs(): number {
     return this.localPingMs;
   }
 
   public updateMeasuredPing(rttMs: number) {
     if (!Number.isFinite(rttMs) || rttMs <= 0) return;
-    const clamped = Math.max(4, Math.min(999, Math.round(rttMs)));
-    this.localPingMs = Math.round(this.localPingMs * 0.65 + clamped * 0.35);
+    const clamped = Math.max(2, Math.min(999, Math.round(rttMs)));
+    this.localPingMs = Math.round(this.localPingMs * 0.6 + clamped * 0.4);
   }
 
   private connectBroker(entry: (typeof this.sockets)[number]) {
@@ -298,10 +401,12 @@ class RealtimeMultiplayerBroker {
             try {
               // Send MQTT PINGREQ + RTT measurement probe strictly every 3000ms (3s)
               entry.ws.send(toArrayBuffer(new Uint8Array([0xc0, 0x00])));
-              const probe = encoder.encode(String(performance.now()));
-              entry.ws.send(
-                toArrayBuffer(buildPublishPacket(pingTopic, probe, false))
-              );
+              if (!this.directWsConnected) {
+                const probe = encoder.encode(String(performance.now()));
+                entry.ws.send(
+                  toArrayBuffer(buildPublishPacket(pingTopic, probe, false))
+                );
+              }
             } catch {
               // ignore
             }
@@ -363,12 +468,11 @@ class RealtimeMultiplayerBroker {
 
       try {
         const pkt = JSON.parse(decoder.decode(payloadBytes)) as FastTickPacket;
+        const localRxSeq = this.nextMonotonicSeq();
+
         if (pkt.t === 'p') {
           const rPlayers = this.players.get(roomId) || {};
           const existing = rPlayers[pkt.u];
-          if (existing && (existing.seq || 0) > pkt.s) {
-            return; // Ignore out-of-order older packet
-          }
           rPlayers[pkt.u] = {
             ...(existing || {
               playerId: pkt.u,
@@ -382,8 +486,9 @@ class RealtimeMultiplayerBroker {
             vx: pkt.vx,
             vy: pkt.vy,
             kicking: pkt.k === 1,
+            keyMask: typeof pkt.km === 'number' ? pkt.km : pkt.k === 1 ? 16 : 0,
             pingMs: pkt.p,
-            seq: pkt.s,
+            seq: localRxSeq,
             updatedAtMs: Date.now(),
           };
           this.players.set(roomId, rPlayers);
@@ -391,14 +496,9 @@ class RealtimeMultiplayerBroker {
           if (room) {
             room.heartbeatAtMs = Date.now();
           }
-          // Notice: we DO NOT call emitStructuralChange on 25Hz movement ticks!
-          // MatchArena reads directly from getRoomPlayers(roomId) at 60 FPS with 0 React re-renders!
         } else if (pkt.t === 'b') {
           const room = this.rooms.get(roomId);
           if (!room) return;
-          if ((room.seq || 0) > pkt.s && pkt.es === 'normal') {
-            return; // Ignore older ball tick
-          }
           const scoreOrEventChanged =
             room.redScore !== pkt.rs ||
             room.blueScore !== pkt.bs ||
@@ -416,7 +516,7 @@ class RealtimeMultiplayerBroker {
           room.eventUntilMs = pkt.eu;
           room.lastTouchTeam = pkt.lt;
           room.actorUid = pkt.u;
-          room.seq = pkt.s;
+          room.seq = localRxSeq;
           room.updatedAtMs = Date.now();
           room.heartbeatAtMs = Date.now();
 
@@ -460,7 +560,6 @@ class RealtimeMultiplayerBroker {
           now - hb > 18000
         ) {
           if (now - hb > 18000 && !parsed.deleted) {
-            // Clear stale retained room from broker
             this.broadcastMqtt(
               `${TOPIC_PREFIX}/rooms/${roomId}`,
               new Uint8Array(0),
@@ -479,31 +578,32 @@ class RealtimeMultiplayerBroker {
         }
 
         const existing = this.rooms.get(roomId);
-        if (!existing || (parsed.updatedAtMs || 0) >= (existing.updatedAtMs || 0) - 200) {
-          this.rooms.set(roomId, {
-            ...parsed,
-            // Preserve latest fast-tick ball state if room is already playing locally
-            ballX:
-              existing && existing.status === 'playing' && (existing.seq || 0) > (parsed.seq || 0)
-                ? existing.ballX
-                : parsed.ballX,
-            ballY:
-              existing && existing.status === 'playing' && (existing.seq || 0) > (parsed.seq || 0)
-                ? existing.ballY
-                : parsed.ballY,
-            ballVx:
-              existing && existing.status === 'playing' && (existing.seq || 0) > (parsed.seq || 0)
-                ? existing.ballVx
-                : parsed.ballVx,
-            ballVy:
-              existing && existing.status === 'playing' && (existing.seq || 0) > (parsed.seq || 0)
-                ? existing.ballVy
-                : parsed.ballVy,
-            updatedAtMs: parsed.updatedAtMs || now,
-            heartbeatAtMs: parsed.heartbeatAtMs || parsed.updatedAtMs || now,
-          });
-          this.emitStructuralChange(roomId);
-        }
+        const localRxSeq = this.nextMonotonicSeq();
+        this.rooms.set(roomId, {
+          ...parsed,
+          ballX:
+            existing && existing.status === 'playing' && parsed.eventState === 'normal'
+              ? existing.ballX
+              : parsed.ballX,
+          ballY:
+            existing && existing.status === 'playing' && parsed.eventState === 'normal'
+              ? existing.ballY
+              : parsed.ballY,
+          ballVx:
+            existing && existing.status === 'playing' && parsed.eventState === 'normal'
+              ? existing.ballVx
+              : parsed.ballVx,
+          ballVy:
+            existing && existing.status === 'playing' && parsed.eventState === 'normal'
+              ? existing.ballVy
+              : parsed.ballVy,
+          seq: existing && existing.status === 'playing' && parsed.eventState === 'normal'
+            ? existing.seq || localRxSeq
+            : localRxSeq,
+          updatedAtMs: now,
+          heartbeatAtMs: now,
+        });
+        this.emitStructuralChange(roomId);
       } catch {
         // ignore
       }
@@ -542,17 +642,13 @@ class RealtimeMultiplayerBroker {
           existing.nickname !== parsed.nickname ||
           existing.jerseyNumber !== parsed.jerseyNumber;
 
+        const localRxSeq = this.nextMonotonicSeq();
         rPlayers[uid] = {
           ...parsed,
-          x:
-            existing && (existing.seq || 0) > (parsed.seq || 0)
-              ? existing.x
-              : parsed.x,
-          y:
-            existing && (existing.seq || 0) > (parsed.seq || 0)
-              ? existing.y
-              : parsed.y,
-          updatedAtMs: parsed.updatedAtMs || Date.now(),
+          x: existing ? existing.x : parsed.x,
+          y: existing ? existing.y : parsed.y,
+          seq: existing?.seq || localRxSeq,
+          updatedAtMs: Date.now(),
         };
         this.players.set(roomId, rPlayers);
         if (structuralChanged) {
@@ -581,14 +677,33 @@ class RealtimeMultiplayerBroker {
 
   private broadcastMqtt(topic: string, payload: Uint8Array, retain: boolean) {
     this.start();
-    // Send on the first connected broker (primary) to avoid duplicate traffic; use secondary as automatic failover!
+
+    // 1. Always send over direct same-origin WebSocket (/ws) first (<5ms latency, zero throttling!)
+    if (
+      this.directWsConnected &&
+      this.directWs &&
+      this.directWs.readyState === WebSocket.OPEN
+    ) {
+      try {
+        this.directWs.send(
+          JSON.stringify({
+            topic,
+            payload: decoder.decode(payload),
+          })
+        );
+        // For high-frequency non-retained fast ticks, if directWs is connected we don't even need to wait on external MQTT!
+      } catch {
+        // ignore
+      }
+    }
+
+    // 2. Also send to primary connected external broker so cross-network / GitHub Pages clients stay synced
     let sent = false;
     for (const entry of this.sockets) {
       if (entry.connected && entry.ws?.readyState === WebSocket.OPEN) {
         this.sendToEntry(entry, topic, payload, retain);
         sent = true;
         if (!retain) {
-          // For non-retained fast ticks, sending via primary connected broker avoids double-packet jitter
           break;
         }
       }
@@ -605,7 +720,8 @@ class RealtimeMultiplayerBroker {
     const now = Date.now();
     const stamped: SyncedRoomRecord = {
       ...room,
-      updatedAtMs: room.updatedAtMs || now,
+      seq: this.nextMonotonicSeq(),
+      updatedAtMs: now,
       heartbeatAtMs: now,
     };
     this.deletedRoomIds.delete(room.roomId);
@@ -625,11 +741,23 @@ class RealtimeMultiplayerBroker {
     kicking: boolean,
     pingMs: number,
     seq: number,
-    fallbackMeta?: { nickname: string; jerseyNumber: number; team: 'red' | 'blue' }
+    fallbackMeta?: {
+      nickname: string;
+      jerseyNumber: number;
+      team: 'red' | 'blue';
+      keyMask?: number;
+    }
   ) {
     this.start();
+    const localSeq = this.nextMonotonicSeq();
     const rPlayers = this.players.get(roomId) || {};
     const existing = rPlayers[uid];
+    const km =
+      typeof fallbackMeta?.keyMask === 'number'
+        ? fallbackMeta.keyMask
+        : kicking
+          ? 16
+          : 0;
     rPlayers[uid] = {
       playerId: uid,
       roomId,
@@ -641,8 +769,9 @@ class RealtimeMultiplayerBroker {
       vx,
       vy,
       kicking,
+      keyMask: km,
       pingMs,
-      seq,
+      seq: localSeq,
       updatedAtMs: Date.now(),
     };
     this.players.set(roomId, rPlayers);
@@ -655,6 +784,7 @@ class RealtimeMultiplayerBroker {
       vx,
       vy,
       k: kicking ? 1 : 0,
+      km,
       p: pingMs,
       s: seq,
     };
@@ -683,6 +813,7 @@ class RealtimeMultiplayerBroker {
     seq: number
   ) {
     this.start();
+    const localSeq = this.nextMonotonicSeq();
     const room = this.rooms.get(roomId);
     if (room) {
       room.redScore = Math.max(room.redScore, patch.redScore);
@@ -696,7 +827,7 @@ class RealtimeMultiplayerBroker {
       room.eventUntilMs = patch.eventUntilMs;
       room.lastTouchTeam = patch.lastTouchTeam;
       room.actorUid = actorUid;
-      room.seq = seq;
+      room.seq = localSeq;
       room.updatedAtMs = Date.now();
       room.heartbeatAtMs = Date.now();
     }

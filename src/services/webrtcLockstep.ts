@@ -724,6 +724,15 @@ export interface FastAuthoritativeSnapshot {
 type DataChannelPacket =
   | ({ kind: 'input' } & InputPacket)
   | {
+      kind: 'client_ball';
+      playerId: string;
+      ballX: number;
+      ballY: number;
+      ballVx: number;
+      ballVy: number;
+      lastTouchTeam: EventTeam;
+    }
+  | {
       kind: 'frame';
       tick: number;
       inputs: Record<string, PlayerInputKeys>;
@@ -768,6 +777,7 @@ export class WebRTCLockstepSession {
       pc: RTCPeerConnection;
       dc: RTCDataChannel | null;
       open: boolean;
+      createdAtPerf: number;
       pendingCandidates: RTCIceCandidateInit[];
       missingTicks: number;
       waitTicksForCurrentFrame: number;
@@ -785,6 +795,16 @@ export class WebRTCLockstepSession {
         inputs: Record<string, PlayerInputKeys>,
         snap?: FastAuthoritativeSnapshot
       ) => void)
+    | null = null;
+  private onClientBallCallback:
+    | ((pkt: {
+        playerId: string;
+        ballX: number;
+        ballY: number;
+        ballVx: number;
+        ballVy: number;
+        lastTouchTeam: EventTeam;
+      }) => void)
     | null = null;
   private onStateSeedCallback:
     | ((world: DeterministicWorldState) => void)
@@ -804,6 +824,14 @@ export class WebRTCLockstepSession {
       inputs: Record<string, PlayerInputKeys>,
       snap?: FastAuthoritativeSnapshot
     ) => void;
+    onClientBall?: (pkt: {
+      playerId: string;
+      ballX: number;
+      ballY: number;
+      ballVx: number;
+      ballVy: number;
+      lastTouchTeam: EventTeam;
+    }) => void;
     onStateSeed?: (world: DeterministicWorldState) => void;
     onPeerDisconnected?: (peerUid: string) => void;
   }) {
@@ -812,6 +840,7 @@ export class WebRTCLockstepSession {
     this.isHost = opts.isHost;
     this.onSignalOut = opts.onSignalOut;
     this.onFrameInputsCallback = opts.onFrameInputs || null;
+    this.onClientBallCallback = opts.onClientBall || null;
     this.onStateSeedCallback = opts.onStateSeed || null;
     this.onPeerDisconnectedCallback = opts.onPeerDisconnected || null;
     this.playerPings[this.localUid] = realtimeWsBroker.getLocalPingMs();
@@ -822,12 +851,20 @@ export class WebRTCLockstepSession {
         this.sendPingProbes();
       }, PING_INTERVAL_MS);
 
-      // Automatic WebRTC Handshake Retry if any peer DataChannel is not open yet
+      // Automatic WebRTC Handshake Retry only if connection is missing or stalled > 6.5s
       this.handshakeRetryId = window.setInterval(() => {
+        const nowPerf = performance.now();
         for (const uid of this.targetMemberUids) {
           if (uid === this.localUid) continue;
           const entry = this.peers.get(uid);
-          if (!entry || !entry.open) {
+          const isStalled =
+            !entry ||
+            (!entry.open &&
+              (entry.pc.connectionState === 'failed' ||
+                entry.pc.connectionState === 'closed' ||
+                entry.pc.iceConnectionState === 'failed' ||
+                nowPerf - entry.createdAtPerf > 6500));
+          if (isStalled) {
             if (!this.isHost) {
               this.onSignalOut({
                 roomId: this.roomId,
@@ -836,10 +873,12 @@ export class WebRTCLockstepSession {
                 type: 'join_request',
                 ts: Date.now(),
               });
+            } else {
+              this.initiateHostPeerConnection(uid, true).catch(() => {});
             }
           }
         }
-      }, 1800);
+      }, 4500);
     }
   }
 
@@ -921,13 +960,14 @@ export class WebRTCLockstepSession {
       pc,
       dc: null as RTCDataChannel | null,
       open: false,
+      createdAtPerf: performance.now(),
       pendingCandidates: [] as RTCIceCandidateInit[],
       missingTicks: 0,
       waitTicksForCurrentFrame: 0,
       lastInputAtPerf: performance.now(),
       lastInputKeys: { ...EMPTY_INPUT_KEYS },
       inputBuffer: new Map<number, PlayerInputKeys>(),
-      pingMs: 24,
+      pingMs: 18,
     };
 
     pc.onicecandidate = (event) => {
@@ -1001,9 +1041,20 @@ export class WebRTCLockstepSession {
     }
   }
 
-  private async initiateHostPeerConnection(clientUid: string) {
+  private async initiateHostPeerConnection(clientUid: string, force = false) {
     const existing = this.peers.get(clientUid);
-    if (existing && existing.open) return;
+    if (existing) {
+      if (existing.open) return;
+      const ageMs = performance.now() - existing.createdAtPerf;
+      const failed =
+        existing.pc.connectionState === 'failed' ||
+        existing.pc.connectionState === 'closed' ||
+        existing.pc.iceConnectionState === 'failed';
+      // Never kill an active handshake that is less than 6 seconds old!
+      if (!force && !failed && ageMs < 6000) {
+        return;
+      }
+    }
 
     const entry = this.createPeerEntry(clientUid);
     try {
@@ -1129,6 +1180,10 @@ export class WebRTCLockstepSession {
         const firstKey = entry.inputBuffer.keys().next().value;
         if (typeof firstKey === 'number') entry.inputBuffer.delete(firstKey);
       }
+    } else if (pkt.kind === 'client_ball' && this.isHost) {
+      if (this.onClientBallCallback) {
+        this.onClientBallCallback(pkt);
+      }
     } else if (pkt.kind === 'frame' && !this.isHost) {
       if (this.onFrameInputsCallback) {
         this.onFrameInputsCallback(pkt.tick, pkt.inputs, pkt.snap);
@@ -1181,6 +1236,24 @@ export class WebRTCLockstepSession {
       keys,
     };
     this.broadcastToPeers(pkt);
+  }
+
+  /**
+   * Fast UDP-like ball touch relay over WebRTC DataChannel when Client touches/kicks ball
+   */
+  public sendClientBallTouch(ball: {
+    ballX: number;
+    ballY: number;
+    ballVx: number;
+    ballVy: number;
+    lastTouchTeam: EventTeam;
+  }) {
+    if (this.isHost) return;
+    this.broadcastToPeers({
+      kind: 'client_ball',
+      playerId: this.localUid,
+      ...ball,
+    });
   }
 
   /**

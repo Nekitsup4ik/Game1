@@ -1,4 +1,7 @@
+import crypto from 'crypto';
 import express from 'express';
+import http from 'http';
+import type { Duplex } from 'stream';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
@@ -25,6 +28,43 @@ const __dirname = path.dirname(__filename);
 
 const roomsStore = new Map<string, MatchRoomDoc & { updatedAtMs: number }>();
 const playersStore = new Map<string, Record<string, RoomPlayerDoc & { updatedAtMs: number }>>();
+const wsClients = new Set<Duplex>();
+
+function encodeWsTextFrame(text: string): Buffer {
+  const payload = Buffer.from(text, 'utf8');
+  const len = payload.length;
+  let header: Buffer;
+  if (len < 126) {
+    header = Buffer.allocUnsafe(2);
+    header[0] = 0x81;
+    header[1] = len;
+  } else if (len < 65536) {
+    header = Buffer.allocUnsafe(4);
+    header[0] = 0x81;
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.allocUnsafe(10);
+    header[0] = 0x81;
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  return Buffer.concat([header, payload]);
+}
+
+function broadcastWsJson(data: unknown, excludeSocket?: Duplex) {
+  if (wsClients.size === 0) return;
+  const frame = encodeWsTextFrame(JSON.stringify(data));
+  for (const sock of wsClients) {
+    if (sock !== excludeSocket && !sock.destroyed && sock.writable) {
+      try {
+        sock.write(frame);
+      } catch {
+        wsClients.delete(sock);
+      }
+    }
+  }
+}
 
 function clamp(val: number, min: number, max: number): number {
   if (!Number.isFinite(val)) return min;
@@ -523,11 +563,6 @@ async function startServer() {
       return;
     }
 
-    if (patch.seq && room.seq && patch.seq < room.seq && patch.eventState === 'normal') {
-      res.json({ ok: true, room, ts: now });
-      return;
-    }
-
     room.redScore = Math.max(room.redScore, clamp(Math.round(patch.redScore), 0, 99));
     room.blueScore = Math.max(room.blueScore, clamp(Math.round(patch.blueScore), 0, 99));
     room.ballX = Math.round(clamp(patch.ballX, -100, CANVAS_WIDTH + 100) * 10) / 10;
@@ -545,7 +580,7 @@ async function startServer() {
     room.eventUntilMs = Math.max(0, Math.round(patch.eventUntilMs));
     room.lastTouchTeam = patch.lastTouchTeam;
     room.actorUid = patch.actorUid;
-    room.seq = patch.seq || now;
+    room.seq = (room.seq || 0) + 1;
     room.updatedAtMs = now;
     room.heartbeatAtMs = now;
     res.json({ ok: true, room, ts: now });
@@ -719,7 +754,153 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = http.createServer(app);
+
+  // Direct RFC-6455 WebSocket Relay on /ws with TCP_NODELAY (<5ms latency!)
+  httpServer.on('upgrade', (req, socket, head) => {
+    if (!req.url || !req.url.startsWith('/ws')) {
+      return;
+    }
+    const key = req.headers['sec-websocket-key'];
+    if (!key || typeof key !== 'string') {
+      socket.destroy();
+      return;
+    }
+
+    const accept = crypto
+      .createHash('sha1')
+      .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
+      .digest('base64');
+
+    socket.write(
+      'HTTP/1.1 101 Switching Protocols\r\n' +
+        'Upgrade: websocket\r\n' +
+        'Connection: Upgrade\r\n' +
+        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+    );
+
+    if ('setNoDelay' in socket && typeof socket.setNoDelay === 'function') {
+      socket.setNoDelay(true);
+    }
+
+    wsClients.add(socket);
+    let rxBuffer = head && head.length > 0 ? Buffer.from(head) : Buffer.alloc(0);
+
+    // Send initial rooms snapshot on connect
+    cleanupStaleRooms();
+    for (const r of roomsStore.values()) {
+      try {
+        socket.write(
+          encodeWsTextFrame(
+            JSON.stringify({
+              topic: `haxarena2d/v3_live/rooms/${r.roomId}`,
+              payload: JSON.stringify(r),
+            })
+          )
+        );
+        const rPlayers = playersStore.get(r.roomId) || {};
+        for (const p of Object.values(rPlayers)) {
+          socket.write(
+            encodeWsTextFrame(
+              JSON.stringify({
+                topic: `haxarena2d/v3_live/players/${r.roomId}/${p.playerId}`,
+                payload: JSON.stringify(p),
+              })
+            )
+          );
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    const processWsFrames = () => {
+      while (rxBuffer.length >= 2) {
+        const b0 = rxBuffer[0];
+        const b1 = rxBuffer[1];
+        const opcode = b0 & 0x0f;
+        const masked = (b1 & 0x80) !== 0;
+        let payloadLen = b1 & 0x7f;
+        let offset = 2;
+
+        if (payloadLen === 126) {
+          if (rxBuffer.length < 4) return;
+          payloadLen = rxBuffer.readUInt16BE(2);
+          offset = 4;
+        } else if (payloadLen === 127) {
+          if (rxBuffer.length < 10) return;
+          payloadLen = Number(rxBuffer.readBigUInt64BE(2));
+          offset = 10;
+        }
+
+        const maskLen = masked ? 4 : 0;
+        if (rxBuffer.length < offset + maskLen + payloadLen) {
+          return;
+        }
+
+        const mask = masked ? rxBuffer.subarray(offset, offset + 4) : null;
+        offset += maskLen;
+        const data = Buffer.from(rxBuffer.subarray(offset, offset + payloadLen));
+        rxBuffer = rxBuffer.subarray(offset + payloadLen);
+
+        if (opcode === 0x08) {
+          wsClients.delete(socket);
+          socket.end();
+          return;
+        }
+        if (opcode === 0x09) {
+          // Ping -> Pong
+          const pong = Buffer.allocUnsafe(2);
+          pong[0] = 0x8a;
+          pong[1] = 0x00;
+          socket.write(pong);
+          continue;
+        }
+        if (opcode === 0x01) {
+          if (mask) {
+            for (let i = 0; i < data.length; i++) {
+              data[i] ^= mask[i & 3];
+            }
+          }
+          try {
+            const msg = JSON.parse(data.toString('utf8')) as {
+              topic?: string;
+              payload?: string;
+              pingT0?: number;
+            };
+            if (typeof msg.pingT0 === 'number') {
+              socket.write(encodeWsTextFrame(JSON.stringify({ pongT0: msg.pingT0 })));
+              continue;
+            }
+            if (msg.topic && typeof msg.payload === 'string') {
+              // Relay immediately to all connected clients (including sender for unified pipeline or excluding sender)
+              broadcastWsJson({ topic: msg.topic, payload: msg.payload }, socket);
+            }
+          } catch {
+            // ignore
+          }
+        }
+      }
+    };
+
+    socket.on('data', (chunk: Buffer) => {
+      rxBuffer = Buffer.concat([rxBuffer, chunk]);
+      if (rxBuffer.length > 512 * 1024) {
+        rxBuffer = Buffer.alloc(0);
+        return;
+      }
+      processWsFrames();
+    });
+
+    socket.on('close', () => {
+      wsClients.delete(socket);
+    });
+    socket.on('error', () => {
+      wsClients.delete(socket);
+    });
+  });
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`HaxArena 2D Server running on http://localhost:${PORT}`);
   });
 }

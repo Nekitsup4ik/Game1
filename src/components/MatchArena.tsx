@@ -91,6 +91,8 @@ interface LocalPhysicsState {
   ballY: number;
   ballVx: number;
   ballVy: number;
+  ballOffsetX: number;
+  ballOffsetY: number;
   ballAngle: number;
   lastTouchTeam: EventTeam;
   eventState: EventState;
@@ -570,6 +572,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     ballY: room.ballY ?? FIELD_CENTER_Y,
     ballVx: room.ballVx ?? 0,
     ballVy: room.ballVy ?? 0,
+    ballOffsetX: 0,
+    ballOffsetY: 0,
     ballAngle: 0,
     lastTouchTeam: room.lastTouchTeam ?? 'none',
     eventState: room.eventState ?? 'normal',
@@ -631,6 +635,26 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             snap
           );
         }
+      },
+      onClientBall: (pkt) => {
+        const p = physRef.current;
+        const prevVisX = p.ballX + p.ballOffsetX;
+        const prevVisY = p.ballY + p.ballOffsetY;
+        p.ballX = pkt.ballX;
+        p.ballY = pkt.ballY;
+        p.ballVx = pkt.ballVx;
+        p.ballVy = pkt.ballVy;
+        p.lastTouchTeam = pkt.lastTouchTeam;
+        const errX = prevVisX - p.ballX;
+        const errY = prevVisY - p.ballY;
+        if (Math.hypot(errX, errY) < 95) {
+          p.ballOffsetX = round4(errX * 0.45);
+          p.ballOffsetY = round4(errY * 0.45);
+        } else {
+          p.ballOffsetX = 0;
+          p.ballOffsetY = 0;
+        }
+        remoteBallGraceUntilMsRef.current = Date.now() + 200;
       },
     });
     webrtcSessionRef.current = session;
@@ -817,6 +841,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             p.ballY = netRoom.ballY;
             p.ballVx = netRoom.ballVx;
             p.ballVy = netRoom.ballVy;
+            p.ballOffsetX = 0;
+            p.ballOffsetY = 0;
 
             if (netRoom.eventState === 'goal') {
               p.awaitingSetPieceTouch = false;
@@ -836,54 +862,68 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               }
             }
           } else if (
-            (netRoom.seq || 0) > lastAppliedBallSeqRef.current &&
+            (netRoom.seq || 0) !== lastAppliedBallSeqRef.current &&
             netRoom.eventState === 'normal'
           ) {
-            // Only apply ball position/velocity when a genuinely NEW ball packet arrives!
-            lastAppliedBallSeqRef.current = netRoom.seq || now;
+            // HaxBall Exact Physics Reconciliation + Visual Smoothing Offset
+            lastAppliedBallSeqRef.current = netRoom.seq || 0;
             const isFromOtherPlayer = Boolean(
               netRoom.actorUid && netRoom.actorUid !== profile.uid
             );
             const recentlyTouchedLocally =
-              now - lastLocalBallTouchMsRef.current < 150;
+              now - lastLocalBallTouchMsRef.current < 160;
 
             if (isFromOtherPlayer) {
-              remoteBallGraceUntilMsRef.current = now + 180;
+              remoteBallGraceUntilMsRef.current = now + 200;
             }
 
             if (
-              !recentlyTouchedLocally &&
-              (netRoom.hostUid !== profile.uid || isFromOtherPlayer)
+              isFromOtherPlayer ||
+              (!recentlyTouchedLocally && netRoom.hostUid !== profile.uid)
             ) {
-              // Extrapolate incoming ball state forward to compensate network delay
+              const prevVisX = p.ballX + p.ballOffsetX;
+              const prevVisY = p.ballY + p.ballOffsetY;
+
               const extrapFrames = Math.max(
                 0,
-                Math.min(7, ((extrapolationMsRef.current + 18) / 1000) * 60)
+                Math.min(2.5, (extrapolationMsRef.current / 1000) * 60)
               );
-              const projX = round4(
-                netRoom.ballX + netRoom.ballVx * extrapFrames * 0.72
+              const targetX = round4(
+                netRoom.ballX + netRoom.ballVx * extrapFrames * 0.45
               );
-              const projY = round4(
-                netRoom.ballY + netRoom.ballVy * extrapFrames * 0.72
+              const targetY = round4(
+                netRoom.ballY + netRoom.ballVy * extrapFrames * 0.45
               );
-              const dist = Math.hypot(projX - p.ballX, projY - p.ballY);
 
-              // Never hard-snap during normal play unless distance > 250px (e.g. kickoff reset)!
-              if (dist > 250) {
-                p.ballX = projX;
-                p.ballY = projY;
-              } else {
-                const ballBlend = dist > 75 ? 0.34 : 0.22;
-                p.ballX = round4(p.ballX + (projX - p.ballX) * ballBlend);
-                p.ballY = round4(p.ballY + (projY - p.ballY) * ballBlend);
-              }
-              p.ballVx = round4(p.ballVx * 0.25 + netRoom.ballVx * 0.75);
-              p.ballVy = round4(p.ballVy * 0.25 + netRoom.ballVy * 0.75);
+              // 1. Immediately apply 100% of the authoritative ball position & velocity!
+              p.ballX = targetX;
+              p.ballY = targetY;
+              p.ballVx = netRoom.ballVx;
+              p.ballVy = netRoom.ballVy;
               p.lastTouchTeam = netRoom.lastTouchTeam;
+
+              // 2. Absorb visual discrepancy into ballOffsetX/ballOffsetY so it glides with zero teleport!
+              const errX = prevVisX - p.ballX;
+              const errY = prevVisY - p.ballY;
+              const errDist = Math.hypot(errX, errY);
+              if (errDist < 95) {
+                const keep = isFromOtherPlayer ? 0.42 : 0.68;
+                p.ballOffsetX = round4(errX * keep);
+                p.ballOffsetY = round4(errY * keep);
+              } else {
+                p.ballOffsetX = 0;
+                p.ballOffsetY = 0;
+              }
             }
           }
         }
       }
+
+      // Decay visual smoothing offset on every 60Hz frame
+      p.ballOffsetX =
+        Math.abs(p.ballOffsetX) > 0.25 ? round4(p.ballOffsetX * 0.72) : 0;
+      p.ballOffsetY =
+        Math.abs(p.ballOffsetY) > 0.25 ? round4(p.ballOffsetY * 0.72) : 0;
 
       if (Object.keys(liveSnap.players).length > 0) {
         playersRef.current = { ...playersRef.current, ...liveSnap.players };
@@ -1090,7 +1130,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         }
 
         // 1. Only update simX/simY/vx/vy from network when a genuinely NEW packet arrives!
-        if (pktSeq > state.lastSeq) {
+        if (pktSeq !== state.lastSeq) {
           state.lastSeq = pktSeq;
           state.vx = rp.vx || 0;
           state.vy = rp.vy || 0;
@@ -1098,8 +1138,19 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           state.simY = round4(rp.y + state.vy * extrapFrames * 0.35);
         }
 
-        // 2. Advance the simulated target every 60fps frame using lockstep input + velocity damping
-        const peerKey = peerInputsRef.current[rp.playerId];
+        // 2. Advance the simulated target every 60fps frame using lockstep input + keyMask + velocity damping
+        const km = (rp as { keyMask?: number }).keyMask;
+        const peerKey =
+          peerInputsRef.current[rp.playerId] ||
+          (typeof km === 'number'
+            ? {
+                up: (km & 1) !== 0,
+                down: (km & 2) !== 0,
+                left: (km & 4) !== 0,
+                right: (km & 8) !== 0,
+                kick: (km & 16) !== 0,
+              }
+            : null);
         if (peerKey) {
           let pdx = 0;
           let pdy = 0;
@@ -1150,11 +1201,11 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
 
         // 3. Smoothly glide visual position (state.x, state.y) toward moving state.simX, state.simY
         const d = Math.hypot(state.simX - state.x, state.simY - state.y);
-        if (d > 220) {
+        if (d > 160) {
           state.x = state.simX;
           state.y = state.simY;
         } else {
-          const blend = Math.min(0.45, 0.25 * dtScale);
+          const blend = Math.min(0.55, 0.36 * dtScale);
           state.x = round4(state.x + (state.simX - state.x) * blend);
           state.y = round4(state.y + (state.simY - state.y) * blend);
         }
@@ -1618,10 +1669,19 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         }
       }
 
-      // 6. Real-Time Network Synchronization (60Hz WebRTC Lockstep + 33Hz WebSocket Fast Channel)
+      // 6. Real-Time Network Synchronization (60Hz WebRTC Lockstep + 50Hz /ws Direct Fast Channel)
       if (!isMatchFinished) {
         if (localTouchedBall) {
           lastLocalBallTouchMsRef.current = now;
+          if (rtcSession && !rtcSession.isHost) {
+            rtcSession.sendClientBallTouch({
+              ballX: p.ballX,
+              ballY: p.ballY,
+              ballVx: p.ballVx,
+              ballVy: p.ballVy,
+              lastTouchTeam: p.lastTouchTeam,
+            });
+          }
         }
 
         // Broadcast 60Hz authoritative lockstep frame over WebRTC DataChannel when Host
@@ -1672,7 +1732,18 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           }
         }
 
-        if (localMovedOrChanged && now - lastPlayerSyncMsRef.current >= 30) {
+        const k = keysRef.current;
+        const keyMask =
+          (k.up ? 1 : 0) |
+          (k.down ? 2 : 0) |
+          (k.left ? 4 : 0) |
+          (k.right ? 8 : 0) |
+          (k.kick ? 16 : 0);
+
+        if (
+          (localMovedOrChanged || keyMask !== 0) &&
+          now - lastPlayerSyncMsRef.current >= 20
+        ) {
           lastPlayerSyncMsRef.current = now;
           syncLocalPlayerDisc(
             currentRoom.roomId,
@@ -1683,6 +1754,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               vx: p.myVx,
               vy: p.myVy,
               kicking: p.myKicking,
+              keyMask,
             },
             {
               nickname: profile.nickname,
@@ -1697,13 +1769,13 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           now >= remoteBallGraceUntilMsRef.current;
         const isBallAuthority = isHostAuthority || localTouchedBall;
         const ballMoving =
-          Math.abs(p.ballVx) > 0.04 || Math.abs(p.ballVy) > 0.04 || localTouchedBall;
+          Math.abs(p.ballVx) > 0.03 || Math.abs(p.ballVy) > 0.03 || localTouchedBall;
 
         if (
           isBallAuthority &&
           ballMoving &&
           p.eventState === 'normal' &&
-          (localTouchedBall || now - lastBallSyncMsRef.current >= 32)
+          (localTouchedBall || now - lastBallSyncMsRef.current >= 20)
         ) {
           lastBallSyncMsRef.current = now;
           syncRoomGameplayState(currentRoom.roomId, {
@@ -2362,15 +2434,18 @@ function drawArena(
     heldDurationMs >= POWERSHOT_CHARGE_MS &&
     heldDurationMs <= POWERSHOT_CHARGE_MS + POWERSHOT_WINDOW_MS;
 
+  const renderBallX = phys.ballX + (phys.ballOffsetX || 0);
+  const renderBallY = phys.ballY + (phys.ballOffsetY || 0);
+
   ctx.save();
   // Drop shadow under ball
   ctx.beginPath();
-  ctx.arc(phys.ballX, phys.ballY + 2, BALL_RADIUS, 0, Math.PI * 2);
+  ctx.arc(renderBallX, renderBallY + 2, BALL_RADIUS, 0, Math.PI * 2);
   ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
   ctx.fill();
 
   // Translate & rotate ball around its center
-  ctx.translate(phys.ballX, phys.ballY);
+  ctx.translate(renderBallX, renderBallY);
   ctx.rotate(phys.ballAngle);
 
   // White spherical backing so the soccer ball is always solid & bright

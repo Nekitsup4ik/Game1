@@ -81,18 +81,20 @@ if (bc) {
     if (!data) return;
     if (data.type === 'room' && data.room) {
       const r = data.room as SyncedRoomRecord;
-      const prev = memoryRooms.get(r.roomId);
-      if (!prev || (r.seq || r.updatedAtMs || 0) >= (prev.seq || prev.updatedAtMs || 0)) {
-        memoryRooms.set(r.roomId, r);
-      }
+      memoryRooms.set(r.roomId, {
+        ...r,
+        seq: realtimeWsBroker.nextMonotonicSeq(),
+        updatedAtMs: Date.now(),
+      });
     } else if (data.type === 'player' && data.player) {
       const p = data.player as SyncedPlayerRecord;
       const map = memoryPlayers.get(p.roomId) || {};
-      const prev = map[p.playerId];
-      if (!prev || (p.seq || p.updatedAtMs || 0) >= (prev.seq || prev.updatedAtMs || 0)) {
-        map[p.playerId] = p;
-        memoryPlayers.set(p.roomId, map);
-      }
+      map[p.playerId] = {
+        ...p,
+        seq: realtimeWsBroker.nextMonotonicSeq(),
+        updatedAtMs: Date.now(),
+      };
+      memoryPlayers.set(p.roomId, map);
     } else if (data.type === 'delete_room' && data.roomId) {
       memoryRooms.delete(data.roomId);
       memoryPlayers.delete(data.roomId);
@@ -1172,10 +1174,18 @@ export async function startMatchByHost(
 export async function syncLocalPlayerDisc(
   roomId: string,
   uid: string,
-  state: { x: number; y: number; vx: number; vy: number; kicking: boolean },
+  state: {
+    x: number;
+    y: number;
+    vx: number;
+    vy: number;
+    kicking: boolean;
+    keyMask?: number;
+  },
   profileFallback?: { nickname: string; jerseyNumber: number; team: TeamColor }
 ): Promise<void> {
   const now = Date.now();
+  const nextSeq = realtimeWsBroker.nextMonotonicSeq();
   const safeX = Math.round(clamp(state.x, 0, CANVAS_WIDTH) * 10) / 10;
   const safeY = Math.round(clamp(state.y, 0, CANVAS_HEIGHT) * 10) / 10;
   const safeVx =
@@ -1202,8 +1212,9 @@ export async function syncLocalPlayerDisc(
     vx: safeVx,
     vy: safeVy,
     kicking: safeKicking,
+    keyMask: state.keyMask,
     pingMs,
-    seq: now,
+    seq: nextSeq,
     updatedAtMs: now,
   };
 
@@ -1211,7 +1222,7 @@ export async function syncLocalPlayerDisc(
   memoryPlayers.set(roomId, pMap);
   bc?.postMessage({ type: 'player', player: updatedPlayer });
 
-  // Non-retained 80-byte WebSocket fast tick (zero React re-renders, ~15ms delivery!)
+  // Non-retained 80-byte WebSocket fast tick (<5ms delivery on /ws!)
   realtimeWsBroker.publishFastPlayerTick(
     roomId,
     uid,
@@ -1221,8 +1232,10 @@ export async function syncLocalPlayerDisc(
     safeVy,
     safeKicking,
     pingMs,
-    now,
+    nextSeq,
     profileFallback
+      ? { ...profileFallback, keyMask: state.keyMask }
+      : undefined
   );
 }
 
@@ -1232,6 +1245,7 @@ export function applyWebRTCAuthoritativeSnapshot(
   snap: FastAuthoritativeSnapshot
 ): void {
   const now = Date.now();
+  const nextSeq = realtimeWsBroker.nextMonotonicSeq();
   const baseRoom = memoryRooms.get(roomId) || realtimeWsBroker.getRoom(roomId);
   if (baseRoom) {
     memoryRooms.set(roomId, {
@@ -1247,7 +1261,7 @@ export function applyWebRTCAuthoritativeSnapshot(
       eventUntilMs: snap.eventUntilMs,
       lastTouchTeam: snap.lastTouchTeam,
       actorUid: hostUid,
-      seq: now,
+      seq: nextSeq,
       updatedAtMs: now,
       heartbeatAtMs: now,
     });
@@ -1267,8 +1281,8 @@ export function applyWebRTCAuthoritativeSnapshot(
       vx: pState.vx,
       vy: pState.vy,
       kicking: pState.kicking,
-      pingMs: existing?.pingMs || 24,
-      seq: now,
+      pingMs: existing?.pingMs || 18,
+      seq: nextSeq,
       updatedAtMs: now,
     };
   }
@@ -1292,6 +1306,7 @@ export async function syncRoomGameplayState(
   }
 ): Promise<void> {
   const now = Date.now();
+  const nextSeq = realtimeWsBroker.nextMonotonicSeq();
   const baseRoom =
     memoryRooms.get(roomId) || realtimeWsBroker.getRoom(roomId);
 
@@ -1318,7 +1333,7 @@ export async function syncRoomGameplayState(
           ballVx: safeBallVx,
           ballVy: safeBallVy,
           actorUid: patch.actorUid,
-          seq: now,
+          seq: nextSeq,
           updatedAtMs: now,
           heartbeatAtMs: now,
         }
@@ -1338,7 +1353,7 @@ export async function syncRoomGameplayState(
           eventUntilMs: Math.max(0, Math.round(patch.eventUntilMs)),
           lastTouchTeam: patch.lastTouchTeam,
           actorUid: patch.actorUid,
-          seq: now,
+          seq: nextSeq,
           updatedAtMs: now,
           heartbeatAtMs: now,
         };
@@ -1362,7 +1377,7 @@ export async function syncRoomGameplayState(
       eventUntilMs: Math.max(0, Math.round(patch.eventUntilMs)),
       lastTouchTeam: patch.lastTouchTeam,
     },
-    now
+    nextSeq
   );
 }
 
