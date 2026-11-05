@@ -154,6 +154,9 @@ class RealtimeMultiplayerBroker {
   private rtcSignalListeners = new Set<(roomId: string, signal: unknown) => void>();
   private localPingMs = 18;
   private rxSeqCounter = 1000;
+  private txSeqCounter = 1;
+  private lastSenderSeq = new Map<string, number>();
+  private localPlayerUid = '';
   private directWs: WebSocket | null = null;
   private directWsConnected = false;
   private directWsPingTimer: number | null = null;
@@ -204,6 +207,11 @@ class RealtimeMultiplayerBroker {
     return this.rxSeqCounter;
   }
 
+  public nextOutgoingSeq(): number {
+    this.txSeqCounter += 1;
+    return this.txSeqCounter;
+  }
+
   private connectDirectWs() {
     if (this.directWsReconnectTimer) {
       window.clearTimeout(this.directWsReconnectTimer);
@@ -251,7 +259,8 @@ class RealtimeMultiplayerBroker {
           if (msg.topic && typeof msg.payload === 'string') {
             this.handleIncomingPublish(
               msg.topic,
-              encoder.encode(msg.payload)
+              encoder.encode(msg.payload),
+              true
             );
           }
         } catch {
@@ -425,12 +434,16 @@ class RealtimeMultiplayerBroker {
           pIdx += 2;
         }
         const payloadBytes = packet.slice(pIdx);
-        this.handleIncomingPublish(topic, payloadBytes);
+        this.handleIncomingPublish(topic, payloadBytes, false);
       }
     }
   }
 
-  private handleIncomingPublish(topic: string, payloadBytes: Uint8Array) {
+  private handleIncomingPublish(
+    topic: string,
+    payloadBytes: Uint8Array,
+    fromDirectWs = false
+  ) {
     const pingTopic = `${TOPIC_PREFIX}/ping/${this.clientId}`;
     if (topic === pingTopic) {
       const sentPerf = Number(decoder.decode(payloadBytes));
@@ -462,12 +475,36 @@ class RealtimeMultiplayerBroker {
 
     const fastPrefix = `${TOPIC_PREFIX}/fast/`;
     if (topic.startsWith(fastPrefix)) {
+      // Never accept delayed 250ms+ MQTT echoes when directWs (<5ms) is active!
+      if (!fromDirectWs && this.directWsConnected) {
+        return;
+      }
       const roomId = topic.slice(fastPrefix.length);
       if (!roomId || payloadBytes.length === 0) return;
       if (this.deletedRoomIds.has(roomId)) return;
 
       try {
         const pkt = JSON.parse(decoder.decode(payloadBytes)) as FastTickPacket;
+
+        // Ignore self-echoed packets from MQTT brokers!
+        if (this.localPlayerUid && pkt.u === this.localPlayerUid) {
+          return;
+        }
+
+        // Per-sender monotonic sequence deduplication (zero clock skew across machines, blocks all duplicate/late packets!)
+        if (pkt.u && typeof pkt.s === 'number') {
+          const dedupKey = `${roomId}:${pkt.t}:${pkt.u}`;
+          const prevS = this.lastSenderSeq.get(dedupKey);
+          if (
+            prevS !== undefined &&
+            pkt.s <= prevS &&
+            prevS - pkt.s < 50000
+          ) {
+            return;
+          }
+          this.lastSenderSeq.set(dedupKey, pkt.s);
+        }
+
         const localRxSeq = this.nextMonotonicSeq();
 
         if (pkt.t === 'p') {
@@ -647,6 +684,8 @@ class RealtimeMultiplayerBroker {
           ...parsed,
           x: existing ? existing.x : parsed.x,
           y: existing ? existing.y : parsed.y,
+          vx: existing ? existing.vx : parsed.vx,
+          vy: existing ? existing.vy : parsed.vy,
           seq: existing?.seq || localRxSeq,
           updatedAtMs: Date.now(),
         };
@@ -691,13 +730,16 @@ class RealtimeMultiplayerBroker {
             payload: decoder.decode(payload),
           })
         );
-        // For high-frequency non-retained fast ticks, if directWs is connected we don't even need to wait on external MQTT!
+        // For non-retained fast ticks, never send to slow external MQTT brokers when directWs is open!
+        if (!retain) {
+          return;
+        }
       } catch {
         // ignore
       }
     }
 
-    // 2. Also send to primary connected external broker so cross-network / GitHub Pages clients stay synced
+    // 2. Send to primary connected external broker for lobby discovery or GitHub Pages fallback
     let sent = false;
     for (const entry of this.sockets) {
       if (entry.connected && entry.ws?.readyState === WebSocket.OPEN) {
@@ -740,7 +782,7 @@ class RealtimeMultiplayerBroker {
     vy: number,
     kicking: boolean,
     pingMs: number,
-    seq: number,
+    _seq: number,
     fallbackMeta?: {
       nickname: string;
       jerseyNumber: number;
@@ -749,7 +791,9 @@ class RealtimeMultiplayerBroker {
     }
   ) {
     this.start();
+    this.localPlayerUid = uid;
     const localSeq = this.nextMonotonicSeq();
+    const outSeq = this.nextOutgoingSeq();
     const rPlayers = this.players.get(roomId) || {};
     const existing = rPlayers[uid];
     const km =
@@ -786,7 +830,7 @@ class RealtimeMultiplayerBroker {
       k: kicking ? 1 : 0,
       km,
       p: pingMs,
-      s: seq,
+      s: outSeq,
     };
     this.broadcastMqtt(
       `${TOPIC_PREFIX}/fast/${roomId}`,
@@ -810,10 +854,14 @@ class RealtimeMultiplayerBroker {
       eventUntilMs: number;
       lastTouchTeam: EventTeam;
     },
-    seq: number
+    _seq: number
   ) {
     this.start();
+    if (actorUid) {
+      this.localPlayerUid = actorUid;
+    }
     const localSeq = this.nextMonotonicSeq();
+    const outSeq = this.nextOutgoingSeq();
     const room = this.rooms.get(roomId);
     if (room) {
       room.redScore = Math.max(room.redScore, patch.redScore);
@@ -845,7 +893,7 @@ class RealtimeMultiplayerBroker {
       et: patch.eventTeam,
       eu: patch.eventUntilMs,
       lt: patch.lastTouchTeam,
-      s: seq,
+      s: outSeq,
     };
     this.broadcastMqtt(
       `${TOPIC_PREFIX}/fast/${roomId}`,

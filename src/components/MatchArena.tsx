@@ -113,6 +113,8 @@ interface LocalPhysicsState {
     {
       x: number;
       y: number;
+      offsetX: number;
+      offsetY: number;
       simX: number;
       simY: number;
       vx: number;
@@ -632,7 +634,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           applyWebRTCAuthoritativeSnapshot(
             roomRef.current.roomId,
             roomRef.current.hostUid,
-            snap
+            snap,
+            profile.uid
           );
         }
       },
@@ -884,20 +887,9 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               const prevVisX = p.ballX + p.ballOffsetX;
               const prevVisY = p.ballY + p.ballOffsetY;
 
-              const extrapFrames = Math.max(
-                0,
-                Math.min(2.5, (extrapolationMsRef.current / 1000) * 60)
-              );
-              const targetX = round4(
-                netRoom.ballX + netRoom.ballVx * extrapFrames * 0.45
-              );
-              const targetY = round4(
-                netRoom.ballY + netRoom.ballVy * extrapFrames * 0.45
-              );
-
-              // 1. Immediately apply 100% of the authoritative ball position & velocity!
-              p.ballX = targetX;
-              p.ballY = targetY;
+              // 1. Immediately apply 100% of the authoritative ball position & velocity (no artificial forward shift ahead of dribbler!)
+              p.ballX = round4(netRoom.ballX);
+              p.ballY = round4(netRoom.ballY);
               p.ballVx = netRoom.ballVx;
               p.ballVy = netRoom.ballVy;
               p.lastTouchTeam = netRoom.lastTouchTeam;
@@ -907,7 +899,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               const errY = prevVisY - p.ballY;
               const errDist = Math.hypot(errX, errY);
               if (errDist < 95) {
-                const keep = isFromOtherPlayer ? 0.42 : 0.68;
+                const keep = isFromOtherPlayer ? 0.45 : 0.65;
                 p.ballOffsetX = round4(errX * keep);
                 p.ballOffsetY = round4(errY * keep);
               } else {
@@ -926,7 +918,12 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         Math.abs(p.ballOffsetY) > 0.25 ? round4(p.ballOffsetY * 0.72) : 0;
 
       if (Object.keys(liveSnap.players).length > 0) {
-        playersRef.current = { ...playersRef.current, ...liveSnap.players };
+        const nextPlayers = { ...playersRef.current };
+        for (const [uid, pl] of Object.entries(liveSnap.players)) {
+          if (uid === profile.uid) continue;
+          nextPlayers[uid] = pl;
+        }
+        playersRef.current = nextPlayers;
       }
 
       const currentRoom = roomRef.current;
@@ -1031,59 +1028,6 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         p.myX = round4(p.myX + p.myVx * dtScale);
         p.myY = round4(p.myY + p.myVy * dtScale);
 
-        // Keep player within outer arena walls
-        p.myX = round4(
-          Math.max(PLAYER_RADIUS + 12, Math.min(CANVAS_WIDTH - PLAYER_RADIUS - 12, p.myX))
-        );
-        p.myY = round4(
-          Math.max(PLAYER_RADIUS + 12, Math.min(CANVAS_HEIGHT - PLAYER_RADIUS - 12, p.myY))
-        );
-
-        // Solid Goalpost Hitboxes for Player Disc (Player cannot pass through goalposts)
-        for (const post of GOALPOSTS) {
-          const dxPost = p.myX - post.x;
-          const dyPost = p.myY - post.y;
-          const distPost = Math.hypot(dxPost, dyPost);
-          const minPostDist = PLAYER_RADIUS + POST_RADIUS;
-          if (distPost < minPostDist && distPost > 0.001) {
-            const pAngle = Math.atan2(dyPost, dxPost);
-            const nx = round4(Math.cos(pAngle));
-            const ny = round4(Math.sin(pAngle));
-            p.myX = round4(post.x + nx * minPostDist);
-            p.myY = round4(post.y + ny * minPostDist);
-            const dot = p.myVx * nx + p.myVy * ny;
-            if (dot < 0) {
-              p.myVx = round4(p.myVx - dot * nx * 1.15);
-              p.myVy = round4(p.myVy - dot * ny * 1.15);
-            }
-          }
-        }
-
-        // During Set Piece (Throw-In / Corner): keep opposing team outside 74px radius
-        const setPieceTeamHasPlayers =
-          p.eventTeam === 'red'
-            ? currentRoom.redUids.length > 0
-            : p.eventTeam === 'blue'
-              ? currentRoom.blueUids.length > 0
-              : false;
-
-        if (
-          p.awaitingSetPieceTouch &&
-          setPieceTeamHasPlayers &&
-          p.eventTeam !== 'none' &&
-          localTeam !== p.eventTeam
-        ) {
-          const dxBall = p.myX - p.ballX;
-          const dyBall = p.myY - p.ballY;
-          const distBall = Math.hypot(dxBall, dyBall);
-          const minThrowInDist = 74;
-          if (distBall < minThrowInDist && distBall > 0.001) {
-            const bAngle = Math.atan2(dyBall, dxBall);
-            p.myX = round4(p.ballX + Math.cos(bAngle) * minThrowInDist);
-            p.myY = round4(p.ballY + Math.sin(bAngle) * minThrowInDist);
-          }
-        }
-
         if (
           Math.abs(p.myVx) > 0.015 ||
           Math.abs(p.myVy) > 0.015 ||
@@ -1098,11 +1042,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         p.myKicking = false;
       }
 
-      // Continuous 60fps Dead-Reckoning + Extrapolation for Remote Players (Zero backward pull between packets!)
-      const extrapFrames = Math.max(
-        0,
-        Math.min(10, (extrapolationMsRef.current / 1000) * 60)
-      );
+      // Continuous 60fps HaxBall Dead-Reckoning + Visual Offset Smoothing for Remote Players (Zero shudder!)
       const remotePlayerDamp = Math.pow(PLAYER_DAMPING, dtScale);
 
       Object.values(allPlayers).forEach((rp) => {
@@ -1119,6 +1059,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           state = {
             x: rp.x,
             y: rp.y,
+            offsetX: 0,
+            offsetY: 0,
             simX: rp.x,
             simY: rp.y,
             vx: rp.vx || 0,
@@ -1129,16 +1071,35 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           return;
         }
 
-        // 1. Only update simX/simY/vx/vy from network when a genuinely NEW packet arrives!
+        // 1. When a genuinely NEW packet arrives, set exact physics coordinates and absorb visual delta into offsetX/offsetY
         if (pktSeq !== state.lastSeq) {
+          const prevVisX = state.x + state.offsetX;
+          const prevVisY = state.y + state.offsetY;
           state.lastSeq = pktSeq;
+          state.x = rp.x;
+          state.y = rp.y;
           state.vx = rp.vx || 0;
           state.vy = rp.vy || 0;
-          state.simX = round4(rp.x + state.vx * extrapFrames * 0.35);
-          state.simY = round4(rp.y + state.vy * extrapFrames * 0.35);
+
+          const errX = prevVisX - state.x;
+          const errY = prevVisY - state.y;
+          const errDist = Math.hypot(errX, errY);
+          if (errDist < 95) {
+            state.offsetX = round4(errX * 0.65);
+            state.offsetY = round4(errY * 0.65);
+          } else {
+            state.offsetX = 0;
+            state.offsetY = 0;
+          }
         }
 
-        // 2. Advance the simulated target every 60fps frame using lockstep input + keyMask + velocity damping
+        // Decay visual offset smoothly every 60Hz frame
+        state.offsetX =
+          Math.abs(state.offsetX) > 0.2 ? round4(state.offsetX * 0.72) : 0;
+        state.offsetY =
+          Math.abs(state.offsetY) > 0.2 ? round4(state.offsetY * 0.72) : 0;
+
+        // 2. Step remote player physics at 60Hz between packets using lockstep input + keyMask + velocity damping
         const km = (rp as { keyMask?: number }).keyMask;
         const peerKey =
           peerInputsRef.current[rp.playerId] ||
@@ -1186,233 +1147,204 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           state.vy = 0;
         }
 
-        state.simX = round4(
+        state.x = round4(
           Math.max(
             PLAYER_RADIUS + 12,
-            Math.min(CANVAS_WIDTH - PLAYER_RADIUS - 12, state.simX + state.vx * dtScale)
+            Math.min(CANVAS_WIDTH - PLAYER_RADIUS - 12, state.x + state.vx * dtScale)
           )
         );
-        state.simY = round4(
+        state.y = round4(
           Math.max(
             PLAYER_RADIUS + 12,
-            Math.min(CANVAS_HEIGHT - PLAYER_RADIUS - 12, state.simY + state.vy * dtScale)
+            Math.min(CANVAS_HEIGHT - PLAYER_RADIUS - 12, state.y + state.vy * dtScale)
           )
         );
-
-        // 3. Smoothly glide visual position (state.x, state.y) toward moving state.simX, state.simY
-        const d = Math.hypot(state.simX - state.x, state.simY - state.y);
-        if (d > 160) {
-          state.x = state.simX;
-          state.y = state.simY;
-        } else {
-          const blend = Math.min(0.55, 0.36 * dtScale);
-          state.x = round4(state.x + (state.simX - state.x) * blend);
-          state.y = round4(state.y + (state.simY - state.y) * blend);
-        }
+        state.simX = state.x;
+        state.simY = state.y;
       });
 
-      // 2. Ball & Disc Collision + Kick + Real 2D Goal Net Physics
+      // 1b. Player-to-Player Disc Collisions (Фишки игроков сталкиваются и толкают друг друга!)
+      if (!isMatchFinished && !isPausedForOutOrCorner) {
+        const minPlayerDist = PLAYER_RADIUS * 2; // 38px
+        Object.values(allPlayers).forEach((rp) => {
+          if (rp.playerId === profile.uid) return;
+          const rState = p.remoteRenderPos[rp.playerId];
+          if (!rState) return;
+
+          const dxP = p.myX - rState.x;
+          const dyP = p.myY - rState.y;
+          const distP = Math.hypot(dxP, dyP);
+
+          if (distP < minPlayerDist && distP > 0.001) {
+            const pAngle = Math.atan2(dyP, dxP);
+            const nx = round4(Math.cos(pAngle));
+            const ny = round4(Math.sin(pAngle));
+            const overlap = minPlayerDist - distP;
+
+            // Push both discs apart symmetrically so players can block and push each other
+            p.myX = round4(p.myX + nx * overlap * 0.52);
+            p.myY = round4(p.myY + ny * overlap * 0.52);
+            rState.x = round4(rState.x - nx * overlap * 0.48);
+            rState.y = round4(rState.y - ny * overlap * 0.48);
+
+            // Elastic 2D momentum transfer between equal-mass player discs
+            const relVx = p.myVx - rState.vx;
+            const relVy = p.myVy - rState.vy;
+            const normalVel = relVx * nx + relVy * ny;
+            if (normalVel < 0) {
+              const playerRestitution = 0.28;
+              const impulse = -(1 + playerRestitution) * normalVel * 0.5;
+              p.myVx = round4(p.myVx + impulse * nx);
+              p.myVy = round4(p.myVy + impulse * ny);
+              rState.vx = round4(rState.vx - impulse * nx);
+              rState.vy = round4(rState.vy - impulse * ny);
+            }
+            localMovedOrChanged = true;
+          }
+        });
+
+        // Keep local player within outer arena walls & goalposts after player-to-player push
+        p.myX = round4(
+          Math.max(PLAYER_RADIUS + 12, Math.min(CANVAS_WIDTH - PLAYER_RADIUS - 12, p.myX))
+        );
+        p.myY = round4(
+          Math.max(PLAYER_RADIUS + 12, Math.min(CANVAS_HEIGHT - PLAYER_RADIUS - 12, p.myY))
+        );
+
+        for (const post of GOALPOSTS) {
+          const dxPost = p.myX - post.x;
+          const dyPost = p.myY - post.y;
+          const distPost = Math.hypot(dxPost, dyPost);
+          const minPostDist = PLAYER_RADIUS + POST_RADIUS;
+          if (distPost < minPostDist && distPost > 0.001) {
+            const pAngle = Math.atan2(dyPost, dxPost);
+            const nx = round4(Math.cos(pAngle));
+            const ny = round4(Math.sin(pAngle));
+            p.myX = round4(post.x + nx * minPostDist);
+            p.myY = round4(post.y + ny * minPostDist);
+            const dot = p.myVx * nx + p.myVy * ny;
+            if (dot < 0) {
+              p.myVx = round4(p.myVx - dot * nx * 1.15);
+              p.myVy = round4(p.myVy - dot * ny * 1.15);
+            }
+          }
+        }
+
+        // During Set Piece (Throw-In / Corner): keep opposing team outside 74px radius
+        const setPieceTeamHasPlayers =
+          p.eventTeam === 'red'
+            ? currentRoom.redUids.length > 0
+            : p.eventTeam === 'blue'
+              ? currentRoom.blueUids.length > 0
+              : false;
+
+        if (
+          p.awaitingSetPieceTouch &&
+          setPieceTeamHasPlayers &&
+          p.eventTeam !== 'none' &&
+          localTeam !== p.eventTeam
+        ) {
+          const dxBall = p.myX - p.ballX;
+          const dyBall = p.myY - p.ballY;
+          const distBall = Math.hypot(dxBall, dyBall);
+          const minThrowInDist = 74;
+          if (distBall < minThrowInDist && distBall > 0.001) {
+            const bAngle = Math.atan2(dyBall, dxBall);
+            p.myX = round4(p.ballX + Math.cos(bAngle) * minThrowInDist);
+            p.myY = round4(p.ballY + Math.sin(bAngle) * minThrowInDist);
+          }
+        }
+      }
+
+      // 2. Step Ball Movement FIRST, then resolve Disc-to-Ball Contact & Kick so the ball stays right on the player's circle when dribbling!
       let localTouchedBall = false;
       if (!isMatchFinished && !isPausedForOutOrCorner) {
-        // Players can collide with and kick the ball both during normal play AND during the 3-second post-goal celebration!
-        if (p.eventState === 'normal' || p.eventState === 'goal') {
-          const activeDiscs: Array<{
-            uid: string;
-            team: TeamColor;
-            x: number;
-            y: number;
-            vx: number;
-            vy: number;
-            kicking: boolean;
-          }> = [
-            {
-              uid: profile.uid,
-              team: localTeam,
-              x: p.myX,
-              y: p.myY,
-              vx: p.myVx,
-              vy: p.myVy,
-              kicking: p.myKicking,
-            },
-          ];
+        const activeDiscs: Array<{
+          uid: string;
+          team: TeamColor;
+          x: number;
+          y: number;
+          vx: number;
+          vy: number;
+          kicking: boolean;
+        }> = [
+          {
+            uid: profile.uid,
+            team: localTeam,
+            x: p.myX,
+            y: p.myY,
+            vx: p.myVx,
+            vy: p.myVy,
+            kicking: p.myKicking,
+          },
+        ];
 
-          Object.values(allPlayers).forEach((rp) => {
-            if (rp.playerId === profile.uid) return;
-            const interp = p.remoteRenderPos[rp.playerId] || { x: rp.x, y: rp.y };
-            activeDiscs.push({
-              uid: rp.playerId,
-              team: rp.team,
-              x: interp.x,
-              y: interp.y,
-              vx: rp.vx || 0,
-              vy: rp.vy || 0,
-              kicking: rp.kicking || false,
-            });
+        Object.values(allPlayers).forEach((rp) => {
+          if (rp.playerId === profile.uid) return;
+          const interp = p.remoteRenderPos[rp.playerId] || {
+            x: rp.x,
+            y: rp.y,
+            vx: rp.vx || 0,
+            vy: rp.vy || 0,
+          };
+          activeDiscs.push({
+            uid: rp.playerId,
+            team: rp.team,
+            x: interp.x,
+            y: interp.y,
+            vx: interp.vx,
+            vy: interp.vy,
+            kicking: rp.kicking || false,
           });
+        });
 
-          // Gray circle radius around player disc (PLAYER_RADIUS + 5 + BALL_RADIUS + tolerance = KICK_RANGE)
-          const grayCircleHoldDist = KICK_RANGE;
+        // Sub-stepped Ball Movement + Disc Contact + Goal Line Detection + Goal Net Physics
+        const subSteps = 2;
+        for (let step = 0; step < subSteps; step++) {
+          p.ballX = round4(p.ballX + (p.ballVx * dtScale) / subSteps);
+          p.ballY = round4(p.ballY + (p.ballVy * dtScale) / subSteps);
 
-          // Determine which player (if any) currently holds the ball on/inside their gray circle
-          let holderUid = '';
-          let closestGrayDist = Infinity;
-          for (const disc of activeDiscs) {
-            const d = Math.hypot(p.ballX - disc.x, p.ballY - disc.y);
-            if (d <= grayCircleHoldDist && d < closestGrayDist) {
-              closestGrayDist = d;
-              holderUid = disc.uid;
-            }
-          }
+          // Resolve Disc-to-Ball Contact inside each sub-step AFTER stepping ball position:
+          // This guarantees the ball sits flush against the player's disc circle (dist = PLAYER_RADIUS + BALL_RADIUS) instead of floating ahead!
+          if (p.eventState === 'normal' || p.eventState === 'goal') {
+            for (const disc of activeDiscs) {
+              const dx = p.ballX - disc.x;
+              const dy = p.ballY - disc.y;
+              const dist = Math.hypot(dx, dy);
+              const minDist = PLAYER_RADIUS + BALL_RADIUS;
 
-          if (holderUid === '') {
-            // Ball left the gray circle! Reset lock so the player can hold it for 5s again
-            p.controllingUid = '';
-            p.controlStartedAtMs = 0;
-            p.powershotMustExitRing = false;
-          } else if (p.controllingUid !== holderUid) {
-            // Ball entered a player's gray circle: start the 5-second hold timer
-            p.controllingUid = holderUid;
-            p.controlStartedAtMs = now;
-            p.powershotMustExitRing = false;
-          } else if (!p.powershotMustExitRing && p.controlStartedAtMs > 0) {
-            // Same player is still holding the ball in their gray circle:
-            // Check if the 5s charge + 2.5s active window (7.5s total) has expired without a kick
-            const heldMs = now - p.controlStartedAtMs;
-            if (heldMs > POWERSHOT_CHARGE_MS + POWERSHOT_WINDOW_MS) {
-              // 2.5s window expired! Powershot disappears and player MUST remove ball from gray circle to recharge
-              p.powershotMustExitRing = true;
-              p.controlStartedAtMs = 0;
-            }
-          }
+              if (dist < minDist && dist > 0.001 && !disc.kicking) {
+                const cAngle = Math.atan2(dy, dx);
+                const nx = round4(Math.cos(cAngle));
+                const ny = round4(Math.sin(cAngle));
 
-          for (const disc of activeDiscs) {
-            const dx = p.ballX - disc.x;
-            const dy = p.ballY - disc.y;
-            const dist = Math.hypot(dx, dy);
-            const minDist = PLAYER_RADIUS + BALL_RADIUS;
+                // Place ball flush on the outer perimeter of the player's disc
+                p.ballX = round4(disc.x + nx * minDist);
+                p.ballY = round4(disc.y + ny * minDist);
 
-            // Deterministic Kick (`attemptKick(player, ball, input)` with Math.atan2, Math.cos, Math.sin & 4-decimal rounding):
-            if (disc.kicking && dist < KICK_RANGE && dist > 0.001) {
-              const heldMs =
-                p.controllingUid === disc.uid &&
-                !p.powershotMustExitRing &&
-                p.controlStartedAtMs > 0
-                  ? now - p.controlStartedAtMs
-                  : 0;
-              const hasChargedPowershot =
-                heldMs >= POWERSHOT_CHARGE_MS &&
-                heldMs <= POWERSHOT_CHARGE_MS + POWERSHOT_WINDOW_MS;
+                const relVx = p.ballVx - disc.vx;
+                const relVy = p.ballVy - disc.vy;
+                const normalVel = relVx * nx + relVy * ny;
 
-              const kickStrength = hasChargedPowershot
-                ? POWERSHOT_IMPULSE
-                : p.isCornerSetPiece
-                  ? CORNER_KICK_IMPULSE
-                  : KICK_IMPULSE;
+                if (normalVel < 0) {
+                  // Zero restitution (0.0) during gentle dribbling so the ball rolls right on the player's disc without jumping ahead;
+                  // small bounce (0.08) only on high-speed impact
+                  const restitution = -normalVel > 1.85 ? 0.08 : 0.0;
+                  const impulse = -(1 + restitution) * normalVel;
+                  p.ballVx = round4(p.ballVx + impulse * nx);
+                  p.ballVy = round4(p.ballVy + impulse * ny);
+                }
 
-              const ballObj = {
-                x: p.ballX,
-                y: p.ballY,
-                vx: p.ballVx,
-                vy: p.ballVy,
-                radius: BALL_RADIUS,
-              };
-              const kickRes = attemptKick(
-                {
-                  x: disc.x,
-                  y: disc.y,
-                  vx: disc.vx,
-                  vy: disc.vy,
-                  radius: PLAYER_RADIUS,
-                },
-                ballObj,
-                {
-                  keys: {
-                    up: false,
-                    down: false,
-                    left: false,
-                    right: false,
-                    kick: disc.kicking,
-                  },
-                },
-                kickStrength,
-                KICK_RANGE - PLAYER_RADIUS - BALL_RADIUS
-              );
-
-              if (kickRes) {
-                p.ballVx = round4(kickRes.impulseX + disc.vx * 0.38);
-                p.ballVy = round4(kickRes.impulseY + disc.vy * 0.38);
                 p.lastTouchTeam = disc.team;
                 p.awaitingSetPieceTouch = false;
                 p.isCornerSetPiece = false;
 
-                if (hasChargedPowershot) {
-                  // Immediately turn off the Powershot color as soon as the player kicks
-                  p.powershotFlightUntilMs = 0;
-                  p.powershotMustExitRing = true;
-                  p.controlStartedAtMs = 0;
-                }
-
                 if (disc.uid === profile.uid) {
                   localTouchedBall = true;
-                  if (soundEnabledRef.current) {
-                    if (hasChargedPowershot) {
-                      soundFX.playPowerShot();
-                    } else {
-                      soundFX.playKick();
-                    }
-                  }
                 }
-              }
-            }
-
-            // Pure 2D Normal Circle Collision (Independent ball physics, zero sideways sticking, no kick sound on touch)
-            if (dist < minDist && dist > 0.001 && !disc.kicking) {
-              const nx = dx / dist;
-              const ny = dy / dist;
-              const overlap = minDist - dist;
-
-              p.ballX += nx * overlap * 0.88;
-              p.ballY += ny * overlap * 0.88;
-              if (disc.uid === profile.uid) {
-                p.myX -= nx * overlap * 0.12;
-                p.myY -= ny * overlap * 0.12;
-              }
-
-              const relVx = p.ballVx - disc.vx;
-              const relVy = p.ballVy - disc.vy;
-              const normalVel = relVx * nx + relVy * ny;
-
-              if (normalVel < 0) {
-                // Pure normal-only impulse with soft restitution (0.12):
-                // Ball has its own independent 2D physics and never sticks sideways when turning left/right
-                const restitution = 0.12;
-                const impulse = -(1 + restitution) * normalVel;
-                p.ballVx += impulse * nx;
-                p.ballVy += impulse * ny;
-              }
-
-              p.lastTouchTeam = disc.team;
-              p.awaitingSetPieceTouch = false;
-              p.isCornerSetPiece = false;
-
-              if (disc.uid === profile.uid) {
-                localTouchedBall = true;
               }
             }
           }
-        } else {
-          p.controllingUid = '';
-          p.controlStartedAtMs = 0;
-          p.powershotMustExitRing = false;
-        }
-
-        // Sub-stepped Ball Movement + Goal Line Detection + Elastic Spring-Mesh Goal Net Physics
-        const isAuthority =
-          currentRoom.hostUid === profile.uid || localTouchedBall;
-        const subSteps = 2;
-        for (let step = 0; step < subSteps; step++) {
-          p.ballX += (p.ballVx * dtScale) / subSteps;
-          p.ballY += (p.ballVy * dtScale) / subSteps;
 
           // Goalpost Circle Collisions
           for (const post of GOALPOSTS) {
@@ -1423,18 +1355,21 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             if (dist < minDist && dist > 0.001) {
               const nx = dx / dist;
               const ny = dy / dist;
-              p.ballX = post.x + nx * minDist;
-              p.ballY = post.y + ny * minDist;
+              p.ballX = round4(post.x + nx * minDist);
+              p.ballY = round4(post.y + ny * minDist);
               const dot = p.ballVx * nx + p.ballVy * ny;
               if (dot < 0) {
-                p.ballVx = (p.ballVx - 2 * dot * nx) * 0.82;
-                p.ballVy = (p.ballVy - 2 * dot * ny) * 0.82;
+                p.ballVx = round4((p.ballVx - 2 * dot * nx) * 0.82);
+                p.ballVy = round4((p.ballVy - 2 * dot * ny) * 0.82);
                 if (soundEnabledRef.current) {
                   soundFX.playPostHit();
                 }
               }
             }
           }
+
+          const isAuthority =
+            currentRoom.hostUid === profile.uid || localTouchedBall;
 
           // 3. Check for GOAL inside each sub-step BEFORE net rebound so goals are always counted!
           if (p.eventState === 'normal') {
@@ -1521,15 +1456,130 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           stepGoalNetSprings(p.rightNet);
         }
 
+        // Check Powershot Hold & Deterministic Kick (`attemptKick`)
+        if (p.eventState === 'normal' || p.eventState === 'goal') {
+          const grayCircleHoldDist = KICK_RANGE;
+          let holderUid = '';
+          let closestGrayDist = Infinity;
+          for (const disc of activeDiscs) {
+            const d = Math.hypot(p.ballX - disc.x, p.ballY - disc.y);
+            if (d <= grayCircleHoldDist && d < closestGrayDist) {
+              closestGrayDist = d;
+              holderUid = disc.uid;
+            }
+          }
+
+          if (holderUid === '') {
+            p.controllingUid = '';
+            p.controlStartedAtMs = 0;
+            p.powershotMustExitRing = false;
+          } else if (p.controllingUid !== holderUid) {
+            p.controllingUid = holderUid;
+            p.controlStartedAtMs = now;
+            p.powershotMustExitRing = false;
+          } else if (!p.powershotMustExitRing && p.controlStartedAtMs > 0) {
+            const heldMs = now - p.controlStartedAtMs;
+            if (heldMs > POWERSHOT_CHARGE_MS + POWERSHOT_WINDOW_MS) {
+              p.powershotMustExitRing = true;
+              p.controlStartedAtMs = 0;
+            }
+          }
+
+          for (const disc of activeDiscs) {
+            const dx = p.ballX - disc.x;
+            const dy = p.ballY - disc.y;
+            const dist = Math.hypot(dx, dy);
+
+            if (disc.kicking && dist < KICK_RANGE && dist > 0.001) {
+              const heldMs =
+                p.controllingUid === disc.uid &&
+                !p.powershotMustExitRing &&
+                p.controlStartedAtMs > 0
+                  ? now - p.controlStartedAtMs
+                  : 0;
+              const hasChargedPowershot =
+                heldMs >= POWERSHOT_CHARGE_MS &&
+                heldMs <= POWERSHOT_CHARGE_MS + POWERSHOT_WINDOW_MS;
+
+              const kickStrength = hasChargedPowershot
+                ? POWERSHOT_IMPULSE
+                : p.isCornerSetPiece
+                  ? CORNER_KICK_IMPULSE
+                  : KICK_IMPULSE;
+
+              const ballObj = {
+                x: p.ballX,
+                y: p.ballY,
+                vx: p.ballVx,
+                vy: p.ballVy,
+                radius: BALL_RADIUS,
+              };
+              const kickRes = attemptKick(
+                {
+                  x: disc.x,
+                  y: disc.y,
+                  vx: disc.vx,
+                  vy: disc.vy,
+                  radius: PLAYER_RADIUS,
+                },
+                ballObj,
+                {
+                  keys: {
+                    up: false,
+                    down: false,
+                    left: false,
+                    right: false,
+                    kick: disc.kicking,
+                  },
+                },
+                kickStrength,
+                KICK_RANGE - PLAYER_RADIUS - BALL_RADIUS
+              );
+
+              if (kickRes) {
+                p.ballVx = round4(kickRes.impulseX + disc.vx * 0.35);
+                p.ballVy = round4(kickRes.impulseY + disc.vy * 0.35);
+                p.lastTouchTeam = disc.team;
+                p.awaitingSetPieceTouch = false;
+                p.isCornerSetPiece = false;
+
+                if (hasChargedPowershot) {
+                  p.powershotFlightUntilMs = 0;
+                  p.powershotMustExitRing = true;
+                  p.controlStartedAtMs = 0;
+                }
+
+                if (disc.uid === profile.uid) {
+                  localTouchedBall = true;
+                  if (soundEnabledRef.current) {
+                    if (hasChargedPowershot) {
+                      soundFX.playPowerShot();
+                    } else {
+                      soundFX.playKick();
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } else {
+          p.controllingUid = '';
+          p.controlStartedAtMs = 0;
+          p.powershotMustExitRing = false;
+        }
+
+        const isAuthority =
+          currentRoom.hostUid === profile.uid || localTouchedBall;
+
         // Apply natural turf/air damping (identical on pitch and inside goal mouth)
         const ballDamp = Math.pow(BALL_DAMPING, dtScale);
-        p.ballVx *= ballDamp;
-        p.ballVy *= ballDamp;
+        p.ballVx = round4(p.ballVx * ballDamp);
+        p.ballVy = round4(p.ballVy * ballDamp);
 
         const bSpeed = Math.hypot(p.ballVx, p.ballVy);
         if (bSpeed > BALL_MAX_SPEED) {
-          p.ballVx = (p.ballVx / bSpeed) * BALL_MAX_SPEED;
-          p.ballVy = (p.ballVy / bSpeed) * BALL_MAX_SPEED;
+          p.ballVx = round4((p.ballVx / bSpeed) * BALL_MAX_SPEED);
+          p.ballVy = round4((p.ballVy / bSpeed) * BALL_MAX_SPEED);
         }
         if (bSpeed < 0.03) {
           p.ballVx = 0;
@@ -1685,6 +1735,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         }
 
         // Broadcast 60Hz authoritative lockstep frame over WebRTC DataChannel when Host
+        // Only send Host's own authoritative disc in snapPlayers so Host never echoes stale client positions back to clients!
         if (rtcSession && rtcSession.isHost) {
           const snapPlayers: Record<
             string,
@@ -1698,17 +1749,6 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               kicking: p.myKicking,
             },
           };
-          Object.values(allPlayers).forEach((rp) => {
-            if (rp.playerId === profile.uid) return;
-            const rState = p.remoteRenderPos[rp.playerId];
-            snapPlayers[rp.playerId] = {
-              x: rState ? rState.x : rp.x,
-              y: rState ? rState.y : rp.y,
-              vx: rState ? rState.vx : rp.vx || 0,
-              vy: rState ? rState.vy : rp.vy || 0,
-              kicking: rp.kicking || false,
-            };
-          });
           const resolved = rtcSession.resolveHostLockstepFrame(
             currentTick,
             { ...keysRef.current },
@@ -2343,14 +2383,19 @@ function drawArena(
   // Add remote players
   Object.values(players).forEach((rp) => {
     if (rp.playerId === localProfile.uid) return;
-    const pos = phys.remoteRenderPos[rp.playerId] || { x: rp.x, y: rp.y };
+    const pos = phys.remoteRenderPos[rp.playerId] || {
+      x: rp.x,
+      y: rp.y,
+      offsetX: 0,
+      offsetY: 0,
+    };
     renderList.push({
       uid: rp.playerId,
       nickname: rp.nickname,
       jerseyNumber: rp.jerseyNumber,
       team: rp.team,
-      x: pos.x,
-      y: pos.y,
+      x: pos.x + (pos.offsetX || 0),
+      y: pos.y + (pos.offsetY || 0),
       kicking: rp.kicking,
       pingMs: rp.pingMs ?? 24,
       isMe: false,

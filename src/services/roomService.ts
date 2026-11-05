@@ -1242,7 +1242,8 @@ export async function syncLocalPlayerDisc(
 export function applyWebRTCAuthoritativeSnapshot(
   roomId: string,
   hostUid: string,
-  snap: FastAuthoritativeSnapshot
+  snap: FastAuthoritativeSnapshot,
+  localUid?: string
 ): void {
   const now = Date.now();
   const nextSeq = realtimeWsBroker.nextMonotonicSeq();
@@ -1269,6 +1270,8 @@ export function applyWebRTCAuthoritativeSnapshot(
 
   const pMap = memoryPlayers.get(roomId) || {};
   for (const [uid, pState] of Object.entries(snap.players)) {
+    if (localUid && uid === localUid) continue;
+    if (uid !== hostUid) continue;
     const existing = pMap[uid] || realtimeWsBroker.getRoomPlayers(roomId)[uid];
     pMap[uid] = {
       playerId: uid,
