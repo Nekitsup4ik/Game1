@@ -688,17 +688,20 @@ class RealtimeMultiplayerBroker {
         }
 
         const existing = rPlayers[uid];
-        const room = this.rooms.get(roomId);
-        const isPlayingMatch = room && room.status === 'playing';
-
         const structuralChanged =
           !existing ||
           existing.team !== parsed.team ||
           existing.nickname !== parsed.nickname ||
           existing.jerseyNumber !== parsed.jerseyNumber;
 
-        // During an active 'playing' match, NEVER let a retained players/ metadata packet overwrite live 60Hz coordinates!
-        const shouldAcceptCoords = !existing || !isPlayingMatch || structuralChanged;
+        // Only accept coordinates from retained players/ metadata packets on initial join or explicit spawn reset
+        const hasRecentLiveCoords =
+          existing && Date.now() - (existing.updatedAtMs || 0) < 12000;
+        const isSpawnReset =
+          parsed.vx === 0 &&
+          parsed.vy === 0 &&
+          structuralChanged;
+        const shouldAcceptCoords = !existing || !hasRecentLiveCoords || isSpawnReset;
 
         const localRxSeq = this.nextMonotonicSeq();
         rPlayers[uid] = {
@@ -738,10 +741,17 @@ class RealtimeMultiplayerBroker {
     }
   }
 
-  private broadcastMqtt(topic: string, payload: Uint8Array, retain: boolean) {
+  private lastExternalMqttFastSentMs = new Map<string, number>();
+
+  private broadcastMqtt(
+    topic: string,
+    payload: Uint8Array,
+    retain: boolean,
+    subKey = ''
+  ) {
     this.start();
 
-    // 1. Send over direct same-origin WebSocket (/ws) when connected (<5ms latency)
+    // 1. Always send over direct same-origin WebSocket (/ws) immediately at full 60Hz (<5ms latency, zero throttling)
     if (
       this.directWsConnected &&
       this.directWs &&
@@ -759,8 +769,22 @@ class RealtimeMultiplayerBroker {
       }
     }
 
-    // 2. Always also send to primary connected external broker so players across ais-dev / ais-pre / Cloud Run instances / GitHub Pages
-    // receive 60Hz fast ticks and WebRTC signals! (lastSenderSeq automatically deduplicates whichever arrives second!)
+    // 2. For external public MQTT brokers (broker.emqx.io / broker.hivemq.com):
+    // Public brokers forcibly disconnect clients that flood >25 msg/sec (causing 2.5s+0.5s = 3s teleport stalls!).
+    // Always allow retained messages and '/rtc/' WebRTC signaling immediately,
+    // and rate-limit 'fast/' non-retained packets on external MQTT to ~16Hz (60ms per stream key).
+    const isFastTopic = !retain && topic.includes('/fast/');
+    if (isFastTopic) {
+      const nowPerf = performance.now();
+      const rateKey = `${topic}:${subKey}`;
+      const minIntervalMs = this.directWsConnected ? 90 : 55;
+      const prevPerf = this.lastExternalMqttFastSentMs.get(rateKey) || 0;
+      if (nowPerf - prevPerf < minIntervalMs) {
+        return;
+      }
+      this.lastExternalMqttFastSentMs.set(rateKey, nowPerf);
+    }
+
     let sent = false;
     for (const entry of this.sockets) {
       if (entry.connected && entry.ws?.readyState === WebSocket.OPEN) {
@@ -856,7 +880,8 @@ class RealtimeMultiplayerBroker {
     this.broadcastMqtt(
       `${TOPIC_PREFIX}/fast/${roomId}`,
       encoder.encode(JSON.stringify(pkt)),
-      false
+      false,
+      kicking ? `p_kick:${uid}:${outSeq}` : `p:${uid}`
     );
   }
 
@@ -919,7 +944,8 @@ class RealtimeMultiplayerBroker {
     this.broadcastMqtt(
       `${TOPIC_PREFIX}/fast/${roomId}`,
       encoder.encode(JSON.stringify(pkt)),
-      false
+      false,
+      patch.eventState !== 'normal' ? `b_ev:${outSeq}` : 'b'
     );
   }
 

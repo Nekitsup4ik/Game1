@@ -414,9 +414,12 @@ async function startServer() {
     res.json({ switched: true, room });
   });
 
-  // 6. Start Match by Host
+  // 6. Start Match by Host (with Rocket League 3-2-1 Countdown)
   app.post('/api/mp/room/start', (req, res) => {
-    const { roomId } = req.body as { roomId: string };
+    const { roomId, matchStartedAtMs } = req.body as {
+      roomId: string;
+      matchStartedAtMs?: number;
+    };
     const room = roomsStore.get(roomId);
     if (!room) {
       res.status(404).json({ error: 'Room not found' });
@@ -425,7 +428,12 @@ async function startServer() {
 
     const now = Date.now();
     room.status = 'playing';
-    room.matchStartedAtMs = now;
+    room.redScore = 0;
+    room.blueScore = 0;
+    room.matchStartedAtMs =
+      typeof matchStartedAtMs === 'number' && matchStartedAtMs > 0
+        ? matchStartedAtMs
+        : now + 3000;
     room.ballX = FIELD_CENTER_X;
     room.ballY = FIELD_CENTER_Y;
     room.ballVx = 0;

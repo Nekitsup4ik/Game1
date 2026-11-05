@@ -33,7 +33,7 @@ export const LOCKSTEP_FPS = 60;
 export const LOCKSTEP_DT = 1 / LOCKSTEP_FPS;
 export const MAX_EXTRAPOLATION_MS = 200;
 export const LOCKSTEP_WAIT_TIMEOUT_TICKS = 5; // 5 ticks (~83 ms) before empty input substitution
-export const LOCKSTEP_DISCONNECT_TIMEOUT_TICKS = 60; // 60 ticks (1.0 s) before closing peer connection
+export const LOCKSTEP_DISCONNECT_TIMEOUT_TICKS = 600; // 600 ticks (10.0 s) before closing peer connection
 export const PING_INTERVAL_MS = 3000; // Measure ping strictly every 3 seconds
 
 // Deterministic Tick Durations (at 60 Hz)
@@ -68,12 +68,18 @@ export const EMPTY_INPUT_KEYS: PlayerInputKeys = {
 };
 
 /**
- * 1. Pure Input Transmission Packet
+ * 1. Pure Input Transmission Packet (+ optional P2P state sync for hybrid smoothing)
  */
 export interface InputPacket {
   tick: number;
   playerId: string;
   keys: PlayerInputKeys;
+  x?: number;
+  y?: number;
+  vx?: number;
+  vy?: number;
+  kicking?: boolean;
+  keyMask?: number;
 }
 
 export interface DeterministicPlayerState {
@@ -699,6 +705,8 @@ export interface WebRTCSignalMessage {
 
 export interface FastAuthoritativeSnapshot {
   tick: number;
+  roomStatus?: 'waiting' | 'playing' | 'finished';
+  matchStartedAtMs?: number;
   ballX: number;
   ballY: number;
   ballVx: number;
@@ -718,6 +726,7 @@ export interface FastAuthoritativeSnapshot {
       vx: number;
       vy: number;
       kicking: boolean;
+      keyMask?: number;
     }
   >;
 }
@@ -797,6 +806,7 @@ export class WebRTCLockstepSession {
         snap?: FastAuthoritativeSnapshot
       ) => void)
     | null = null;
+  private onClientInputStateCallback: ((pkt: InputPacket) => void) | null = null;
   private onClientBallCallback:
     | ((pkt: {
         playerId: string;
@@ -825,6 +835,7 @@ export class WebRTCLockstepSession {
       inputs: Record<string, PlayerInputKeys>,
       snap?: FastAuthoritativeSnapshot
     ) => void;
+    onClientInputState?: (pkt: InputPacket) => void;
     onClientBall?: (pkt: {
       playerId: string;
       ballX: number;
@@ -841,6 +852,7 @@ export class WebRTCLockstepSession {
     this.isHost = opts.isHost;
     this.onSignalOut = opts.onSignalOut;
     this.onFrameInputsCallback = opts.onFrameInputs || null;
+    this.onClientInputStateCallback = opts.onClientInputState || null;
     this.onClientBallCallback = opts.onClientBall || null;
     this.onStateSeedCallback = opts.onStateSeed || null;
     this.onPeerDisconnectedCallback = opts.onPeerDisconnected || null;
@@ -852,7 +864,7 @@ export class WebRTCLockstepSession {
         this.sendPingProbes();
       }, PING_INTERVAL_MS);
 
-      // Automatic WebRTC Handshake Retry only if connection is missing or stalled > 6.5s
+      // Fast WebRTC Handshake Retry if peer DataChannel is not open yet (> 3.2s)
       this.handshakeRetryId = window.setInterval(() => {
         const nowPerf = performance.now();
         for (const uid of this.targetMemberUids) {
@@ -864,7 +876,7 @@ export class WebRTCLockstepSession {
               (entry.pc.connectionState === 'failed' ||
                 entry.pc.connectionState === 'closed' ||
                 entry.pc.iceConnectionState === 'failed' ||
-                nowPerf - entry.createdAtPerf > 6500));
+                nowPerf - entry.createdAtPerf > 3200));
           if (isStalled) {
             if (!this.isHost) {
               this.onSignalOut({
@@ -879,7 +891,7 @@ export class WebRTCLockstepSession {
             }
           }
         }
-      }, 4500);
+      }, 1800);
     }
   }
 
@@ -1051,8 +1063,8 @@ export class WebRTCLockstepSession {
         existing.pc.connectionState === 'failed' ||
         existing.pc.connectionState === 'closed' ||
         existing.pc.iceConnectionState === 'failed';
-      // Never kill an active handshake that is less than 6 seconds old!
-      if (!force && !failed && ageMs < 6000) {
+      // Never kill an active handshake that is less than 3 seconds old!
+      if (!force && !failed && ageMs < 3000) {
         return;
       }
     }
@@ -1181,6 +1193,9 @@ export class WebRTCLockstepSession {
         const firstKey = entry.inputBuffer.keys().next().value;
         if (typeof firstKey === 'number') entry.inputBuffer.delete(firstKey);
       }
+      if (this.onClientInputStateCallback) {
+        this.onClientInputStateCallback(pkt);
+      }
     } else if (pkt.kind === 'client_ball' && this.isHost) {
       if (this.onClientBallCallback) {
         this.onClientBallCallback(pkt);
@@ -1227,14 +1242,26 @@ export class WebRTCLockstepSession {
   }
 
   /**
-   * 1. Client sends pure input packet `{ tick, playerId, keys }` to Host every tick (60 Hz)
+   * 1. Client sends pure input packet `{ tick, playerId, keys }` (+ optional P2P kinematics) to Host every tick (60 Hz)
    */
-  public sendClientInput(tick: number, keys: PlayerInputKeys) {
+  public sendClientInput(
+    tick: number,
+    keys: PlayerInputKeys,
+    state?: {
+      x: number;
+      y: number;
+      vx: number;
+      vy: number;
+      kicking: boolean;
+      keyMask: number;
+    }
+  ) {
     const pkt: DataChannelPacket = {
       kind: 'input',
       tick,
       playerId: this.localUid,
       keys,
+      ...(state || {}),
     };
     this.broadcastToPeers(pkt);
   }

@@ -574,13 +574,12 @@ export function subscribeToActiveRoom(
       return;
     }
 
-    // Build structural signature (status, score, events, teams, nicknames, numbers)
-    // Notice: x, y, vx, vy, ballX, ballY are NOT in this signature so 25Hz physics never triggers React re-renders!
+    // Build structural signature (status, matchStartedAtMs, score, events, teams, nicknames, numbers)
     const playerMetaSig = Object.values(players)
       .map((p) => `${p.playerId}:${p.team}:${p.nickname}:${p.jerseyNumber}`)
       .sort()
       .join('|');
-    const sig = `${room.status}:${room.redScore}:${room.blueScore}:${room.eventState}:${room.eventTeam}:${room.eventUntilMs}:${room.winnerTeam}:${room.memberUids.join(',')}:${room.redUids.join(',')}:${room.blueUids.join(',')}:${playerMetaSig}`;
+    const sig = `${room.status}:${room.matchStartedAtMs}:${room.redScore}:${room.blueScore}:${room.eventState}:${room.eventTeam}:${room.eventUntilMs}:${room.winnerTeam}:${room.memberUids.join(',')}:${room.redUids.join(',')}:${room.blueUids.join(',')}:${playerMetaSig}`;
 
     const now = Date.now();
     // Emit immediately if structural state changed, or every 3000ms (3s) to refresh pingMs in the Tab scoreboard
@@ -597,12 +596,53 @@ export function subscribeToActiveRoom(
     }
   });
 
-  // Poll Express API only at a slow 2.5s interval for room status/roster changes (NEVER overwrite live 60Hz positions!)
+  // Real-time Firestore listener on rooms/{roomId} so room status ('waiting' -> 'playing'),
+  // 3-2-1 countdown (matchStartedAtMs), and team roster changes sync instantly across all clients
+  let unsubRoomFirestore: (() => void) | null = null;
+  if (!isFirestoreQuotaExceeded) {
+    unsubRoomFirestore = onSnapshot(
+      doc(db, 'rooms', roomId),
+      (snap) => {
+        if (cancelled || !snap.exists()) return;
+        const fRoom = snap.data() as MatchRoomDoc;
+        const now = Date.now();
+        const existing = memoryRooms.get(roomId) || realtimeWsBroker.getRoom(roomId);
+        const isPlayingalready = existing && existing.status === 'playing' && fRoom.status === 'playing';
+        const nextRoom: SyncedRoomRecord = {
+          ...(existing || fRoom),
+          status: fRoom.status,
+          hostUid: fRoom.hostUid,
+          hostName: fRoom.hostName,
+          memberUids: fRoom.memberUids || existing?.memberUids || [],
+          redUids: fRoom.redUids || existing?.redUids || [],
+          blueUids: fRoom.blueUids || existing?.blueUids || [],
+          matchStartedAtMs: fRoom.matchStartedAtMs || existing?.matchStartedAtMs || 0,
+          redScore: Math.max(existing?.redScore || 0, fRoom.redScore || 0),
+          blueScore: Math.max(existing?.blueScore || 0, fRoom.blueScore || 0),
+          winnerTeam: fRoom.winnerTeam || existing?.winnerTeam || 'none',
+          ballX: isPlayingalready ? existing.ballX : fRoom.ballX,
+          ballY: isPlayingalready ? existing.ballY : fRoom.ballY,
+          ballVx: isPlayingalready ? existing.ballVx : fRoom.ballVx,
+          ballVy: isPlayingalready ? existing.ballVy : fRoom.ballVy,
+          seq: existing?.seq || realtimeWsBroker.nextMonotonicSeq(),
+          updatedAtMs: now,
+          heartbeatAtMs: now,
+        };
+        memoryRooms.set(roomId, nextRoom);
+        emitIfStructuralOrPeriodic(false);
+      },
+      () => {
+        // ignore snapshot errors
+      }
+    );
+  }
+
+  // Poll Express API for room status/roster changes while waiting (NEVER overwrite live 60Hz positions!)
   const fetchRoomApi = async () => {
     if (cancelled || inFlight || !apiReachable) return;
     const existingLocal = memoryRooms.get(roomId) || realtimeWsBroker.getRoom(roomId);
     if (existingLocal && existingLocal.status === 'playing') {
-      // During active gameplay, WebRTC DataChannel & WebSocket handle 60Hz ticks; avoid HTTP polling lag!
+      // During active gameplay, WebRTC DataChannel & WebSocket handle 60Hz ticks
       return;
     }
     inFlight = true;
@@ -616,12 +656,14 @@ export function subscribeToActiveRoom(
       if (
         !prevRoom ||
         data.room.status !== prevRoom.status ||
+        data.room.matchStartedAtMs !== prevRoom.matchStartedAtMs ||
         data.room.memberUids.length !== prevRoom.memberUids.length ||
         data.room.redUids.length !== prevRoom.redUids.length ||
         data.room.blueUids.length !== prevRoom.blueUids.length
       ) {
         memoryRooms.set(roomId, {
           ...data.room,
+          seq: realtimeWsBroker.nextMonotonicSeq(),
           updatedAtMs: data.room.updatedAtMs || Date.now(),
           heartbeatAtMs: Date.now(),
         });
@@ -631,6 +673,13 @@ export function subscribeToActiveRoom(
       for (const [uid, pDoc] of Object.entries(data.players || {})) {
         if (!memP[uid]) {
           memP[uid] = pDoc;
+        } else {
+          memP[uid] = {
+            ...memP[uid],
+            team: pDoc.team,
+            nickname: pDoc.nickname,
+            jerseyNumber: pDoc.jerseyNumber,
+          };
         }
       }
       memoryPlayers.set(roomId, memP);
@@ -643,7 +692,7 @@ export function subscribeToActiveRoom(
   emitIfStructuralOrPeriodic(true);
 
   fetchRoomApi();
-  const apiPollId = window.setInterval(fetchRoomApi, 2500);
+  const apiPollId = window.setInterval(fetchRoomApi, 1000);
   const uiPingRefreshId = window.setInterval(() => {
     emitIfStructuralOrPeriodic(false);
   }, 3000);
@@ -651,6 +700,7 @@ export function subscribeToActiveRoom(
   return () => {
     cancelled = true;
     unsubWs();
+    if (unsubRoomFirestore) unsubRoomFirestore();
     window.clearInterval(apiPollId);
     window.clearInterval(uiPingRefreshId);
   };
@@ -1073,19 +1123,26 @@ export async function switchPlayerTeam(
   return { switched: true };
 }
 
+export const MATCH_COUNTDOWN_MS = 3000; // 3, 2, 1, СТАРТ! (3 seconds)
+
 export async function startMatchByHost(
   room: MatchRoomDoc,
   playersMap: Record<string, RoomPlayerDoc>
 ): Promise<void> {
-  postApiJson('/api/mp/room/start', { roomId: room.roomId }).catch(() => {});
-
   const now = Date.now();
+  const countdownTargetMs = now + MATCH_COUNTDOWN_MS;
+
+  postApiJson('/api/mp/room/start', {
+    roomId: room.roomId,
+    matchStartedAtMs: countdownTargetMs,
+  }).catch(() => {});
+
   const updatedRoom: SyncedRoomRecord = {
     ...room,
     status: 'playing',
     redScore: 0,
     blueScore: 0,
-    matchStartedAtMs: now,
+    matchStartedAtMs: countdownTargetMs,
     winnerTeam: 'none',
     ballX: FIELD_CENTER_X,
     ballY: FIELD_CENTER_Y,
@@ -1167,7 +1224,9 @@ export async function startMatchByHost(
       const batch = writeBatch(db);
       batch.update(doc(db, 'rooms', room.roomId), {
         status: 'playing',
-        matchStartedAtMs: now,
+        redScore: 0,
+        blueScore: 0,
+        matchStartedAtMs: countdownTargetMs,
         ballX: FIELD_CENTER_X,
         ballY: FIELD_CENTER_Y,
         ballVx: 0,
@@ -1295,6 +1354,52 @@ export function getHostAuthoritativePlayerState(
   return rMap ? rMap[uid] || null : null;
 }
 
+export function applyWebRTCClientInputState(
+  roomId: string,
+  pkt: {
+    playerId: string;
+    x?: number;
+    y?: number;
+    vx?: number;
+    vy?: number;
+    kicking?: boolean;
+    keyMask?: number;
+  }
+): void {
+  if (typeof pkt.x !== 'number' || typeof pkt.y !== 'number') return;
+  const now = Date.now();
+  const nextSeq = realtimeWsBroker.nextMonotonicSeq();
+  const pMap = memoryPlayers.get(roomId) || {};
+  const wsPlayers = realtimeWsBroker.getRoomPlayers(roomId);
+  const existing = pMap[pkt.playerId] || wsPlayers[pkt.playerId];
+  const baseRoom = memoryRooms.get(roomId) || realtimeWsBroker.getRoom(roomId);
+
+  const km = typeof pkt.keyMask === 'number' ? pkt.keyMask : pkt.kicking ? 16 : 0;
+  const isKickingNow = Boolean(pkt.kicking || (km & 16) !== 0);
+  const kickUntilMs = isKickingNow ? now + 160 : existing?.kickUntilMs || 0;
+
+  pMap[pkt.playerId] = {
+    playerId: pkt.playerId,
+    roomId,
+    nickname: existing?.nickname || 'Player',
+    jerseyNumber: existing?.jerseyNumber || 10,
+    team:
+      existing?.team ||
+      (baseRoom?.blueUids.includes(pkt.playerId) ? 'blue' : 'red'),
+    x: pkt.x,
+    y: pkt.y,
+    vx: pkt.vx || 0,
+    vy: pkt.vy || 0,
+    kicking: isKickingNow || now < kickUntilMs,
+    kickUntilMs,
+    keyMask: km,
+    pingMs: existing?.pingMs || 18,
+    seq: nextSeq,
+    updatedAtMs: now,
+  };
+  memoryPlayers.set(roomId, pMap);
+}
+
 export function applyWebRTCAuthoritativeSnapshot(
   roomId: string,
   hostUid: string,
@@ -1304,24 +1409,28 @@ export function applyWebRTCAuthoritativeSnapshot(
   const now = Date.now();
   const nextSeq = realtimeWsBroker.nextMonotonicSeq();
   const baseRoom = memoryRooms.get(roomId) || realtimeWsBroker.getRoom(roomId);
-  const wsRoom = realtimeWsBroker.getRoom(roomId);
   const isEchoOfLocalBall = Boolean(localUid && snap.actorUid === localUid);
-  // Prevent dual-stream jitter when /ws is actively delivering ball ticks (<80ms)
-  const wsBallFresh = Boolean(
-    wsRoom &&
-      now - (wsRoom.updatedAtMs || 0) < 80 &&
-      snap.eventState === 'normal'
-  );
 
-  if (baseRoom && !isEchoOfLocalBall && !wsBallFresh) {
+  if (baseRoom) {
+    const nextStatus =
+      snap.roomStatus === 'playing' && baseRoom.status === 'waiting'
+        ? 'playing'
+        : baseRoom.status;
+    const nextMatchStartedAtMs =
+      snap.matchStartedAtMs && snap.matchStartedAtMs > 0
+        ? snap.matchStartedAtMs
+        : baseRoom.matchStartedAtMs;
+
     memoryRooms.set(roomId, {
       ...baseRoom,
+      status: nextStatus,
+      matchStartedAtMs: nextMatchStartedAtMs,
       redScore: Math.max(baseRoom.redScore, snap.redScore),
       blueScore: Math.max(baseRoom.blueScore, snap.blueScore),
-      ballX: snap.ballX,
-      ballY: snap.ballY,
-      ballVx: snap.ballVx,
-      ballVy: snap.ballVy,
+      ballX: isEchoOfLocalBall ? baseRoom.ballX : snap.ballX,
+      ballY: isEchoOfLocalBall ? baseRoom.ballY : snap.ballY,
+      ballVx: isEchoOfLocalBall ? baseRoom.ballVx : snap.ballVx,
+      ballVy: isEchoOfLocalBall ? baseRoom.ballVy : snap.ballVy,
       eventState: snap.eventState,
       eventTeam: snap.eventTeam,
       eventUntilMs: snap.eventUntilMs,
@@ -1348,26 +1457,34 @@ export function applyWebRTCAuthoritativeSnapshot(
     };
     if (localUid && uid === localUid) continue;
 
-    // Only write into memoryPlayers if /ws hasn't delivered a fresh fast tick for this player in the last 120ms.
-    // This eliminates dual-channel packet fighting (WebRTC vs /ws) that caused 0.5s sawtooth shudder!
     const wsP = wsPlayers[uid];
-    if (wsP && now - (wsP.updatedAtMs || 0) < 120) {
-      continue;
-    }
-
     const existing = pMap[uid] || wsP;
+    const km =
+      typeof pState.keyMask === 'number'
+        ? pState.keyMask
+        : pState.kicking
+          ? 16
+          : existing?.keyMask;
+    const isKickingNow = Boolean(pState.kicking || (km && (km & 16) !== 0));
+    const kickUntilMs = isKickingNow ? now + 160 : existing?.kickUntilMs || 0;
+
     pMap[uid] = {
       playerId: uid,
       roomId,
-      nickname: existing?.nickname || (uid === hostUid ? baseRoom?.hostName || 'Host' : 'Player'),
+      nickname:
+        existing?.nickname ||
+        (uid === hostUid ? baseRoom?.hostName || 'Host' : 'Player'),
       jerseyNumber: existing?.jerseyNumber || 10,
-      team: existing?.team || (baseRoom?.blueUids.includes(uid) ? 'blue' : 'red'),
+      team:
+        existing?.team ||
+        (baseRoom?.blueUids.includes(uid) ? 'blue' : 'red'),
       x: pState.x,
       y: pState.y,
       vx: pState.vx,
       vy: pState.vy,
-      kicking: pState.kicking,
-      keyMask: existing?.keyMask,
+      kicking: isKickingNow || now < kickUntilMs,
+      kickUntilMs,
+      keyMask: km,
       pingMs: existing?.pingMs || 18,
       seq: nextSeq,
       updatedAtMs: now,

@@ -24,7 +24,6 @@ import {
   subscribeToActiveRoom,
   subscribeToLobbyRooms,
 } from './services/roomService';
-import { RoomLobbyView } from './components/RoomLobbyView';
 import { MatchArena } from './components/MatchArena';
 
 const STORAGE_NICKNAME_KEY = 'haxarena_nickname';
@@ -314,13 +313,12 @@ export default function App() {
   const isInActiveMatch = Boolean(
     profileConfirmed &&
       currentProfile &&
-      activeRoom &&
-      activeRoom.status !== 'waiting'
+      activeRoom
   );
 
   return (
     <div className="min-h-screen flex flex-col bg-slate-950 text-slate-100">
-      {/* Top Bar Contract: Hidden during active match so the game window gets maximum screen space */}
+      {/* Top Bar Contract: Hidden during active room/warmup/match so the game window gets maximum screen space */}
       {!isInActiveMatch && (
         <header className="flex flex-wrap items-center justify-between gap-6 px-6 py-3.5 border-b border-slate-800/90 bg-slate-950">
           {/* Zone 1: Brand Title (Single Element) */}
@@ -416,26 +414,17 @@ export default function App() {
       {/* Main Content Area */}
       <main className="flex-1 flex flex-col">
         {activeRoomId && activeRoom && currentProfile ? (
-          /* АКТИВНАЯ КОМНАТА ИЛИ МАТЧ */
-          activeRoom.status === 'waiting' ? (
-            <RoomLobbyView
-              room={activeRoom}
-              players={activePlayers}
-              profile={currentProfile}
-              onLeaveRoom={handleLeaveCurrentRoom}
-            />
-          ) : (
-            <MatchArena
-              room={activeRoom}
-              players={activePlayers}
-              profile={currentProfile}
-              onExitToLobby={handleLeaveCurrentRoom}
-              onCreateRematch={async () => {
-                await handleLeaveCurrentRoom();
-                await handleCreateRoom();
-              }}
-            />
-          )
+          /* АКТИВНАЯ КОМНАТА: РАЗМИНКА (Rocket League Free-Play) -> ОТСЧЁТ 3, 2, 1 -> МАТЧ */
+          <MatchArena
+            room={activeRoom}
+            players={activePlayers}
+            profile={currentProfile}
+            onExitToLobby={handleLeaveCurrentRoom}
+            onCreateRematch={async () => {
+              await handleLeaveCurrentRoom();
+              await handleCreateRoom();
+            }}
+          />
         ) : activeTab === 'rules' ? (
           /* ВКЛАДКА «ПРАВИЛА 4×4» */
           <div className="w-full max-w-5xl mx-auto px-6 py-10 space-y-8">

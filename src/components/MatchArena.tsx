@@ -1,5 +1,16 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { LogOut, RotateCcw, Shield, Trophy, Volume2, VolumeX, Wifi } from 'lucide-react';
+import {
+  ArrowLeftRight,
+  LogOut,
+  Play,
+  RotateCcw,
+  Shield,
+  Sparkles,
+  Trophy,
+  Volume2,
+  VolumeX,
+  Wifi,
+} from 'lucide-react';
 import {
   BALL_DAMPING,
   BALL_MAX_SPEED,
@@ -24,6 +35,7 @@ import {
   KICK_RANGE,
   MATCH_DURATION_MS,
   MATCH_DURATION_SEC,
+  MAX_TEAM_SIZE,
   OUT_PAUSE_MS,
   PLAYER_ACCEL,
   PLAYER_DAMPING,
@@ -41,15 +53,19 @@ import {
 } from '../types/game';
 import {
   applyWebRTCAuthoritativeSnapshot,
+  applyWebRTCClientInputState,
   finishMatchRoom,
   getHostAuthoritativePlayerState,
   getLiveMatchSnapshot,
   getLocalPingMs,
+  MATCH_COUNTDOWN_MS,
   registerGoalInNet,
   resetFormationAfterGoalDelay,
   sendRoomHeartbeat,
   sendWebRTCSignal,
+  startMatchByHost,
   subscribeToWebRTCSignals,
+  switchPlayerTeam,
   syncLocalPlayerDisc,
   syncRoomGameplayState,
 } from '../services/roomService';
@@ -646,6 +662,12 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   const [tabOpen, setTabOpen] = useState<boolean>(false);
   const [extrapolationMs, setExtrapolationMs] = useState<number>(20);
   const extrapolationMsRef = useRef<number>(20);
+  const [countdownLabel, setCountdownLabel] = useState<string | null>(null);
+  const [switchingTeam, setSwitchingTeam] = useState<boolean>(false);
+  const [startingMatch, setStartingMatch] = useState<boolean>(false);
+  const prevRoomStatusRef = useRef<MatchRoomDoc['status']>(room.status);
+  const lastCountdownBeepSecRef = useRef<number>(0);
+  const autoStartTriggeredRef = useRef<boolean>(false);
 
   useEffect(() => {
     soundEnabledRef.current = soundEnabled;
@@ -672,6 +694,9 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             profile.uid
           );
         }
+      },
+      onClientInputState: (pkt) => {
+        applyWebRTCClientInputState(roomRef.current.roomId, pkt);
       },
       onClientBall: (pkt) => {
         const nowMs = Date.now();
@@ -711,6 +736,32 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     webrtcSessionRef.current?.connectToMemberPeers(room.memberUids);
   }, [room.memberUids]);
 
+  // Rocket League style: Auto-start 3-2-1 countdown when both teams have at least 1 player in Warmup!
+  useEffect(() => {
+    const isHost = room.hostUid === profile.uid;
+    const bothTeamsReady = room.redUids.length >= 1 && room.blueUids.length >= 1;
+    if (room.status !== 'waiting') {
+      autoStartTriggeredRef.current = false;
+      return;
+    }
+    if (isHost && bothTeamsReady && !autoStartTriggeredRef.current) {
+      const timerId = window.setTimeout(() => {
+        if (
+          roomRef.current.status === 'waiting' &&
+          roomRef.current.redUids.length >= 1 &&
+          roomRef.current.blueUids.length >= 1 &&
+          !autoStartTriggeredRef.current
+        ) {
+          autoStartTriggeredRef.current = true;
+          startMatchByHost(roomRef.current, playersRef.current).catch(() => {
+            autoStartTriggeredRef.current = false;
+          });
+        }
+      }, 1200);
+      return () => window.clearTimeout(timerId);
+    }
+  }, [room.status, room.hostUid, room.redUids.length, room.blueUids.length, profile.uid]);
+
   // Keep room alive & refresh ping strictly every 3000ms (3 seconds) to avoid network traffic
   useEffect(() => {
     sendRoomHeartbeat(room.roomId, profile.uid).catch(() => {});
@@ -732,19 +783,50 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     playersRef.current = players;
   }, [players]);
 
-  // Match 5-Minute Forward Timer & Auto-Finish Check
+  // Match 5-Minute Forward Timer, Rocket League 3-2-1 Countdown & Auto-Finish Check
   useEffect(() => {
     const updateTimer = () => {
       const currentRoom = roomRef.current;
       if (currentRoom.status === 'finished') {
         setElapsedSeconds(MATCH_DURATION_SEC);
+        setCountdownLabel(null);
         return;
       }
-      if (!currentRoom.matchStartedAtMs) {
+      if (currentRoom.status === 'waiting' || !currentRoom.matchStartedAtMs) {
         setElapsedSeconds(0);
+        setCountdownLabel(null);
         return;
       }
-      const elapsedMs = Math.max(0, Date.now() - currentRoom.matchStartedAtMs);
+
+      const nowMs = Date.now();
+      const remainingToStartMs = currentRoom.matchStartedAtMs - nowMs;
+
+      if (remainingToStartMs > 0) {
+        setElapsedSeconds(0);
+        const secLeft = Math.min(3, Math.max(1, Math.ceil(remainingToStartMs / 1000)));
+        setCountdownLabel(String(secLeft));
+        if (lastCountdownBeepSecRef.current !== secLeft) {
+          lastCountdownBeepSecRef.current = secLeft;
+          if (soundEnabledRef.current) {
+            soundFX.playKick();
+          }
+        }
+        return;
+      }
+
+      if (remainingToStartMs > -900) {
+        setCountdownLabel('СТАРТ!');
+        if (lastCountdownBeepSecRef.current !== 0) {
+          lastCountdownBeepSecRef.current = 0;
+          if (soundEnabledRef.current) {
+            soundFX.playOutWhistle();
+          }
+        }
+      } else {
+        setCountdownLabel(null);
+      }
+
+      const elapsedMs = Math.max(0, nowMs - currentRoom.matchStartedAtMs);
       const sec = Math.min(MATCH_DURATION_SEC, Math.floor(elapsedMs / 1000));
       setElapsedSeconds(sec);
 
@@ -758,9 +840,9 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     };
 
     updateTimer();
-    const interval = window.setInterval(updateTimer, 200);
+    const interval = window.setInterval(updateTimer, 100);
     return () => window.clearInterval(interval);
-  }, []);
+  }, [profile.uid]);
 
   // Keyboard Listeners (WASD + Arrow Keys + Space/X Kick + Tab Scoreboard)
   useEffect(() => {
@@ -830,6 +912,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       lastPerfTime = perfNow;
       // Normalize physics to 60Hz so 120Hz/144Hz monitors don't double player/ball speed
       const dtScale = rawDtMs / (1000 / 60);
+      const extrapFrames = Math.min(8, (extrapolationMsRef.current / 1000) * 60);
 
       const now = Date.now();
       const p = physRef.current;
@@ -871,8 +954,14 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         if (p.eventState === 'goal' && now < p.eventUntilMs - 100) {
           roomRef.current = {
             ...netRoom,
-            redScore: Math.max(roomRef.current.redScore, netRoom.redScore),
-            blueScore: Math.max(roomRef.current.blueScore, netRoom.blueScore),
+            redScore:
+              netRoom.status === 'waiting'
+                ? 0
+                : Math.max(roomRef.current.redScore, netRoom.redScore),
+            blueScore:
+              netRoom.status === 'waiting'
+                ? 0
+                : Math.max(roomRef.current.blueScore, netRoom.blueScore),
             eventState: 'goal',
             eventTeam: p.eventTeam,
             eventUntilMs: p.eventUntilMs,
@@ -880,8 +969,14 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         } else {
           roomRef.current = {
             ...netRoom,
-            redScore: Math.max(roomRef.current.redScore, netRoom.redScore),
-            blueScore: Math.max(roomRef.current.blueScore, netRoom.blueScore),
+            redScore:
+              netRoom.status === 'waiting'
+                ? 0
+                : Math.max(roomRef.current.redScore, netRoom.redScore),
+            blueScore:
+              netRoom.status === 'waiting'
+                ? 0
+                : Math.max(roomRef.current.blueScore, netRoom.blueScore),
           };
 
           // Handle new goal, out, or corner event from network (clock-skew immune!)
@@ -936,9 +1031,16 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
 
       const currentRoom = roomRef.current;
       const allPlayers = playersRef.current;
+      const isWarmup = currentRoom.status === 'waiting';
+      const isCountdownLocked =
+        currentRoom.status === 'playing' &&
+        currentRoom.matchStartedAtMs > 0 &&
+        now < currentRoom.matchStartedAtMs;
       const isMatchFinished =
         currentRoom.status === 'finished' ||
-        (currentRoom.matchStartedAtMs > 0 &&
+        (currentRoom.status === 'playing' &&
+          currentRoom.matchStartedAtMs > 0 &&
+          now >= currentRoom.matchStartedAtMs &&
           now - currentRoom.matchStartedAtMs >= MATCH_DURATION_MS);
 
       const localTeam: TeamColor = currentRoom.blueUids.includes(profile.uid)
@@ -950,6 +1052,65 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           ? currentRoom.redUids.indexOf(profile.uid)
           : currentRoom.blueUids.indexOf(profile.uid)
       );
+
+      // Rocket League Transition: When transitioning from 'waiting' (Warmup) to 'playing' (or during 3-2-1 Countdown),
+      // snap all discs to kickoff formation and center the ball!
+      if (
+        (prevRoomStatusRef.current === 'waiting' && currentRoom.status === 'playing') ||
+        isCountdownLocked
+      ) {
+        if (prevRoomStatusRef.current === 'waiting' && currentRoom.status === 'playing') {
+          prevRoomStatusRef.current = 'playing';
+          roomRef.current.redScore = 0;
+          roomRef.current.blueScore = 0;
+        }
+        p.eventState = 'normal';
+        p.eventTeam = 'none';
+        p.eventUntilMs = 0;
+        p.awaitingSetPieceTouch = false;
+        p.isCornerSetPiece = false;
+        p.ballX = FIELD_CENTER_X;
+        p.ballY = FIELD_CENTER_Y;
+        p.ballVx = 0;
+        p.ballVy = 0;
+        p.ballOffsetX = 0;
+        p.ballOffsetY = 0;
+
+        const spawn = getTeamSpawnPosition(localTeam, localSlotIdx);
+        p.myX = spawn.x;
+        p.myY = spawn.y;
+        p.myVx = 0;
+        p.myVy = 0;
+        p.myOffsetX = 0;
+        p.myOffsetY = 0;
+
+        currentRoom.redUids.forEach((uid, idx) => {
+          if (uid === profile.uid) return;
+          const rSp = getTeamSpawnPosition('red', idx);
+          if (p.remoteRenderPos[uid]) {
+            p.remoteRenderPos[uid].x = rSp.x;
+            p.remoteRenderPos[uid].y = rSp.y;
+            p.remoteRenderPos[uid].offsetX = 0;
+            p.remoteRenderPos[uid].offsetY = 0;
+            p.remoteRenderPos[uid].vx = 0;
+            p.remoteRenderPos[uid].vy = 0;
+          }
+        });
+        currentRoom.blueUids.forEach((uid, idx) => {
+          if (uid === profile.uid) return;
+          const bSp = getTeamSpawnPosition('blue', idx);
+          if (p.remoteRenderPos[uid]) {
+            p.remoteRenderPos[uid].x = bSp.x;
+            p.remoteRenderPos[uid].y = bSp.y;
+            p.remoteRenderPos[uid].offsetX = 0;
+            p.remoteRenderPos[uid].offsetY = 0;
+            p.remoteRenderPos[uid].vx = 0;
+            p.remoteRenderPos[uid].vy = 0;
+          }
+        });
+      } else {
+        prevRoomStatusRef.current = currentRoom.status;
+      }
 
       // Handle expiration of Out/Corner short placement pause OR 3-second Post-Goal formation reset
       if (p.eventState !== 'normal' && now >= p.eventUntilMs) {
@@ -968,61 +1129,61 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           p.awaitingSetPieceTouch = false;
           p.isCornerSetPiece = false;
 
-          const spawn = getTeamSpawnPosition(localTeam, localSlotIdx);
-          p.myX = spawn.x;
-          p.myY = spawn.y;
-          p.myOffsetX = 0;
-          p.myOffsetY = 0;
-          p.myVx = 0;
-          p.myVy = 0;
+          if (!isWarmup) {
+            const spawn = getTeamSpawnPosition(localTeam, localSlotIdx);
+            p.myX = spawn.x;
+            p.myY = spawn.y;
+            p.myOffsetX = 0;
+            p.myOffsetY = 0;
+            p.myVx = 0;
+            p.myVy = 0;
 
-          currentRoom.redUids.forEach((uid, idx) => {
-            if (uid === profile.uid) return;
-            const rSp = getTeamSpawnPosition('red', idx);
-            if (p.remoteRenderPos[uid]) {
-              p.remoteRenderPos[uid].x = rSp.x;
-              p.remoteRenderPos[uid].y = rSp.y;
-              p.remoteRenderPos[uid].offsetX = 0;
-              p.remoteRenderPos[uid].offsetY = 0;
-              p.remoteRenderPos[uid].vx = 0;
-              p.remoteRenderPos[uid].vy = 0;
-            }
-          });
-          currentRoom.blueUids.forEach((uid, idx) => {
-            if (uid === profile.uid) return;
-            const bSp = getTeamSpawnPosition('blue', idx);
-            if (p.remoteRenderPos[uid]) {
-              p.remoteRenderPos[uid].x = bSp.x;
-              p.remoteRenderPos[uid].y = bSp.y;
-              p.remoteRenderPos[uid].offsetX = 0;
-              p.remoteRenderPos[uid].offsetY = 0;
-              p.remoteRenderPos[uid].vx = 0;
-              p.remoteRenderPos[uid].vy = 0;
-            }
-          });
+            currentRoom.redUids.forEach((uid, idx) => {
+              if (uid === profile.uid) return;
+              const rSp = getTeamSpawnPosition('red', idx);
+              if (p.remoteRenderPos[uid]) {
+                p.remoteRenderPos[uid].x = rSp.x;
+                p.remoteRenderPos[uid].y = rSp.y;
+                p.remoteRenderPos[uid].offsetX = 0;
+                p.remoteRenderPos[uid].offsetY = 0;
+                p.remoteRenderPos[uid].vx = 0;
+                p.remoteRenderPos[uid].vy = 0;
+              }
+            });
+            currentRoom.blueUids.forEach((uid, idx) => {
+              if (uid === profile.uid) return;
+              const bSp = getTeamSpawnPosition('blue', idx);
+              if (p.remoteRenderPos[uid]) {
+                p.remoteRenderPos[uid].x = bSp.x;
+                p.remoteRenderPos[uid].y = bSp.y;
+                p.remoteRenderPos[uid].offsetX = 0;
+                p.remoteRenderPos[uid].offsetY = 0;
+                p.remoteRenderPos[uid].vx = 0;
+                p.remoteRenderPos[uid].vy = 0;
+              }
+            });
 
-          resetFormationAfterGoalDelay(currentRoom, allPlayers, profile.uid).catch(
-            () => {}
-          );
+            resetFormationAfterGoalDelay(currentRoom, allPlayers, profile.uid).catch(
+              () => {}
+            );
+          }
         }
       }
 
       const isPausedForOutOrCorner =
-        (p.eventState === 'out' || p.eventState === 'corner') &&
-        now < p.eventUntilMs;
+        isCountdownLocked ||
+        ((p.eventState === 'out' || p.eventState === 'corner') &&
+          now < p.eventUntilMs);
 
       if (p.awaitingSetPieceTouch && now > p.setPieceExpireMs) {
         p.awaitingSetPieceTouch = false;
         p.isCornerSetPiece = false;
       }
 
-      // 1. Update Local Player Disc Movement + Pure Input WebRTC Transmission (60 Hz integer tick)
+      // 1. Update Local Player Disc Movement
       tickCounterRef.current += 1;
       const currentTick = tickCounterRef.current;
       const rtcSession = webrtcSessionRef.current;
-      if (rtcSession && !isMatchFinished && !rtcSession.isHost) {
-        rtcSession.sendClientInput(currentTick, { ...keysRef.current });
-      }
 
       let localMovedOrChanged = false;
       if (!isMatchFinished && !isPausedForOutOrCorner) {
@@ -1203,10 +1364,28 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           const prevVisX = state.x + state.offsetX;
           const prevVisY = state.y + state.offsetY;
           state.lastSeq = pktSeq;
-          state.x = rp.x;
-          state.y = rp.y;
-          state.vx = rp.vx || 0;
-          state.vy = rp.vy || 0;
+          const rVx = rp.vx || 0;
+          const rVy = rp.vy || 0;
+          state.vx = rVx;
+          state.vy = rVy;
+          state.x = round4(
+            Math.max(
+              PLAYER_RADIUS + 12,
+              Math.min(
+                CANVAS_WIDTH - PLAYER_RADIUS - 12,
+                rp.x + rVx * extrapFrames * 0.25
+              )
+            )
+          );
+          state.y = round4(
+            Math.max(
+              PLAYER_RADIUS + 12,
+              Math.min(
+                CANVAS_HEIGHT - PLAYER_RADIUS - 12,
+                rp.y + rVy * extrapFrames * 0.25
+              )
+            )
+          );
 
           const errX = prevVisX - state.x;
           const errY = prevVisY - state.y;
@@ -1259,11 +1438,11 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             rState.x = round4(rState.x - nx * overlap * 0.5);
             rState.y = round4(rState.y - ny * overlap * 0.5);
 
-            // Smoothly absorb sub-frame collision nudge into visual offsets so discs never jitter on contact
-            p.myOffsetX = round4((prevMyVisX - p.myX) * 0.45);
-            p.myOffsetY = round4((prevMyVisY - p.myY) * 0.45);
-            rState.offsetX = round4((prevRemVisX - rState.x) * 0.45);
-            rState.offsetY = round4((prevRemVisY - rState.y) * 0.45);
+            // Absorb 100% (1.0) of collision separation into visual offsets so discs NEVER shudder on contact!
+            p.myOffsetX = round4(prevMyVisX - p.myX);
+            p.myOffsetY = round4(prevMyVisY - p.myY);
+            rState.offsetX = round4(prevRemVisX - rState.x);
+            rState.offsetY = round4(prevRemVisY - rState.y);
 
             // Elastic 2D momentum transfer + contact repulsion so stationary discs always get pushed smoothly
             const relVx = p.myVx - rState.vx;
@@ -1292,25 +1471,39 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           }
         });
 
-        // Smoothly reconcile Client coordinates with Host only if a major collision divergence (> 24px) occurred,
-        // absorbing 100% of the shift into myOffsetX/myOffsetY so there is zero visible shudder!
-        if (
-          currentRoom.hostUid !== profile.uid &&
-          now - lastPlayerCollisionMsRef.current < 240
-        ) {
+        // Continuous Zero-Desync Coordinate Convergence with Host Authoritative State:
+        // Projects Host's snapshot forward by one-way latency and smoothly converges any collision or drift discrepancy,
+        // absorbing 100% of the shift into myOffsetX/myOffsetY so there is ZERO visible shudder!
+        if (currentRoom.hostUid !== profile.uid) {
           const hostAuthMe = getHostAuthoritativePlayerState(
             currentRoom.roomId,
             profile.uid
           );
-          if (hostAuthMe && now - hostAuthMe.ts < 140) {
-            const diffX = hostAuthMe.x - p.myX;
-            const diffY = hostAuthMe.y - p.myY;
+          if (hostAuthMe && now - hostAuthMe.ts < 180) {
+            const leadFrames = Math.min(2.5, getLocalPingMs() / 33.3);
+            const targetX = hostAuthMe.x + p.myVx * leadFrames;
+            const targetY = hostAuthMe.y + p.myVy * leadFrames;
+            const diffX = targetX - p.myX;
+            const diffY = targetY - p.myY;
             const diffDist = Math.hypot(diffX, diffY);
-            if (diffDist > 24 && diffDist < 120) {
+            const inCollisionWindow = now - lastPlayerCollisionMsRef.current < 480;
+            const isIdle =
+              !keysRef.current.up &&
+              !keysRef.current.down &&
+              !keysRef.current.left &&
+              !keysRef.current.right &&
+              Math.hypot(p.myVx, p.myVy) < 0.08;
+
+            if (
+              (inCollisionWindow && diffDist > 1.8) ||
+              (isIdle && diffDist > 1.5) ||
+              diffDist > 8.5
+            ) {
               const prevVisX = p.myX + p.myOffsetX;
               const prevVisY = p.myY + p.myOffsetY;
-              p.myX = round4(p.myX + diffX * 0.25);
-              p.myY = round4(p.myY + diffY * 0.25);
+              const blend = diffDist > 60 ? 0.55 : inCollisionWindow ? 0.28 : 0.18;
+              p.myX = round4(p.myX + diffX * blend);
+              p.myY = round4(p.myY + diffY * blend);
               p.myOffsetX = round4(prevVisX - p.myX);
               p.myOffsetY = round4(prevVisY - p.myY);
               lastLocalActiveMoveMsRef.current = now;
@@ -1370,6 +1563,26 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             p.myY = round4(p.ballY + Math.sin(bAngle) * minThrowInDist);
           }
         }
+      }
+
+      // Send 60Hz Pure Input + Authoritative Local Coordinates over WebRTC DataChannel (`gameChannel`)
+      const kNow = keysRef.current;
+      const currentKeyMask =
+        (kNow.up ? 1 : 0) |
+        (kNow.down ? 2 : 0) |
+        (kNow.left ? 4 : 0) |
+        (kNow.right ? 8 : 0) |
+        (kNow.kick ? 16 : 0);
+
+      if (rtcSession && !isMatchFinished && !rtcSession.isHost) {
+        rtcSession.sendClientInput(currentTick, { ...kNow }, {
+          x: p.myX,
+          y: p.myY,
+          vx: p.myVx,
+          vy: p.myVy,
+          kicking: Boolean(p.myKicking || (p.myKickUntilMs && now < p.myKickUntilMs)),
+          keyMask: currentKeyMask,
+        });
       }
 
       // 2. Step Ball Movement FIRST, then resolve Local Disc-to-Ball Contact & Kick, then Reconcile Network Ball State!
@@ -1499,8 +1712,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             const inGoalY = p.ballY > GOAL_TOP && p.ballY < GOAL_BOTTOM;
             if (inGoalY && p.ballX + BALL_RADIUS * 0.6 < FIELD_LEFT) {
               // Blue scores in Red's left goal!
-              const newBlueScore = roomRef.current.blueScore + 1;
-              const pauseUntil = now + GOAL_PAUSE_MS;
+              const newBlueScore = isWarmup ? 0 : roomRef.current.blueScore + 1;
+              const pauseUntil = now + (isWarmup ? 1500 : GOAL_PAUSE_MS);
               p.eventState = 'goal';
               p.eventTeam = 'blue';
               p.eventUntilMs = pauseUntil;
@@ -1522,18 +1735,20 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               if (soundEnabledRef.current) {
                 soundFX.playGoalFanfare();
               }
-              registerGoalInNet(
-                roomRef.current,
-                'blue',
-                roomRef.current.redScore,
-                newBlueScore,
-                pauseUntil,
-                { x: p.ballX, y: p.ballY, vx: p.ballVx, vy: p.ballVy }
-              ).catch(() => {});
+              if (!isWarmup) {
+                registerGoalInNet(
+                  roomRef.current,
+                  'blue',
+                  roomRef.current.redScore,
+                  newBlueScore,
+                  pauseUntil,
+                  { x: p.ballX, y: p.ballY, vx: p.ballVx, vy: p.ballVy }
+                ).catch(() => {});
+              }
             } else if (inGoalY && p.ballX - BALL_RADIUS * 0.6 > FIELD_RIGHT) {
               // Red scores in Blue's right goal!
-              const newRedScore = roomRef.current.redScore + 1;
-              const pauseUntil = now + GOAL_PAUSE_MS;
+              const newRedScore = isWarmup ? 0 : roomRef.current.redScore + 1;
+              const pauseUntil = now + (isWarmup ? 1500 : GOAL_PAUSE_MS);
               p.eventState = 'goal';
               p.eventTeam = 'red';
               p.eventUntilMs = pauseUntil;
@@ -1555,14 +1770,16 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               if (soundEnabledRef.current) {
                 soundFX.playGoalFanfare();
               }
-              registerGoalInNet(
-                roomRef.current,
-                'red',
-                newRedScore,
-                roomRef.current.blueScore,
-                pauseUntil,
-                { x: p.ballX, y: p.ballY, vx: p.ballVx, vy: p.ballVy }
-              ).catch(() => {});
+              if (!isWarmup) {
+                registerGoalInNet(
+                  roomRef.current,
+                  'red',
+                  newRedScore,
+                  roomRef.current.blueScore,
+                  pauseUntil,
+                  { x: p.ballX, y: p.ballY, vx: p.ballVx, vy: p.ballVy }
+                ).catch(() => {});
+              }
             }
           }
 
@@ -1732,10 +1949,10 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               const prevVisX = p.ballX + p.ballOffsetX;
               const prevVisY = p.ballY + p.ballOffsetY;
 
-              p.ballX = round4(netRoom.ballX);
-              p.ballY = round4(netRoom.ballY);
               p.ballVx = netRoom.ballVx;
               p.ballVy = netRoom.ballVy;
+              p.ballX = round4(netRoom.ballX + netRoom.ballVx * extrapFrames * 0.2);
+              p.ballY = round4(netRoom.ballY + netRoom.ballVy * extrapFrames * 0.2);
               p.lastTouchTeam = netRoom.lastTouchTeam;
 
               const errX = prevVisX - p.ballX;
@@ -1764,10 +1981,10 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           if (now - rtcPkt.ts < 80) {
             const prevVisX = p.ballX + p.ballOffsetX;
             const prevVisY = p.ballY + p.ballOffsetY;
-            p.ballX = round4(rtcPkt.ballX);
-            p.ballY = round4(rtcPkt.ballY);
             p.ballVx = rtcPkt.ballVx;
             p.ballVy = rtcPkt.ballVy;
+            p.ballX = round4(rtcPkt.ballX + rtcPkt.ballVx * extrapFrames * 0.2);
+            p.ballY = round4(rtcPkt.ballY + rtcPkt.ballVy * extrapFrames * 0.2);
             p.lastTouchTeam = rtcPkt.lastTouchTeam;
             const errX = prevVisX - p.ballX;
             const errY = prevVisY - p.ballY;
@@ -1966,7 +2183,14 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         if (rtcSession && rtcSession.isHost) {
           const snapPlayers: Record<
             string,
-            { x: number; y: number; vx: number; vy: number; kicking: boolean }
+            {
+              x: number;
+              y: number;
+              vx: number;
+              vy: number;
+              kicking: boolean;
+              keyMask?: number;
+            }
           > = {
             [profile.uid]: {
               x: p.myX,
@@ -1976,6 +2200,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               kicking: Boolean(
                 p.myKicking || (p.myKickUntilMs && now < p.myKickUntilMs)
               ),
+              keyMask: currentKeyMask,
             },
           };
           Object.values(allPlayers).forEach((rp) => {
@@ -1989,6 +2214,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               kicking: Boolean(
                 rp.kicking || (rState?.kickUntilMs && now < rState.kickUntilMs)
               ),
+              keyMask: (rp as { keyMask?: number }).keyMask,
             };
           });
 
@@ -2010,6 +2236,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               ballVy: p.ballVy,
               redScore: roomRef.current.redScore,
               blueScore: roomRef.current.blueScore,
+              roomStatus: roomRef.current.status,
+              matchStartedAtMs: roomRef.current.matchStartedAtMs,
               eventState: p.eventState,
               eventTeam: p.eventTeam,
               eventUntilMs: p.eventUntilMs,
@@ -2023,13 +2251,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           }
         }
 
-        const k = keysRef.current;
-        const keyMask =
-          (k.up ? 1 : 0) |
-          (k.down ? 2 : 0) |
-          (k.left ? 4 : 0) |
-          (k.right ? 8 : 0) |
-          (k.kick ? 16 : 0);
+        const keyMask = currentKeyMask;
 
         const lastSent = lastSentPosRef.current;
         const posDelta = Math.hypot(p.myX - lastSent.x, p.myY - lastSent.y);
@@ -2145,6 +2367,46 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
 
   const isFinished =
     room.status === 'finished' || elapsedSeconds >= MATCH_DURATION_SEC;
+  const isWaitingWarmup = room.status === 'waiting';
+  const isHostPlayer = room.hostUid === profile.uid;
+  const targetSwitchTeam: TeamColor = myTeam === 'red' ? 'blue' : 'red';
+  const canSwitchTeam =
+    isWaitingWarmup &&
+    (targetSwitchTeam === 'red'
+      ? room.redUids.length < MAX_TEAM_SIZE
+      : room.blueUids.length < MAX_TEAM_SIZE);
+
+  const handleWarmupSwitchTeam = async () => {
+    if (!canSwitchTeam || switchingTeam) return;
+    setSwitchingTeam(true);
+    try {
+      await switchPlayerTeam(roomRef.current, profile);
+      const nextSlot =
+        targetSwitchTeam === 'red'
+          ? roomRef.current.redUids.length
+          : roomRef.current.blueUids.length;
+      const sp = getTeamSpawnPosition(targetSwitchTeam, Math.max(0, nextSlot));
+      physRef.current.myX = sp.x;
+      physRef.current.myY = sp.y;
+      physRef.current.myVx = 0;
+      physRef.current.myVy = 0;
+      physRef.current.myOffsetX = 0;
+      physRef.current.myOffsetY = 0;
+    } finally {
+      setSwitchingTeam(false);
+    }
+  };
+
+  const handleManualStartMatch = async () => {
+    if (!isHostPlayer || startingMatch || room.status !== 'waiting') return;
+    setStartingMatch(true);
+    autoStartTriggeredRef.current = true;
+    try {
+      await startMatchByHost(roomRef.current, playersRef.current);
+    } finally {
+      setStartingMatch(false);
+    }
+  };
 
   const getWinnerBannerText = (): {
     headline: string;
@@ -2247,30 +2509,32 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               Красные
             </span>
             <span className="font-mono-tabular font-bold text-xl sm:text-2xl text-white pl-1">
-              {room.redScore}
+              {isWaitingWarmup ? 0 : room.redScore}
             </span>
           </div>
 
-          {/* Center Match Timer (00:00 -> 05:00) */}
+          {/* Center Match Timer (00:00 -> 05:00 or РАЗМИНКА) */}
           <div className="flex flex-col items-center justify-center px-5 py-1 bg-slate-950">
             <span className="text-[10px] font-medium tracking-widest text-slate-400 uppercase">
-              Время · 5 мин
+              {isWaitingWarmup ? 'Разминка' : 'Время · 5 мин'}
             </span>
             <span
               className={`font-mono-tabular font-bold text-lg sm:text-xl tracking-wider ${
-                elapsedSeconds >= 270 && !isFinished
+                isWaitingWarmup
                   ? 'text-amber-400'
-                  : 'text-emerald-400'
+                  : elapsedSeconds >= 270 && !isFinished
+                    ? 'text-amber-400'
+                    : 'text-emerald-400'
               }`}
             >
-              {formatTimerMMSS(elapsedSeconds)}
+              {isWaitingWarmup ? 'СВОБ. ИГРА' : formatTimerMMSS(elapsedSeconds)}
             </span>
           </div>
 
           {/* Blue Team Score Block */}
           <div className="flex items-center gap-3 px-4 py-1.5 bg-gradient-to-l from-blue-950/90 to-slate-900 border-l border-slate-800">
             <span className="font-mono-tabular font-bold text-xl sm:text-2xl text-white pr-1">
-              {room.blueScore}
+              {isWaitingWarmup ? 0 : room.blueScore}
             </span>
             <span className="font-display font-bold text-sm sm:text-base tracking-wide text-blue-400 whitespace-nowrap">
               Синие
@@ -2324,6 +2588,71 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           className="w-full h-full block"
         />
 
+        {/* Rocket League Free-Play Warmup Banner ("РАЗМИНКА · ОЖИДАНИЕ ИГРОКОВ") */}
+        {isWaitingWarmup && !isFinished && (
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 flex flex-wrap items-center justify-center gap-3 px-4 py-2 rounded-xl bg-slate-950/90 border border-amber-500/40 shadow-2xl backdrop-blur-sm">
+            <div className="flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-amber-400 shrink-0" />
+              <div className="text-xs">
+                <span className="font-display font-bold text-amber-300 uppercase tracking-wider">
+                  Разминка · Свободная игра
+                </span>
+                <span className="text-slate-300 ml-2">
+                  {room.redUids.length >= 1 && room.blueUids.length >= 1
+                    ? 'Обе команды готовы! Запуск отсчёта 3, 2, 1...'
+                    : `Ожидание соперника (${room.redUids.length} Красн. vs ${room.blueUids.length} Син.) — пока можно свободно пинать мяч`}
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={!canSwitchTeam || switchingTeam}
+                onClick={handleWarmupSwitchTeam}
+                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-50 border border-slate-700 text-[11px] font-medium text-slate-200 transition-colors cursor-pointer"
+              >
+                <ArrowLeftRight className="w-3.5 h-3.5" />
+                <span>
+                  В {targetSwitchTeam === 'red' ? 'Красные' : 'Синие'}
+                </span>
+              </button>
+
+              {isHostPlayer && (
+                <button
+                  type="button"
+                  disabled={startingMatch}
+                  onClick={handleManualStartMatch}
+                  className="flex items-center gap-1.5 px-3 py-1 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-semibold text-[11px] transition-colors cursor-pointer"
+                >
+                  <Play className="w-3.5 h-3.5 fill-current" />
+                  <span>Начать матч (3-2-1)</span>
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Rocket League 3, 2, 1, СТАРТ! Center-Screen Countdown Overlay */}
+        {countdownLabel && !isFinished && (
+          <div className="absolute inset-0 z-15 pointer-events-none flex flex-col items-center justify-center bg-slate-950/35">
+            <div className="px-8 py-5 rounded-3xl bg-slate-950/85 border-2 border-emerald-400/60 shadow-2xl text-center">
+              <div className="text-xs font-semibold uppercase tracking-widest text-emerald-300 mb-1">
+                Приготовьтесь к матчу
+              </div>
+              <div
+                className={`font-display font-black tracking-tight ${
+                  countdownLabel === 'СТАРТ!'
+                    ? 'text-5xl sm:text-6xl text-emerald-400'
+                    : 'text-6xl sm:text-7xl text-amber-400 font-mono-tabular'
+                }`}
+              >
+                {countdownLabel}
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* TAB Scoreboard Overlay: Teams, Nicknames, Ping (updated every 3s), and Extrapolation */}
         {tabOpen && !isFinished && (
           <div className="absolute inset-0 z-20 flex items-center justify-center bg-slate-950/75 backdrop-blur-sm p-4">
@@ -2363,7 +2692,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
                       </span>
                     </div>
                     <span className="font-mono-tabular font-bold text-base text-white">
-                      Счёт: {room.redScore}
+                      Счёт: {isWaitingWarmup ? 0 : room.redScore}
                     </span>
                   </div>
 
@@ -2426,7 +2755,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
                       </span>
                     </div>
                     <span className="font-mono-tabular font-bold text-base text-white">
-                      Счёт: {room.blueScore}
+                      Счёт: {isWaitingWarmup ? 0 : room.blueScore}
                     </span>
                   </div>
 
