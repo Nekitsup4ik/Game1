@@ -7,7 +7,6 @@ import {
   Trophy,
   Trash2,
   UserCheck,
-  Wifi,
 } from 'lucide-react';
 import {
   MatchRoomDoc,
@@ -18,7 +17,6 @@ import {
   clearAllStaleRooms,
   createMatchRoom,
   deleteOrLeaveMatchRoom,
-  getLocalPingMs,
   joinMatchRoom,
   subscribeToActiveRoom,
   subscribeToLobbyRooms,
@@ -832,11 +830,6 @@ export default function App() {
                 </div>
                 <div>
                   <div className="flex items-center gap-2 text-xs text-slate-400 flex-wrap">
-                    <span className="inline-flex items-center gap-1 text-emerald-400 font-mono-tabular font-semibold">
-                      <Wifi className="w-3.5 h-3.5" />
-                      {getLocalPingMs()} мс
-                    </span>
-                    <span aria-hidden="true">·</span>
                     <span>Номер #{currentProfile.jerseyNumber}</span>
                     <span aria-hidden="true">·</span>
                     <button
@@ -907,9 +900,6 @@ export default function App() {
                         <span>Очистить комнаты</span>
                       </button>
                     )}
-                    <span className="hidden sm:inline text-xs text-slate-400">
-                      Автоочистка пустых через 15 сек
-                    </span>
                   </div>
                 </div>
 

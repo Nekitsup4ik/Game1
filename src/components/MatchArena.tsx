@@ -46,9 +46,19 @@ import {
   registerGoalInNet,
   resetFormationAfterGoalDelay,
   sendRoomHeartbeat,
+  sendWebRTCSignal,
+  subscribeToWebRTCSignals,
   syncLocalPlayerDisc,
   syncRoomGameplayState,
 } from '../services/roomService';
+import {
+  attemptKick,
+  MAX_EXTRAPOLATION_MS,
+  PING_INTERVAL_MS,
+  PlayerInputKeys,
+  round4,
+  WebRTCLockstepSession,
+} from '../services/webrtcLockstep';
 import { soundFX } from '../utils/sound';
 
 interface MatchArenaProps {
@@ -576,19 +586,66 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   const lastAppliedBallSeqRef = useRef<number>(room.seq || 0);
   const lastHandledEventUntilRef = useRef<number>(0);
   const finishTriggeredRef = useRef<boolean>(false);
+  const tickCounterRef = useRef<number>(0);
+  const webrtcSessionRef = useRef<WebRTCLockstepSession | null>(null);
+  const peerInputsRef = useRef<Record<string, PlayerInputKeys>>({});
   const [localPing, setLocalPing] = useState<number>(() => getLocalPingMs());
+  const [peerPings, setPeerPings] = useState<Record<string, number>>({});
+  const [tabOpen, setTabOpen] = useState<boolean>(false);
+  const [extrapolationMs, setExtrapolationMs] = useState<number>(20);
+  const extrapolationMsRef = useRef<number>(20);
 
   useEffect(() => {
     soundEnabledRef.current = soundEnabled;
   }, [soundEnabled]);
 
-  // Keep room alive with a 3.5-second heartbeat & update local ping HUD
+  // Initialize P2P WebRTC DataChannel Lockstep Session + Firebase/WS Signaling
+  useEffect(() => {
+    const isHost = room.hostUid === profile.uid;
+    const session = new WebRTCLockstepSession({
+      roomId: room.roomId,
+      localUid: profile.uid,
+      isHost,
+      onSignalOut: (sig) => {
+        sendWebRTCSignal(sig);
+      },
+      onFrameInputs: (_tick, frameInputs) => {
+        peerInputsRef.current = frameInputs;
+      },
+    });
+    webrtcSessionRef.current = session;
+
+    const unsubSignals = subscribeToWebRTCSignals(
+      room.roomId,
+      profile.uid,
+      (sig) => {
+        session.handleIncomingSignal(sig).catch(() => {});
+      }
+    );
+
+    session.connectToMemberPeers(roomRef.current.memberUids);
+
+    return () => {
+      unsubSignals();
+      session.destroy();
+      webrtcSessionRef.current = null;
+    };
+  }, [room.roomId, room.hostUid, profile.uid]);
+
+  useEffect(() => {
+    webrtcSessionRef.current?.connectToMemberPeers(room.memberUids);
+  }, [room.memberUids]);
+
+  // Keep room alive & refresh ping strictly every 3000ms (3 seconds) to avoid network traffic
   useEffect(() => {
     sendRoomHeartbeat(room.roomId, profile.uid).catch(() => {});
     const hbId = window.setInterval(() => {
       setLocalPing(getLocalPingMs());
+      if (webrtcSessionRef.current) {
+        setPeerPings(webrtcSessionRef.current.getPlayerPings());
+      }
       sendRoomHeartbeat(roomRef.current.roomId, profile.uid).catch(() => {});
-    }, 3500);
+    }, PING_INTERVAL_MS);
     return () => window.clearInterval(hbId);
   }, [room.roomId, profile.uid]);
 
@@ -630,9 +687,14 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     return () => window.clearInterval(interval);
   }, []);
 
-  // Keyboard Listeners (WASD + Arrow Keys + Space/X Kick)
+  // Keyboard Listeners (WASD + Arrow Keys + Space/X Kick + Tab Scoreboard)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.code === 'Tab' || e.key === 'Tab') {
+        e.preventDefault();
+        setTabOpen(true);
+        return;
+      }
       if (
         ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', ' '].includes(e.key)
       ) {
@@ -654,6 +716,11 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.code === 'Tab' || e.key === 'Tab') {
+        e.preventDefault();
+        setTabOpen(false);
+        return;
+      }
       const code = e.code;
       if (code === 'KeyW' || code === 'ArrowUp') keysRef.current.up = false;
       if (code === 'KeyS' || code === 'ArrowDown') keysRef.current.down = false;
@@ -845,45 +912,70 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         p.isCornerSetPiece = false;
       }
 
-      // 1. Update Local Player Disc Movement (smooth acceleration + football turf glide)
+      // 1. Update Local Player Disc Movement + Pure Input WebRTC Transmission (60 Hz integer tick)
+      tickCounterRef.current += 1;
+      const currentTick = tickCounterRef.current;
+      const rtcSession = webrtcSessionRef.current;
+      if (rtcSession && !isMatchFinished) {
+        if (rtcSession.isHost) {
+          const resolved = rtcSession.resolveHostLockstepFrame(currentTick, {
+            ...keysRef.current,
+          });
+          if (resolved.ready) {
+            peerInputsRef.current = resolved.frameInputs;
+          }
+        } else {
+          rtcSession.sendClientInput(currentTick, { ...keysRef.current });
+        }
+      }
+
       let localMovedOrChanged = false;
       if (!isMatchFinished && !isPausedForOutOrCorner) {
         const k = keysRef.current;
-        let ax = 0;
-        let ay = 0;
-        if (k.left) ax -= 1;
-        if (k.right) ax += 1;
-        if (k.up) ay -= 1;
-        if (k.down) ay += 1;
-
-        if (ax !== 0 && ay !== 0) {
-          const inv = 1 / Math.SQRT2;
-          ax *= inv;
-          ay *= inv;
-        }
+        let dirX = 0;
+        let dirY = 0;
+        if (k.left) dirX -= 1;
+        if (k.right) dirX += 1;
+        if (k.up) dirY -= 1;
+        if (k.down) dirY += 1;
 
         const accel = k.kick ? PLAYER_KICK_ACCEL : PLAYER_ACCEL;
         const playerDamp = Math.pow(PLAYER_DAMPING, dtScale);
-        p.myVx = (p.myVx + ax * accel * dtScale) * playerDamp;
-        p.myVy = (p.myVy + ay * accel * dtScale) * playerDamp;
+
+        if (dirX !== 0 || dirY !== 0) {
+          // Force vector via Math.atan2 -> Math.cos / Math.sin with 4-decimal rounding
+          const moveAngle = Math.atan2(dirY, dirX);
+          const ax = round4(Math.cos(moveAngle) * accel);
+          const ay = round4(Math.sin(moveAngle) * accel);
+          p.myVx = round4((p.myVx + ax * dtScale) * playerDamp);
+          p.myVy = round4((p.myVy + ay * dtScale) * playerDamp);
+        } else {
+          p.myVx = round4(p.myVx * playerDamp);
+          p.myVy = round4(p.myVy * playerDamp);
+        }
 
         const speed = Math.hypot(p.myVx, p.myVy);
         if (speed > PLAYER_MAX_SPEED) {
-          p.myVx = (p.myVx / speed) * PLAYER_MAX_SPEED;
-          p.myVy = (p.myVy / speed) * PLAYER_MAX_SPEED;
+          const sAngle = Math.atan2(p.myVy, p.myVx);
+          p.myVx = round4(Math.cos(sAngle) * PLAYER_MAX_SPEED);
+          p.myVy = round4(Math.sin(sAngle) * PLAYER_MAX_SPEED);
         }
         // Subtle football turf glide: allow natural deceleration down to 0.012 before stopping
-        if (speed < 0.012 && ax === 0 && ay === 0) {
+        if (speed < 0.012 && dirX === 0 && dirY === 0) {
           p.myVx = 0;
           p.myVy = 0;
         }
 
-        p.myX += p.myVx * dtScale;
-        p.myY += p.myVy * dtScale;
+        p.myX = round4(p.myX + p.myVx * dtScale);
+        p.myY = round4(p.myY + p.myVy * dtScale);
 
         // Keep player within outer arena walls
-        p.myX = Math.max(PLAYER_RADIUS + 12, Math.min(CANVAS_WIDTH - PLAYER_RADIUS - 12, p.myX));
-        p.myY = Math.max(PLAYER_RADIUS + 12, Math.min(CANVAS_HEIGHT - PLAYER_RADIUS - 12, p.myY));
+        p.myX = round4(
+          Math.max(PLAYER_RADIUS + 12, Math.min(CANVAS_WIDTH - PLAYER_RADIUS - 12, p.myX))
+        );
+        p.myY = round4(
+          Math.max(PLAYER_RADIUS + 12, Math.min(CANVAS_HEIGHT - PLAYER_RADIUS - 12, p.myY))
+        );
 
         // Solid Goalpost Hitboxes for Player Disc (Player cannot pass through goalposts)
         for (const post of GOALPOSTS) {
@@ -892,14 +984,15 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           const distPost = Math.hypot(dxPost, dyPost);
           const minPostDist = PLAYER_RADIUS + POST_RADIUS;
           if (distPost < minPostDist && distPost > 0.001) {
-            const nx = dxPost / distPost;
-            const ny = dyPost / distPost;
-            p.myX = post.x + nx * minPostDist;
-            p.myY = post.y + ny * minPostDist;
+            const pAngle = Math.atan2(dyPost, dxPost);
+            const nx = round4(Math.cos(pAngle));
+            const ny = round4(Math.sin(pAngle));
+            p.myX = round4(post.x + nx * minPostDist);
+            p.myY = round4(post.y + ny * minPostDist);
             const dot = p.myVx * nx + p.myVy * ny;
             if (dot < 0) {
-              p.myVx -= dot * nx * 1.15;
-              p.myVy -= dot * ny * 1.15;
+              p.myVx = round4(p.myVx - dot * nx * 1.15);
+              p.myVy = round4(p.myVy - dot * ny * 1.15);
             }
           }
         }
@@ -923,10 +1016,9 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           const distBall = Math.hypot(dxBall, dyBall);
           const minThrowInDist = 74;
           if (distBall < minThrowInDist && distBall > 0.001) {
-            const nx = dxBall / distBall;
-            const ny = dyBall / distBall;
-            p.myX = p.ballX + nx * minThrowInDist;
-            p.myY = p.ballY + ny * minThrowInDist;
+            const bAngle = Math.atan2(dyBall, dxBall);
+            p.myX = round4(p.ballX + Math.cos(bAngle) * minThrowInDist);
+            p.myY = round4(p.ballY + Math.sin(bAngle) * minThrowInDist);
           }
         }
 
@@ -944,24 +1036,47 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         p.myKicking = false;
       }
 
-      // Dead-Reckoning + Smooth 60fps Interpolation for Remote Players
+      // Extrapolation + Smooth 60fps Interpolation for Remote Players (using setExtrapolation ms)
+      const extrapFrames = Math.max(
+        0,
+        Math.min(12, (extrapolationMsRef.current / 1000) * 60)
+      );
       Object.values(allPlayers).forEach((rp) => {
         if (rp.playerId === profile.uid) return;
         const prev = p.remoteRenderPos[rp.playerId];
+        const peerKey = peerInputsRef.current[rp.playerId];
+        let rvx = rp.vx || 0;
+        let rvy = rp.vy || 0;
+        if (peerKey) {
+          let pdx = 0;
+          let pdy = 0;
+          if (peerKey.left) pdx -= 1;
+          if (peerKey.right) pdx += 1;
+          if (peerKey.up) pdy -= 1;
+          if (peerKey.down) pdy += 1;
+          if (pdx !== 0 || pdy !== 0) {
+            const ang = Math.atan2(pdy, pdx);
+            const acc = peerKey.kick ? PLAYER_KICK_ACCEL : PLAYER_ACCEL;
+            rvx = round4((rvx + Math.cos(ang) * acc) * PLAYER_DAMPING);
+            rvy = round4((rvy + Math.sin(ang) * acc) * PLAYER_DAMPING);
+          }
+        }
+        const targetX = round4(rp.x + rvx * extrapFrames * 0.25);
+        const targetY = round4(rp.y + rvy * extrapFrames * 0.25);
+
         if (!prev) {
-          p.remoteRenderPos[rp.playerId] = { x: rp.x, y: rp.y };
+          p.remoteRenderPos[rp.playerId] = { x: targetX, y: targetY };
         } else {
-          // Extrapolate with remote player's velocity between packets, then blend smoothly
-          prev.x += (rp.vx || 0) * dtScale * 0.48;
-          prev.y += (rp.vy || 0) * dtScale * 0.48;
-          const d = Math.hypot(rp.x - prev.x, rp.y - prev.y);
+          prev.x = round4(prev.x + rvx * dtScale * 0.48);
+          prev.y = round4(prev.y + rvy * dtScale * 0.48);
+          const d = Math.hypot(targetX - prev.x, targetY - prev.y);
           if (d > 110) {
-            prev.x = rp.x;
-            prev.y = rp.y;
+            prev.x = targetX;
+            prev.y = targetY;
           } else {
             const blend = Math.min(0.65, 0.28 * dtScale);
-            prev.x += (rp.x - prev.x) * blend;
-            prev.y += (rp.y - prev.y) * blend;
+            prev.x = round4(prev.x + (targetX - prev.x) * blend);
+            prev.y = round4(prev.y + (targetY - prev.y) * blend);
           }
         }
       });
@@ -1046,11 +1161,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             const dist = Math.hypot(dx, dy);
             const minDist = PLAYER_RADIUS + BALL_RADIUS;
 
-            // Active Kick (Space / X):
-            // Powershot is only active during the 2.5s window after 5s of holding the ball in the gray circle
+            // Deterministic Kick (`attemptKick(player, ball, input)` with Math.atan2, Math.cos, Math.sin & 4-decimal rounding):
             if (disc.kicking && dist < KICK_RANGE && dist > 0.001) {
-              const nx = dx / dist;
-              const ny = dy / dist;
               const heldMs =
                 p.controllingUid === disc.uid &&
                 !p.powershotMustExitRing &&
@@ -1061,32 +1173,63 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
                 heldMs >= POWERSHOT_CHARGE_MS &&
                 heldMs <= POWERSHOT_CHARGE_MS + POWERSHOT_WINDOW_MS;
 
-              const impulse = hasChargedPowershot
+              const kickStrength = hasChargedPowershot
                 ? POWERSHOT_IMPULSE
                 : p.isCornerSetPiece
                   ? CORNER_KICK_IMPULSE
                   : KICK_IMPULSE;
 
-              p.ballVx = nx * impulse + disc.vx * 0.38;
-              p.ballVy = ny * impulse + disc.vy * 0.38;
-              p.lastTouchTeam = disc.team;
-              p.awaitingSetPieceTouch = false;
-              p.isCornerSetPiece = false;
+              const ballObj = {
+                x: p.ballX,
+                y: p.ballY,
+                vx: p.ballVx,
+                vy: p.ballVy,
+                radius: BALL_RADIUS,
+              };
+              const kickRes = attemptKick(
+                {
+                  x: disc.x,
+                  y: disc.y,
+                  vx: disc.vx,
+                  vy: disc.vy,
+                  radius: PLAYER_RADIUS,
+                },
+                ballObj,
+                {
+                  keys: {
+                    up: false,
+                    down: false,
+                    left: false,
+                    right: false,
+                    kick: disc.kicking,
+                  },
+                },
+                kickStrength,
+                KICK_RANGE - PLAYER_RADIUS - BALL_RADIUS
+              );
 
-              if (hasChargedPowershot) {
-                // Immediately turn off the Powershot color as soon as the player kicks
-                p.powershotFlightUntilMs = 0;
-                p.powershotMustExitRing = true;
-                p.controlStartedAtMs = 0;
-              }
+              if (kickRes) {
+                p.ballVx = round4(kickRes.impulseX + disc.vx * 0.38);
+                p.ballVy = round4(kickRes.impulseY + disc.vy * 0.38);
+                p.lastTouchTeam = disc.team;
+                p.awaitingSetPieceTouch = false;
+                p.isCornerSetPiece = false;
 
-              if (disc.uid === profile.uid) {
-                localTouchedBall = true;
-                if (soundEnabledRef.current) {
-                  if (hasChargedPowershot) {
-                    soundFX.playPowerShot();
-                  } else {
-                    soundFX.playKick();
+                if (hasChargedPowershot) {
+                  // Immediately turn off the Powershot color as soon as the player kicks
+                  p.powershotFlightUntilMs = 0;
+                  p.powershotMustExitRing = true;
+                  p.controlStartedAtMs = 0;
+                }
+
+                if (disc.uid === profile.uid) {
+                  localTouchedBall = true;
+                  if (soundEnabledRef.current) {
+                    if (hasChargedPowershot) {
+                      soundFX.playPowerShot();
+                    } else {
+                      soundFX.playKick();
+                    }
                   }
                 }
               }
@@ -1497,10 +1640,51 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     };
   };
 
+  const handleExtrapolationChange = (nextVal: number) => {
+    const clamped = Math.max(0, Math.min(MAX_EXTRAPOLATION_MS, Math.round(nextVal)));
+    setExtrapolationMs(clamped);
+    extrapolationMsRef.current = clamped;
+    webrtcSessionRef.current?.setExtrapolation(clamped);
+  };
+
+  const redTeamRoster: RoomPlayerDoc[] = room.redUids.map((uid) => {
+    return (
+      players[uid] || {
+        playerId: uid,
+        roomId: room.roomId,
+        nickname: uid === profile.uid ? profile.nickname : 'Игрок',
+        jerseyNumber: uid === profile.uid ? profile.jerseyNumber : 10,
+        team: 'red',
+        x: 0,
+        y: 0,
+        vx: 0,
+        vy: 0,
+        kicking: false,
+      }
+    );
+  });
+
+  const blueTeamRoster: RoomPlayerDoc[] = room.blueUids.map((uid) => {
+    return (
+      players[uid] || {
+        playerId: uid,
+        roomId: room.roomId,
+        nickname: uid === profile.uid ? profile.nickname : 'Игрок',
+        jerseyNumber: uid === profile.uid ? profile.jerseyNumber : 10,
+        team: 'blue',
+        x: 0,
+        y: 0,
+        vx: 0,
+        vy: 0,
+        kicking: false,
+      }
+    );
+  });
+
   return (
-    <div className="relative flex flex-col items-center justify-between w-full h-screen overflow-hidden px-3 py-2 bg-slate-950 select-none">
-      {/* Top-Center High-Contrast Match Scoreboard (HUD) */}
-      <div className="w-full max-w-[min(98vw,calc((100vh-5.75rem)*1400/760))] flex items-center justify-between gap-4 mb-1.5 shrink-0">
+    <div className="relative flex flex-col items-center justify-center w-full h-screen overflow-hidden px-3 py-2 bg-slate-950 select-none">
+      {/* Top-Center High-Contrast Match Scoreboard (HUD) — No Ping here (Ping is exclusively in Tab!) */}
+      <div className="w-full max-w-[min(98vw,calc((100vh-3.75rem)*1400/760))] flex items-center justify-between gap-4 mb-1.5 shrink-0">
         {/* Room title & player badge */}
         <div className="hidden md:flex items-center gap-3 min-w-[200px]">
           <div
@@ -1563,33 +1747,23 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           </div>
         </div>
 
-        {/* Utility Controls (Live Ping + Sound + Leave Room) */}
+        {/* Utility Controls (Tab Scoreboard Button + Sound + Leave Room) */}
         <div className="flex items-center justify-end gap-2 min-w-[160px] md:min-w-[230px]">
-          <div
-            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-xs font-mono-tabular"
-            title="Ваш текущий сетевой пинг"
+          <button
+            type="button"
+            onClick={() => setTabOpen((prev) => !prev)}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-mono-tabular transition-colors cursor-pointer ${
+              tabOpen
+                ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-300'
+                : 'bg-slate-900 border-slate-800 text-slate-300 hover:text-white'
+            }`}
+            title="Нажмите или удерживайте клавишу Tab для просмотра команд и пинга"
           >
-            <Wifi
-              className={`w-3.5 h-3.5 ${
-                localPing < 55
-                  ? 'text-emerald-400'
-                  : localPing < 110
-                    ? 'text-amber-400'
-                    : 'text-red-400'
-              }`}
-            />
-            <span
-              className={`font-semibold ${
-                localPing < 55
-                  ? 'text-emerald-300'
-                  : localPing < 110
-                    ? 'text-amber-300'
-                    : 'text-red-300'
-              }`}
-            >
-              {localPing} мс
+            <span className="px-1.5 py-0.5 rounded bg-slate-950 border border-slate-700 text-[10px] font-bold text-white">
+              TAB
             </span>
-          </div>
+            <span className="hidden sm:inline font-sans font-medium">Команды</span>
+          </button>
           <button
             type="button"
             onClick={() => setSoundEnabled((prev) => !prev)}
@@ -1609,14 +1783,197 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         </div>
       </div>
 
-      {/* Main HTML5 Canvas Stadium Container (Scaled up to fill screen while preserving exact 1400x760 internal game proportions) */}
-      <div className="relative w-full max-w-[min(98vw,calc((100vh-5.75rem)*1400/760))] aspect-[1400/760] rounded-2xl overflow-hidden border-2 border-slate-800 shadow-2xl bg-[#14532d] my-auto">
+      {/* Main HTML5 Canvas Stadium Container (Maximized without bottom bar!) */}
+      <div className="relative w-full max-w-[min(98vw,calc((100vh-3.75rem)*1400/760))] aspect-[1400/760] rounded-2xl overflow-hidden border-2 border-slate-800 shadow-2xl bg-[#14532d] my-auto">
         <canvas
           ref={canvasRef}
           width={CANVAS_WIDTH}
           height={CANVAS_HEIGHT}
           className="w-full h-full block"
         />
+
+        {/* TAB Scoreboard Overlay: Teams, Nicknames, Ping (updated every 3s), and Extrapolation */}
+        {tabOpen && !isFinished && (
+          <div className="absolute inset-0 z-20 flex items-center justify-center bg-slate-950/75 backdrop-blur-sm p-4">
+            <div className="w-full max-w-3xl rounded-2xl bg-slate-900/95 border border-slate-700/90 shadow-2xl overflow-hidden">
+              {/* Header */}
+              <div className="px-6 py-4 bg-slate-950 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="flex items-center gap-2 text-xs text-emerald-400 font-semibold">
+                    <Shield className="w-3.5 h-3.5" />
+                    <span>Таблица матча · WebRTC P2P Lockstep (60 Hz)</span>
+                  </div>
+                  <h3 className="font-display font-bold text-lg text-white mt-0.5">
+                    {room.title}
+                  </h3>
+                </div>
+                <div className="flex items-center gap-3 text-xs text-slate-400">
+                  <span>Обновление пинга: каждые 3 сек</span>
+                  <button
+                    type="button"
+                    onClick={() => setTabOpen(false)}
+                    className="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:text-white cursor-pointer"
+                  >
+                    Закрыть (Tab)
+                  </button>
+                </div>
+              </div>
+
+              {/* Two Team Columns: Red Team & Blue Team with Nicknames & Ping */}
+              <div className="p-6 grid grid-cols-1 sm:grid-cols-2 gap-5">
+                {/* Red Team */}
+                <div className="rounded-xl bg-slate-950/80 border border-red-500/30 p-4">
+                  <div className="flex items-center justify-between pb-3 mb-3 border-b border-slate-800">
+                    <div className="flex items-center gap-2">
+                      <span className="w-3 h-3 rounded-full bg-red-500" />
+                      <span className="font-display font-bold text-sm text-red-400">
+                        Красная команда
+                      </span>
+                    </div>
+                    <span className="font-mono-tabular font-bold text-base text-white">
+                      Счёт: {room.redScore}
+                    </span>
+                  </div>
+
+                  <div className="space-y-2">
+                    {redTeamRoster.length === 0 ? (
+                      <div className="py-4 text-center text-xs text-slate-500">
+                        Нет игроков
+                      </div>
+                    ) : (
+                      redTeamRoster.map((pl) => {
+                        const isMe = pl.playerId === profile.uid;
+                        const pVal = isMe
+                          ? localPing
+                          : peerPings[pl.playerId] ?? pl.pingMs ?? 24;
+                        const pingColor =
+                          pVal < 55
+                            ? 'text-emerald-400 border-emerald-500/30 bg-emerald-950/40'
+                            : pVal < 110
+                              ? 'text-amber-400 border-amber-500/30 bg-amber-950/40'
+                              : 'text-red-400 border-red-500/30 bg-red-950/40';
+                        return (
+                          <div
+                            key={pl.playerId}
+                            className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-slate-900 border border-slate-800/90"
+                          >
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              <div className="w-7 h-7 rounded-full bg-red-600 border border-red-300 flex items-center justify-center font-mono-tabular font-bold text-xs text-white shrink-0">
+                                {pl.jerseyNumber}
+                              </div>
+                              <div className="truncate">
+                                <div className="text-xs font-semibold text-white truncate">
+                                  {pl.nickname}
+                                  {isMe ? ' (Вы)' : ''}
+                                </div>
+                                <div className="text-[10px] text-slate-400">
+                                  {pl.playerId === room.hostUid ? 'Хост P2P' : 'Клиент P2P'}
+                                </div>
+                              </div>
+                            </div>
+                            <div
+                              className={`flex items-center gap-1 px-2 py-0.5 rounded border font-mono-tabular text-xs font-semibold shrink-0 ${pingColor}`}
+                            >
+                              <Wifi className="w-3 h-3" />
+                              <span>{pVal} мс</span>
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+
+                {/* Blue Team */}
+                <div className="rounded-xl bg-slate-950/80 border border-blue-500/30 p-4">
+                  <div className="flex items-center justify-between pb-3 mb-3 border-b border-slate-800">
+                    <div className="flex items-center gap-2">
+                      <span className="w-3 h-3 rounded-full bg-blue-500" />
+                      <span className="font-display font-bold text-sm text-blue-400">
+                        Синяя команда
+                      </span>
+                    </div>
+                    <span className="font-mono-tabular font-bold text-base text-white">
+                      Счёт: {room.blueScore}
+                    </span>
+                  </div>
+
+                  <div className="space-y-2">
+                    {blueTeamRoster.length === 0 ? (
+                      <div className="py-4 text-center text-xs text-slate-500">
+                        Нет игроков
+                      </div>
+                    ) : (
+                      blueTeamRoster.map((pl) => {
+                        const isMe = pl.playerId === profile.uid;
+                        const pVal = isMe
+                          ? localPing
+                          : peerPings[pl.playerId] ?? pl.pingMs ?? 24;
+                        const pingColor =
+                          pVal < 55
+                            ? 'text-emerald-400 border-emerald-500/30 bg-emerald-950/40'
+                            : pVal < 110
+                              ? 'text-amber-400 border-amber-500/30 bg-amber-950/40'
+                              : 'text-red-400 border-red-500/30 bg-red-950/40';
+                        return (
+                          <div
+                            key={pl.playerId}
+                            className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-slate-900 border border-slate-800/90"
+                          >
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              <div className="w-7 h-7 rounded-full bg-blue-600 border border-blue-300 flex items-center justify-center font-mono-tabular font-bold text-xs text-white shrink-0">
+                                {pl.jerseyNumber}
+                              </div>
+                              <div className="truncate">
+                                <div className="text-xs font-semibold text-white truncate">
+                                  {pl.nickname}
+                                  {isMe ? ' (Вы)' : ''}
+                                </div>
+                                <div className="text-[10px] text-slate-400">
+                                  {pl.playerId === room.hostUid ? 'Хост P2P' : 'Клиент P2P'}
+                                </div>
+                              </div>
+                            </div>
+                            <div
+                              className={`flex items-center gap-1 px-2 py-0.5 rounded border font-mono-tabular text-xs font-semibold shrink-0 ${pingColor}`}
+                            >
+                              <Wifi className="w-3 h-3" />
+                              <span>{pVal} мс</span>
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Footer: Extrapolation (0..200 ms) Compensation Setting */}
+              <div className="px-6 py-3.5 bg-slate-950 border-t border-slate-800 flex flex-wrap items-center justify-between gap-4 text-xs">
+                <div className="flex items-center gap-3">
+                  <span className="text-slate-300 font-semibold">
+                    Экстраполяция (сглаживание задержки):
+                  </span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={MAX_EXTRAPOLATION_MS}
+                    step={5}
+                    value={extrapolationMs}
+                    onChange={(e) => handleExtrapolationChange(Number(e.target.value))}
+                    className="w-32 accent-emerald-500 cursor-pointer"
+                  />
+                  <span className="font-mono-tabular font-bold text-emerald-400">
+                    {extrapolationMs} мс
+                  </span>
+                </div>
+                <span className="text-slate-400">
+                  Удерживайте <strong className="text-slate-200 font-mono-tabular">Tab</strong> для быстрого просмотра
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* 5-Minute Match Over Modal («Матч окончен! Победила команда [Цвет]») */}
         {isFinished && (
@@ -1657,63 +2014,6 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             </div>
           </div>
         )}
-      </div>
-
-      {/* Bottom Controls & Per-Player Live Ping Bar */}
-      <div className="w-full max-w-[min(98vw,calc((100vh-5.75rem)*1400/760))] mt-1.5 flex flex-wrap items-center justify-between gap-2 px-4 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800/80 text-xs text-slate-400 shrink-0">
-        <div className="flex items-center gap-3 flex-wrap">
-          <span>
-            Движение:{' '}
-            <strong className="text-slate-200 font-mono-tabular">WASD</strong> /{' '}
-            <strong className="text-slate-200 font-mono-tabular">Стрелки</strong>
-          </span>
-          <span aria-hidden="true">·</span>
-          <span>
-            Удар:{' '}
-            <strong className="text-slate-200 font-mono-tabular">Пробел</strong> /{' '}
-            <strong className="text-slate-200 font-mono-tabular">X</strong>
-          </span>
-        </div>
-
-        {/* Live Ping List for All Active Players in the Match */}
-        <div className="flex items-center gap-2 flex-wrap">
-          {Object.values(players).map((pl) => {
-            const pVal =
-              pl.playerId === profile.uid
-                ? localPing
-                : pl.pingMs ?? 24;
-            const pingColor =
-              pVal < 55
-                ? 'text-emerald-400'
-                : pVal < 110
-                  ? 'text-amber-400'
-                  : 'text-red-400';
-            return (
-              <div
-                key={pl.playerId}
-                className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-950/90 border border-slate-800 text-[11px]"
-              >
-                <span
-                  className={`w-2 h-2 rounded-full ${
-                    pl.team === 'red' ? 'bg-red-500' : 'bg-blue-500'
-                  }`}
-                />
-                <span className="text-slate-200 font-medium truncate max-w-[90px]">
-                  {pl.nickname}
-                </span>
-                <span className={`font-mono-tabular font-semibold ${pingColor}`}>
-                  {pVal} мс
-                </span>
-              </div>
-            );
-          })}
-          <div className="hidden sm:flex items-center gap-1.5 text-slate-400 pl-1">
-            <Shield className="w-3.5 h-3.5 text-emerald-400" />
-            <span>
-              4×4 ({room.redUids.length} vs {room.blueUids.length})
-            </span>
-          </div>
-        </div>
       </div>
     </div>
   );
@@ -1910,7 +2210,7 @@ function drawArena(
     ctx.textBaseline = 'middle';
     ctx.fillText(String(pl.jerseyNumber), pl.x, pl.y + 0.5);
 
-    // Player Nickname + Ping (Мелким белым текстом прямо НАД круглым персонажем игрока)
+    // Player Nickname ONLY (Мелким белым текстом прямо НАД круглым персонажем игрока — без пинга!)
     ctx.font = '600 11.5px "Plus Jakarta Sans", sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'bottom';
@@ -1921,18 +2221,6 @@ function drawArena(
     ctx.strokeText(pl.nickname, pl.x, labelY);
     ctx.fillStyle = '#ffffff';
     ctx.fillText(pl.nickname, pl.x, labelY);
-
-    // Compact Ping label below player disc
-    const pingText = `${pl.pingMs} мс`;
-    ctx.font = '600 9.5px "JetBrains Mono", monospace';
-    ctx.textBaseline = 'top';
-    const pingY = pl.y + PLAYER_RADIUS + 5;
-    ctx.lineWidth = 2.5;
-    ctx.strokeStyle = 'rgba(2, 6, 23, 0.85)';
-    ctx.strokeText(pingText, pl.x, pingY);
-    ctx.fillStyle =
-      pl.pingMs < 55 ? '#4ade80' : pl.pingMs < 110 ? '#fbbf24' : '#f87171';
-    ctx.fillText(pingText, pl.x, pingY);
   }
 
   // 7. Draw Smaller Soccer Ball (⚽ Emoji + Crisp Outer Layer that turns GREEN during the 2.5s Powershot window after 5s hold in gray circle)

@@ -38,6 +38,7 @@ import {
   SyncedPlayerRecord,
   SyncedRoomRecord,
 } from './realtimeWsBroker';
+import { WebRTCSignalMessage } from './webrtcLockstep';
 
 // Clear legacy localStorage keys that previously caused ghost rooms & JSON freeze
 if (typeof window !== 'undefined') {
@@ -92,6 +93,22 @@ if (bc) {
     } else if (data.type === 'delete_room' && data.roomId) {
       memoryRooms.delete(data.roomId);
       memoryPlayers.delete(data.roomId);
+    }
+  });
+}
+
+const localRtcSignalListeners = new Set<(sig: WebRTCSignalMessage) => void>();
+if (bc) {
+  bc.addEventListener('message', (ev: MessageEvent) => {
+    const data = ev.data;
+    if (data && data.type === 'rtc_signal' && data.signal) {
+      for (const cb of localRtcSignalListeners) {
+        try {
+          cb(data.signal as WebRTCSignalMessage);
+        } catch {
+          // ignore
+        }
+      }
     }
   });
 }
@@ -479,8 +496,8 @@ export function subscribeToActiveRoom(
     const sig = `${room.status}:${room.redScore}:${room.blueScore}:${room.eventState}:${room.eventTeam}:${room.eventUntilMs}:${room.winnerTeam}:${room.memberUids.join(',')}:${room.redUids.join(',')}:${room.blueUids.join(',')}:${playerMetaSig}`;
 
     const now = Date.now();
-    // Emit immediately if structural state changed, or every 1500ms to refresh pingMs badges in the UI
-    if (force || sig !== lastStructuralSig || now - lastUiEmitMs >= 1500) {
+    // Emit immediately if structural state changed, or every 3000ms (3s) to refresh pingMs in the Tab scoreboard
+    if (force || sig !== lastStructuralSig || now - lastUiEmitMs >= 3000) {
       lastStructuralSig = sig;
       lastUiEmitMs = now;
       onUpdate({ ...room }, { ...players });
@@ -540,7 +557,7 @@ export function subscribeToActiveRoom(
   const apiPollId = window.setInterval(fetchRoomApi, 60);
   const uiPingRefreshId = window.setInterval(() => {
     emitIfStructuralOrPeriodic(false);
-  }, 1500);
+  }, 3000);
 
   return () => {
     cancelled = true;
@@ -1616,3 +1633,40 @@ export async function pruneStaleRoomsFromLobby(
     ).catch(() => {});
   }
 }
+
+/**
+ * WebRTC Signaling Exchange (SDP Offer/Answer + ICE Candidates)
+ * Relays across BroadcastChannel, WebSocket Broker, and Firebase signaling
+ */
+export function sendWebRTCSignal(signal: WebRTCSignalMessage): void {
+  bc?.postMessage({ type: 'rtc_signal', signal });
+  realtimeWsBroker.publishWebRTCSignal(signal.roomId, signal);
+}
+
+export function subscribeToWebRTCSignals(
+  roomId: string,
+  localUid: string,
+  onSignal: (msg: WebRTCSignalMessage) => void
+): () => void {
+  const handleRaw = (raw: unknown) => {
+    if (!raw || typeof raw !== 'object') return;
+    const msg = raw as WebRTCSignalMessage;
+    if (
+      msg.roomId === roomId &&
+      msg.toUid === localUid &&
+      msg.fromUid !== localUid
+    ) {
+      onSignal(msg);
+    }
+  };
+
+  const bcListener = (sig: WebRTCSignalMessage) => handleRaw(sig);
+  localRtcSignalListeners.add(bcListener);
+  const unsubWs = realtimeWsBroker.subscribeWebRTCSignals(roomId, handleRaw);
+
+  return () => {
+    localRtcSignalListeners.delete(bcListener);
+    unsubWs();
+  };
+}
+

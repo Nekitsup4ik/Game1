@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowLeftRight, Copy, Check, LogOut, Play, Shield, Users, Wifi } from 'lucide-react';
+import { ArrowLeftRight, Copy, Check, LogOut, Play, Shield, Users } from 'lucide-react';
 import {
   MatchRoomDoc,
   MAX_TEAM_SIZE,
@@ -7,7 +7,6 @@ import {
   RoomPlayerDoc,
 } from '../types/game';
 import {
-  getLocalPingMs,
   sendRoomHeartbeat,
   startMatchByHost,
   switchPlayerTeam,
@@ -29,12 +28,10 @@ export const RoomLobbyView: React.FC<RoomLobbyViewProps> = ({
   const [busyAction, setBusyAction] = useState<'switch' | 'start' | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<boolean>(false);
-  const [localPing, setLocalPing] = useState<number>(() => getLocalPingMs());
 
   useEffect(() => {
     sendRoomHeartbeat(room.roomId, profile.uid).catch(() => {});
     const id = window.setInterval(() => {
-      setLocalPing(getLocalPingMs());
       sendRoomHeartbeat(room.roomId, profile.uid).catch(() => {});
     }, 3000);
     return () => window.clearInterval(id);
@@ -199,13 +196,6 @@ export const RoomLobbyView: React.FC<RoomLobbyViewProps> = ({
               }
 
               const isMe = p.playerId === profile.uid;
-              const pPing = isMe ? localPing : p.pingMs ?? 24;
-              const pingClass =
-                pPing < 55
-                  ? 'text-emerald-400 border-emerald-500/30 bg-emerald-950/40'
-                  : pPing < 110
-                    ? 'text-amber-400 border-amber-500/30 bg-amber-950/40'
-                    : 'text-red-400 border-red-500/30 bg-red-950/40';
               return (
                 <div
                   key={p.playerId}
@@ -230,13 +220,6 @@ export const RoomLobbyView: React.FC<RoomLobbyViewProps> = ({
                         {isMe ? ' · Вы' : ''}
                       </div>
                     </div>
-                  </div>
-                  <div
-                    className={`flex items-center gap-1 px-2 py-1 rounded-md border font-mono-tabular text-[11px] font-semibold shrink-0 ${pingClass}`}
-                    title="Сетевой пинг игрока"
-                  >
-                    <Wifi className="w-3 h-3" />
-                    <span>{pPing} мс</span>
                   </div>
                 </div>
               );
@@ -274,13 +257,6 @@ export const RoomLobbyView: React.FC<RoomLobbyViewProps> = ({
               }
 
               const isMe = p.playerId === profile.uid;
-              const pPing = isMe ? localPing : p.pingMs ?? 24;
-              const pingClass =
-                pPing < 55
-                  ? 'text-emerald-400 border-emerald-500/30 bg-emerald-950/40'
-                  : pPing < 110
-                    ? 'text-amber-400 border-amber-500/30 bg-amber-950/40'
-                    : 'text-red-400 border-red-500/30 bg-red-950/40';
               return (
                 <div
                   key={p.playerId}
@@ -305,13 +281,6 @@ export const RoomLobbyView: React.FC<RoomLobbyViewProps> = ({
                         {isMe ? ' · Вы' : ''}
                       </div>
                     </div>
-                  </div>
-                  <div
-                    className={`flex items-center gap-1 px-2 py-1 rounded-md border font-mono-tabular text-[11px] font-semibold shrink-0 ${pingClass}`}
-                    title="Сетевой пинг игрока"
-                  >
-                    <Wifi className="w-3 h-3" />
-                    <span>{pPing} мс</span>
                   </div>
                 </div>
               );

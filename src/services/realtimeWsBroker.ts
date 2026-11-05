@@ -4,6 +4,7 @@ const TOPIC_PREFIX = 'haxarena2d/v3_live';
 const ROOMS_WILDCARD = `${TOPIC_PREFIX}/rooms/+`;
 const PLAYERS_WILDCARD = `${TOPIC_PREFIX}/players/+/+`;
 const FAST_WILDCARD = `${TOPIC_PREFIX}/fast/+`;
+const RTC_SIGNAL_WILDCARD = `${TOPIC_PREFIX}/rtc/+`;
 
 const BROKER_URLS = [
   'wss://broker.emqx.io:8084/mqtt',
@@ -148,6 +149,7 @@ class RealtimeMultiplayerBroker {
   private players = new Map<string, Record<string, SyncedPlayerRecord>>();
   private deletedRoomIds = new Map<string, number>();
   private structuralListeners = new Set<(roomId?: string) => void>();
+  private rtcSignalListeners = new Set<(roomId: string, signal: unknown) => void>();
   private localPingMs = 24;
   private sockets: Array<{
     url: string;
@@ -281,6 +283,7 @@ class RealtimeMultiplayerBroker {
                 ROOMS_WILDCARD,
                 PLAYERS_WILDCARD,
                 FAST_WILDCARD,
+                RTC_SIGNAL_WILDCARD,
                 pingTopic,
               ])
             )
@@ -293,7 +296,7 @@ class RealtimeMultiplayerBroker {
         entry.pingTimer = window.setInterval(() => {
           if (entry.connected && entry.ws?.readyState === WebSocket.OPEN) {
             try {
-              // Send MQTT PINGREQ + RTT measurement probe
+              // Send MQTT PINGREQ + RTT measurement probe strictly every 3000ms (3s)
               entry.ws.send(toArrayBuffer(new Uint8Array([0xc0, 0x00])));
               const probe = encoder.encode(String(performance.now()));
               entry.ws.send(
@@ -303,7 +306,7 @@ class RealtimeMultiplayerBroker {
               // ignore
             }
           }
-        }, 2000);
+        }, 3000);
       } else if (packetType === 0x30) {
         const qos = (byte0 >> 1) & 0x03;
         let pIdx = idx;
@@ -329,6 +332,25 @@ class RealtimeMultiplayerBroker {
       if (Number.isFinite(sentPerf) && sentPerf > 0) {
         const rtt = performance.now() - sentPerf;
         this.updateMeasuredPing(rtt);
+      }
+      return;
+    }
+
+    const rtcPrefix = `${TOPIC_PREFIX}/rtc/`;
+    if (topic.startsWith(rtcPrefix)) {
+      const roomId = topic.slice(rtcPrefix.length);
+      if (!roomId || payloadBytes.length === 0) return;
+      try {
+        const sig = JSON.parse(decoder.decode(payloadBytes));
+        for (const cb of this.rtcSignalListeners) {
+          try {
+            cb(roomId, sig);
+          } catch {
+            // ignore
+          }
+        }
+      } catch {
+        // ignore
       }
       return;
     }
@@ -785,6 +807,28 @@ class RealtimeMultiplayerBroker {
   public getRoomPlayers(roomId: string): Record<string, SyncedPlayerRecord> {
     this.start();
     return this.players.get(roomId) || {};
+  }
+
+  public publishWebRTCSignal(roomId: string, signal: unknown) {
+    this.start();
+    const bytes = encoder.encode(JSON.stringify(signal));
+    this.broadcastMqtt(`${TOPIC_PREFIX}/rtc/${roomId}`, bytes, false);
+  }
+
+  public subscribeWebRTCSignals(
+    roomId: string,
+    cb: (signal: unknown) => void
+  ): () => void {
+    this.start();
+    const listener = (incomingRoomId: string, signal: unknown) => {
+      if (incomingRoomId === roomId) {
+        cb(signal);
+      }
+    };
+    this.rtcSignalListeners.add(listener);
+    return () => {
+      this.rtcSignalListeners.delete(listener);
+    };
   }
 
   public subscribe(cb: (roomId?: string) => void): () => void {
