@@ -593,7 +593,7 @@ export function subscribeToActiveRoom(
 
   const unsubWs = realtimeWsBroker.subscribe((changedRoomId) => {
     if (!changedRoomId || changedRoomId === roomId) {
-      emitIfStructuralOrPeriodic(true);
+      emitIfStructuralOrPeriodic(false);
     }
   });
 
@@ -1212,14 +1212,14 @@ export async function syncLocalPlayerDisc(
 ): Promise<void> {
   const now = Date.now();
   const nextSeq = realtimeWsBroker.nextMonotonicSeq();
-  const safeX = Math.round(clamp(state.x, 0, CANVAS_WIDTH) * 10) / 10;
-  const safeY = Math.round(clamp(state.y, 0, CANVAS_HEIGHT) * 10) / 10;
+  const safeX = Math.round(clamp(state.x, 0, CANVAS_WIDTH) * 10000) / 10000;
+  const safeY = Math.round(clamp(state.y, 0, CANVAS_HEIGHT) * 10000) / 10000;
   const safeVx =
-    Math.round(clamp(state.vx, -PLAYER_MAX_SPEED * 2, PLAYER_MAX_SPEED * 2) * 100) /
-    100;
+    Math.round(clamp(state.vx, -PLAYER_MAX_SPEED * 2, PLAYER_MAX_SPEED * 2) * 10000) /
+    10000;
   const safeVy =
-    Math.round(clamp(state.vy, -PLAYER_MAX_SPEED * 2, PLAYER_MAX_SPEED * 2) * 100) /
-    100;
+    Math.round(clamp(state.vy, -PLAYER_MAX_SPEED * 2, PLAYER_MAX_SPEED * 2) * 10000) /
+    10000;
   const safeKicking = Boolean(state.kicking);
   const pingMs = realtimeWsBroker.getLocalPingMs();
 
@@ -1304,25 +1304,33 @@ export function applyWebRTCAuthoritativeSnapshot(
   const now = Date.now();
   const nextSeq = realtimeWsBroker.nextMonotonicSeq();
   const baseRoom = memoryRooms.get(roomId) || realtimeWsBroker.getRoom(roomId);
+  const wsRoom = realtimeWsBroker.getRoom(roomId);
   const isEchoOfLocalBall = Boolean(localUid && snap.actorUid === localUid);
+  // Prevent dual-stream jitter when /ws is actively delivering ball ticks (<80ms)
+  const wsBallFresh = Boolean(
+    wsRoom &&
+      now - (wsRoom.updatedAtMs || 0) < 80 &&
+      snap.eventState === 'normal'
+  );
 
   if (baseRoom) {
     memoryRooms.set(roomId, {
       ...baseRoom,
       redScore: Math.max(baseRoom.redScore, snap.redScore),
       blueScore: Math.max(baseRoom.blueScore, snap.blueScore),
-      ballX: isEchoOfLocalBall ? baseRoom.ballX : snap.ballX,
-      ballY: isEchoOfLocalBall ? baseRoom.ballY : snap.ballY,
-      ballVx: isEchoOfLocalBall ? baseRoom.ballVx : snap.ballVx,
-      ballVy: isEchoOfLocalBall ? baseRoom.ballVy : snap.ballVy,
+      ballX: isEchoOfLocalBall || wsBallFresh ? baseRoom.ballX : snap.ballX,
+      ballY: isEchoOfLocalBall || wsBallFresh ? baseRoom.ballY : snap.ballY,
+      ballVx: isEchoOfLocalBall || wsBallFresh ? baseRoom.ballVx : snap.ballVx,
+      ballVy: isEchoOfLocalBall || wsBallFresh ? baseRoom.ballVy : snap.ballVy,
       eventState: snap.eventState,
       eventTeam: snap.eventTeam,
       eventUntilMs: snap.eventUntilMs,
-      lastTouchTeam: isEchoOfLocalBall
-        ? baseRoom.lastTouchTeam
-        : snap.lastTouchTeam,
+      lastTouchTeam:
+        isEchoOfLocalBall || wsBallFresh
+          ? baseRoom.lastTouchTeam
+          : snap.lastTouchTeam,
       actorUid: snap.actorUid,
-      seq: isEchoOfLocalBall ? baseRoom.seq : nextSeq,
+      seq: isEchoOfLocalBall || wsBallFresh ? baseRoom.seq : nextSeq,
       updatedAtMs: now,
       heartbeatAtMs: now,
     });
@@ -1330,6 +1338,8 @@ export function applyWebRTCAuthoritativeSnapshot(
 
   const authMap = hostAuthoritativePlayers.get(roomId) || {};
   const pMap = memoryPlayers.get(roomId) || {};
+  const wsPlayers = realtimeWsBroker.getRoomPlayers(roomId);
+
   for (const [uid, pState] of Object.entries(snap.players)) {
     authMap[uid] = {
       x: pState.x,
@@ -1340,19 +1350,27 @@ export function applyWebRTCAuthoritativeSnapshot(
       ts: now,
     };
     if (localUid && uid === localUid) continue;
-    if (uid !== hostUid) continue;
-    const existing = pMap[uid] || realtimeWsBroker.getRoomPlayers(roomId)[uid];
+
+    // Only write into memoryPlayers if /ws hasn't delivered a fresh fast tick for this player in the last 120ms.
+    // This eliminates dual-channel packet fighting (WebRTC vs /ws) that caused 0.5s sawtooth shudder!
+    const wsP = wsPlayers[uid];
+    if (wsP && now - (wsP.updatedAtMs || 0) < 120) {
+      continue;
+    }
+
+    const existing = pMap[uid] || wsP;
     pMap[uid] = {
       playerId: uid,
       roomId,
-      nickname: existing?.nickname || 'Player',
+      nickname: existing?.nickname || (uid === hostUid ? baseRoom?.hostName || 'Host' : 'Player'),
       jerseyNumber: existing?.jerseyNumber || 10,
-      team: existing?.team || 'red',
+      team: existing?.team || (baseRoom?.blueUids.includes(uid) ? 'blue' : 'red'),
       x: pState.x,
       y: pState.y,
       vx: pState.vx,
       vy: pState.vy,
       kicking: pState.kicking,
+      keyMask: existing?.keyMask,
       pingMs: existing?.pingMs || 18,
       seq: nextSeq,
       updatedAtMs: now,
@@ -1383,14 +1401,16 @@ export async function syncRoomGameplayState(
   const baseRoom =
     memoryRooms.get(roomId) || realtimeWsBroker.getRoom(roomId);
 
-  const safeBallX = Math.round(clamp(patch.ballX, -100, CANVAS_WIDTH + 100) * 10) / 10;
-  const safeBallY = Math.round(clamp(patch.ballY, -100, CANVAS_HEIGHT + 100) * 10) / 10;
+  const safeBallX =
+    Math.round(clamp(patch.ballX, -100, CANVAS_WIDTH + 100) * 10000) / 10000;
+  const safeBallY =
+    Math.round(clamp(patch.ballY, -100, CANVAS_HEIGHT + 100) * 10000) / 10000;
   const safeBallVx =
-    Math.round(clamp(patch.ballVx, -BALL_MAX_SPEED * 2, BALL_MAX_SPEED * 2) * 100) /
-    100;
+    Math.round(clamp(patch.ballVx, -BALL_MAX_SPEED * 2, BALL_MAX_SPEED * 2) * 10000) /
+    10000;
   const safeBallVy =
-    Math.round(clamp(patch.ballVy, -BALL_MAX_SPEED * 2, BALL_MAX_SPEED * 2) * 100) /
-    100;
+    Math.round(clamp(patch.ballVy, -BALL_MAX_SPEED * 2, BALL_MAX_SPEED * 2) * 10000) /
+    10000;
 
   if (baseRoom) {
     const inGoalCelebration =

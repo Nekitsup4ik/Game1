@@ -673,20 +673,30 @@ class RealtimeMultiplayerBroker {
         }
 
         const existing = rPlayers[uid];
+        // Block delayed external MQTT echoes when ultra-fast directWs (<5ms) is active
+        if (!fromDirectWs && this.directWsConnected && existing) {
+          return;
+        }
+
         const structuralChanged =
           !existing ||
           existing.team !== parsed.team ||
           existing.nickname !== parsed.nickname ||
           existing.jerseyNumber !== parsed.jerseyNumber;
 
+        const isFormationOrSpawnReset =
+          !existing ||
+          structuralChanged ||
+          (parsed.vx === 0 && parsed.vy === 0);
+
         const localRxSeq = this.nextMonotonicSeq();
         rPlayers[uid] = {
           ...parsed,
-          x: existing ? existing.x : parsed.x,
-          y: existing ? existing.y : parsed.y,
-          vx: existing ? existing.vx : parsed.vx,
-          vy: existing ? existing.vy : parsed.vy,
-          seq: existing?.seq || localRxSeq,
+          x: isFormationOrSpawnReset ? parsed.x : existing.x,
+          y: isFormationOrSpawnReset ? parsed.y : existing.y,
+          vx: isFormationOrSpawnReset ? parsed.vx : existing.vx,
+          vy: isFormationOrSpawnReset ? parsed.vy : existing.vy,
+          seq: isFormationOrSpawnReset ? localRxSeq : existing.seq || localRxSeq,
           updatedAtMs: Date.now(),
         };
         this.players.set(roomId, rPlayers);

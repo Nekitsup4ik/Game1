@@ -567,9 +567,16 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     kick: false,
   });
 
+  const isFreshKickoff =
+    room.matchStartedAtMs > 0 && Date.now() - room.matchStartedAtMs < 6000;
+
   const physRef = useRef<LocalPhysicsState>({
-    myX: players[profile.uid]?.x ?? initialSpawn.x,
-    myY: players[profile.uid]?.y ?? initialSpawn.y,
+    myX: isFreshKickoff
+      ? initialSpawn.x
+      : (players[profile.uid]?.x ?? initialSpawn.x),
+    myY: isFreshKickoff
+      ? initialSpawn.y
+      : (players[profile.uid]?.y ?? initialSpawn.y),
     myOffsetX: 0,
     myOffsetY: 0,
     myVx: 0,
@@ -605,6 +612,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   const lastPlayerSyncMsRef = useRef<number>(0);
   const lastBallSyncMsRef = useRef<number>(0);
   const lastLocalBallTouchMsRef = useRef<number>(0);
+  const lastLocalActiveMoveMsRef = useRef<number>(Date.now());
   const remoteBallGraceUntilMsRef = useRef<number>(0);
   const remoteBallActorUidRef = useRef<string>('');
   const lastPlayerCollisionMsRef = useRef<number>(0);
@@ -655,7 +663,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       },
       onClientBall: (pkt) => {
         const nowMs = Date.now();
-        // If Host itself is actively kicking/touching the ball at this exact instant, resolve smoothly
+        // Smoothly absorb 100% of visual delta so client ball touch never causes a jump on Host
         const p = physRef.current;
         const prevVisX = p.ballX + p.ballOffsetX;
         const prevVisY = p.ballY + p.ballOffsetY;
@@ -666,9 +674,9 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         p.lastTouchTeam = pkt.lastTouchTeam;
         const errX = prevVisX - p.ballX;
         const errY = prevVisY - p.ballY;
-        if (Math.hypot(errX, errY) < 95) {
-          p.ballOffsetX = round4(errX * 0.42);
-          p.ballOffsetY = round4(errY * 0.42);
+        if (Math.hypot(errX, errY) < 120) {
+          p.ballOffsetX = round4(errX);
+          p.ballOffsetY = round4(errY);
         } else {
           p.ballOffsetX = 0;
           p.ballOffsetY = 0;
@@ -942,10 +950,9 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               const errX = prevVisX - p.ballX;
               const errY = prevVisY - p.ballY;
               const errDist = Math.hypot(errX, errY);
-              if (errDist < 95) {
-                const keep = isFromOtherPlayer ? 0.42 : 0.62;
-                p.ballOffsetX = round4(errX * keep);
-                p.ballOffsetY = round4(errY * keep);
+              if (errDist < 120) {
+                p.ballOffsetX = round4(errX);
+                p.ballOffsetY = round4(errY);
               } else {
                 p.ballOffsetX = 0;
                 p.ballOffsetY = 0;
@@ -955,15 +962,17 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         }
       }
 
-      // Decay visual smoothing offsets on every 60Hz frame
+      // Decay visual smoothing offsets smoothly on every 60Hz frame
+      const ballDecay = Math.pow(0.76, dtScale);
+      const discDecay = Math.pow(0.80, dtScale);
       p.ballOffsetX =
-        Math.abs(p.ballOffsetX) > 0.25 ? round4(p.ballOffsetX * 0.72) : 0;
+        Math.abs(p.ballOffsetX) > 0.15 ? round4(p.ballOffsetX * ballDecay) : 0;
       p.ballOffsetY =
-        Math.abs(p.ballOffsetY) > 0.25 ? round4(p.ballOffsetY * 0.72) : 0;
+        Math.abs(p.ballOffsetY) > 0.15 ? round4(p.ballOffsetY * ballDecay) : 0;
       p.myOffsetX =
-        Math.abs(p.myOffsetX) > 0.2 ? round4(p.myOffsetX * 0.72) : 0;
+        Math.abs(p.myOffsetX) > 0.15 ? round4(p.myOffsetX * discDecay) : 0;
       p.myOffsetY =
-        Math.abs(p.myOffsetY) > 0.2 ? round4(p.myOffsetY * 0.72) : 0;
+        Math.abs(p.myOffsetY) > 0.15 ? round4(p.myOffsetY * discDecay) : 0;
 
       const currentRoom = roomRef.current;
       const allPlayers = playersRef.current;
@@ -1067,11 +1076,14 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         p.myY = round4(p.myY + p.myVy * dtScale);
 
         if (
-          Math.abs(p.myVx) > 0.015 ||
-          Math.abs(p.myVy) > 0.015 ||
+           dirX !== 0 ||
+          dirY !== 0 ||
+          Math.abs(p.myVx) > 0.005 ||
+          Math.abs(p.myVy) > 0.005 ||
           p.myKicking !== k.kick
         ) {
           localMovedOrChanged = true;
+          lastLocalActiveMoveMsRef.current = now;
         }
         p.myKicking = k.kick;
       } else {
@@ -1080,7 +1092,10 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         p.myKicking = false;
       }
 
-      // Continuous 60fps HaxBall Dead-Reckoning + Visual Offset Smoothing for Remote Players
+      const preCollisionMyVx = p.myVx;
+      const preCollisionMyVy = p.myVy;
+
+      // Continuous 60fps HaxBall Dead-Reckoning + Zero-Shudder Visual Offset Smoothing for Remote Players
       const remotePlayerDamp = Math.pow(PLAYER_DAMPING, dtScale);
 
       Object.values(allPlayers).forEach((rp) => {
@@ -1109,7 +1124,85 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           return;
         }
 
-        // 1. When a genuinely NEW packet arrives, set exact physics coordinates and absorb visual delta into offsetX/offsetY
+        // STEP 1: Advance remote player physics at 60Hz FIRST (using lockstep input / keyMask + damping)
+        if (!isMatchFinished && !isPausedForOutOrCorner) {
+          const km = (rp as { keyMask?: number }).keyMask;
+          const peerKey =
+            peerInputsRef.current[rp.playerId] ||
+            (typeof km === 'number'
+              ? {
+                  up: (km & 1) !== 0,
+                  down: (km & 2) !== 0,
+                  left: (km & 4) !== 0,
+                  right: (km & 8) !== 0,
+                  kick: (km & 16) !== 0,
+                }
+              : null);
+          if (peerKey) {
+            let pdx = 0;
+            let pdy = 0;
+            if (peerKey.left) pdx -= 1;
+            if (peerKey.right) pdx += 1;
+            if (peerKey.up) pdy -= 1;
+            if (peerKey.down) pdy += 1;
+            if (pdx !== 0 || pdy !== 0) {
+              const ang = Math.atan2(pdy, pdx);
+              const acc = peerKey.kick ? PLAYER_KICK_ACCEL : PLAYER_ACCEL;
+              state.vx = round4(
+                (state.vx + Math.cos(ang) * acc * dtScale) * remotePlayerDamp
+              );
+              state.vy = round4(
+                (state.vy + Math.sin(ang) * acc * dtScale) * remotePlayerDamp
+              );
+            } else {
+              state.vx = round4(state.vx * remotePlayerDamp);
+              state.vy = round4(state.vy * remotePlayerDamp);
+            }
+          } else {
+            state.vx = round4(state.vx * remotePlayerDamp);
+            state.vy = round4(state.vy * remotePlayerDamp);
+          }
+
+          const rSpeed = Math.hypot(state.vx, state.vy);
+          if (rSpeed > PLAYER_MAX_SPEED) {
+            const sAng = Math.atan2(state.vy, state.vx);
+            state.vx = round4(Math.cos(sAng) * PLAYER_MAX_SPEED);
+            state.vy = round4(Math.sin(sAng) * PLAYER_MAX_SPEED);
+          } else if (rSpeed < 0.012) {
+            state.vx = 0;
+            state.vy = 0;
+          }
+
+          state.x = round4(
+            Math.max(
+              PLAYER_RADIUS + 12,
+              Math.min(CANVAS_WIDTH - PLAYER_RADIUS - 12, state.x + state.vx * dtScale)
+            )
+          );
+          state.y = round4(
+            Math.max(
+              PLAYER_RADIUS + 12,
+              Math.min(CANVAS_HEIGHT - PLAYER_RADIUS - 12, state.y + state.vy * dtScale)
+            )
+          );
+
+          for (const post of GOALPOSTS) {
+            const dxPost = state.x - post.x;
+            const dyPost = state.y - post.y;
+            const distPost = Math.hypot(dxPost, dyPost);
+            const minPostDist = PLAYER_RADIUS + POST_RADIUS;
+            if (distPost < minPostDist && distPost > 0.001) {
+              const pAngle = Math.atan2(dyPost, dxPost);
+              const nx = round4(Math.cos(pAngle));
+              const ny = round4(Math.sin(pAngle));
+              state.x = round4(post.x + nx * minPostDist);
+              state.y = round4(post.y + ny * minPostDist);
+            }
+          }
+        }
+
+        // STEP 2: Reconcile when a new network packet arrives AFTER stepping dead-reckoning!
+        // Absorbing 100% (1.0) of (prevVisX - state.x) guarantees 0.000px instantaneous jump on packet arrival!
         if (pktSeq !== state.lastSeq) {
           const prevVisX = state.x + state.offsetX;
           const prevVisY = state.y + state.offsetY;
@@ -1122,86 +1215,26 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           const errX = prevVisX - state.x;
           const errY = prevVisY - state.y;
           const errDist = Math.hypot(errX, errY);
-          if (errDist < 95) {
-            state.offsetX = round4(errX * 0.62);
-            state.offsetY = round4(errY * 0.62);
+          if (errDist < 120) {
+            state.offsetX = round4(errX);
+            state.offsetY = round4(errY);
           } else {
             state.offsetX = 0;
             state.offsetY = 0;
           }
         }
 
-        // Decay visual offset smoothly every 60Hz frame
+        // STEP 3: Smoothly decay visual offset once per 60Hz frame
         state.offsetX =
-          Math.abs(state.offsetX) > 0.2 ? round4(state.offsetX * 0.72) : 0;
+          Math.abs(state.offsetX) > 0.15 ? round4(state.offsetX * discDecay) : 0;
         state.offsetY =
-          Math.abs(state.offsetY) > 0.2 ? round4(state.offsetY * 0.72) : 0;
+          Math.abs(state.offsetY) > 0.15 ? round4(state.offsetY * discDecay) : 0;
 
-        // 2. Step remote player physics at 60Hz between packets using lockstep input + keyMask + velocity damping
-        const km = (rp as { keyMask?: number }).keyMask;
-        const peerKey =
-          peerInputsRef.current[rp.playerId] ||
-          (typeof km === 'number'
-            ? {
-                up: (km & 1) !== 0,
-                down: (km & 2) !== 0,
-                left: (km & 4) !== 0,
-                right: (km & 8) !== 0,
-                kick: (km & 16) !== 0,
-              }
-            : null);
-        if (peerKey) {
-          let pdx = 0;
-          let pdy = 0;
-          if (peerKey.left) pdx -= 1;
-          if (peerKey.right) pdx += 1;
-          if (peerKey.up) pdy -= 1;
-          if (peerKey.down) pdy += 1;
-          if (pdx !== 0 || pdy !== 0) {
-            const ang = Math.atan2(pdy, pdx);
-            const acc = peerKey.kick ? PLAYER_KICK_ACCEL : PLAYER_ACCEL;
-            state.vx = round4(
-              (state.vx + Math.cos(ang) * acc * dtScale) * remotePlayerDamp
-            );
-            state.vy = round4(
-              (state.vy + Math.sin(ang) * acc * dtScale) * remotePlayerDamp
-            );
-          } else {
-            state.vx = round4(state.vx * remotePlayerDamp);
-            state.vy = round4(state.vy * remotePlayerDamp);
-          }
-        } else {
-          state.vx = round4(state.vx * remotePlayerDamp);
-          state.vy = round4(state.vy * remotePlayerDamp);
-        }
-
-        const rSpeed = Math.hypot(state.vx, state.vy);
-        if (rSpeed > PLAYER_MAX_SPEED) {
-          const sAng = Math.atan2(state.vy, state.vx);
-          state.vx = round4(Math.cos(sAng) * PLAYER_MAX_SPEED);
-          state.vy = round4(Math.sin(sAng) * PLAYER_MAX_SPEED);
-        } else if (rSpeed < 0.012) {
-          state.vx = 0;
-          state.vy = 0;
-        }
-
-        state.x = round4(
-          Math.max(
-            PLAYER_RADIUS + 12,
-            Math.min(CANVAS_WIDTH - PLAYER_RADIUS - 12, state.x + state.vx * dtScale)
-          )
-        );
-        state.y = round4(
-          Math.max(
-            PLAYER_RADIUS + 12,
-            Math.min(CANVAS_HEIGHT - PLAYER_RADIUS - 12, state.y + state.vy * dtScale)
-          )
-        );
         state.simX = state.x;
         state.simY = state.y;
       });
 
-      // 1b. Player-to-Player Disc Collisions + Coordinate Convergence (Фишки сталкиваются без рассинхрона координат!)
+      // 1b. Symmetric Player-to-Player Disc Collisions + Zero-Desync Coordinate Convergence
       if (!isMatchFinished && !isPausedForOutOrCorner) {
         const minPlayerDist = PLAYER_RADIUS * 2; // 38px
         Object.values(allPlayers).forEach((rp) => {
@@ -1219,51 +1252,72 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             const ny = round4(Math.sin(pAngle));
             const overlap = minPlayerDist - distP;
 
-            // Resolve overlap primarily on local player (75%) and only slightly on remote render (25%)
-            // so local player immediately broadcasts its true pushed coordinates without creating a fake remote offset!
-            p.myX = round4(p.myX + nx * overlap * 0.75);
-            p.myY = round4(p.myY + ny * overlap * 0.75);
-            rState.x = round4(rState.x - nx * overlap * 0.25);
-            rState.y = round4(rState.y - ny * overlap * 0.25);
+            // Symmetric 50/50 equal-mass separation (identical to HaxBall stepDeterministicWorld!)
+            const prevMyVisX = p.myX + p.myOffsetX;
+            const prevMyVisY = p.myY + p.myOffsetY;
+            const prevRemVisX = rState.x + rState.offsetX;
+            const prevRemVisY = rState.y + rState.offsetY;
 
-            // Elastic 2D momentum transfer between equal-mass player discs
+            p.myX = round4(p.myX + nx * overlap * 0.5);
+            p.myY = round4(p.myY + ny * overlap * 0.5);
+            rState.x = round4(rState.x - nx * overlap * 0.5);
+            rState.y = round4(rState.y - ny * overlap * 0.5);
+
+            // Smoothly absorb sub-frame collision nudge into visual offsets so discs never jitter on contact
+            p.myOffsetX = round4((prevMyVisX - p.myX) * 0.45);
+            p.myOffsetY = round4((prevMyVisY - p.myY) * 0.45);
+            rState.offsetX = round4((prevRemVisX - rState.x) * 0.45);
+            rState.offsetY = round4((prevRemVisY - rState.y) * 0.45);
+
+            // Elastic 2D momentum transfer + contact repulsion so stationary discs always get pushed smoothly
             const relVx = p.myVx - rState.vx;
             const relVy = p.myVy - rState.vy;
             const normalVel = relVx * nx + relVy * ny;
+            const contactPush = round4(overlap * 0.26);
             if (normalVel < 0) {
-              const playerRestitution = 0.16;
-              const impulse = -(1 + playerRestitution) * normalVel * 0.55;
+              const playerRestitution = 0.14;
+              const impulse = Math.max(
+                contactPush,
+                -(1 + playerRestitution) * normalVel * 0.5
+              );
               p.myVx = round4(p.myVx + impulse * nx);
               p.myVy = round4(p.myVy + impulse * ny);
-              rState.vx = round4(rState.vx - impulse * nx * 0.45);
-              rState.vy = round4(rState.vy - impulse * ny * 0.45);
+              rState.vx = round4(rState.vx - impulse * nx);
+              rState.vy = round4(rState.vy - impulse * ny);
+            } else {
+              p.myVx = round4(p.myVx + contactPush * nx);
+              p.myVy = round4(p.myVy + contactPush * ny);
+              rState.vx = round4(rState.vx - contactPush * nx);
+              rState.vy = round4(rState.vy - contactPush * ny);
             }
             lastPlayerCollisionMsRef.current = now;
+            lastLocalActiveMoveMsRef.current = now;
             localMovedOrChanged = true;
           }
         });
 
-        // If Client recently collided with another player, smoothly reconcile with Host's authoritative coordinates
-        // so both screens converge to 100% identical player coordinates!
+        // Smoothly reconcile Client coordinates with Host only if a major collision divergence (> 24px) occurred,
+        // absorbing 100% of the shift into myOffsetX/myOffsetY so there is zero visible shudder!
         if (
           currentRoom.hostUid !== profile.uid &&
-          now - lastPlayerCollisionMsRef.current < 260
+          now - lastPlayerCollisionMsRef.current < 240
         ) {
           const hostAuthMe = getHostAuthoritativePlayerState(
             currentRoom.roomId,
             profile.uid
           );
-          if (hostAuthMe && now - hostAuthMe.ts < 180) {
+          if (hostAuthMe && now - hostAuthMe.ts < 140) {
             const diffX = hostAuthMe.x - p.myX;
             const diffY = hostAuthMe.y - p.myY;
             const diffDist = Math.hypot(diffX, diffY);
-            if (diffDist > 4 && diffDist < 90) {
+            if (diffDist > 24 && diffDist < 120) {
               const prevVisX = p.myX + p.myOffsetX;
               const prevVisY = p.myY + p.myOffsetY;
-              p.myX = round4(p.myX + diffX * 0.28);
-              p.myY = round4(p.myY + diffY * 0.28);
-              p.myOffsetX = round4((prevVisX - p.myX) * 0.65);
-              p.myOffsetY = round4((prevVisY - p.myY) * 0.65);
+              p.myX = round4(p.myX + diffX * 0.25);
+              p.myY = round4(p.myY + diffY * 0.25);
+              p.myOffsetX = round4(prevVisX - p.myX);
+              p.myOffsetY = round4(prevVisY - p.myY);
+              lastLocalActiveMoveMsRef.current = now;
               localMovedOrChanged = true;
             }
           }
@@ -1886,23 +1940,35 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         const lastSent = lastSentPosRef.current;
         const posDelta = Math.hypot(p.myX - lastSent.x, p.myY - lastSent.y);
         const velDelta = Math.hypot(p.myVx - lastSent.vx, p.myVy - lastSent.vy);
+        // Keep streaming 60Hz ticks for 400ms after stopping/colliding so resting coordinates never desync!
+        const inPostMoveWindow = now - lastLocalActiveMoveMsRef.current < 400;
         const needFastSync =
           localMovedOrChanged ||
-          posDelta > 0.04 ||
-          velDelta > 0.01 ||
+          inPostMoveWindow ||
+          posDelta > 0.005 ||
+          velDelta > 0.005 ||
           keyMask !== lastSent.keyMask;
-        const needIdleBeacon = now - lastPlayerSyncMsRef.current >= 120;
+        const needIdleBeacon = now - lastPlayerSyncMsRef.current >= 80;
 
+        // Use >= 11ms instead of >= 16ms so 60Hz requestAnimationFrame (16.67ms) never skips every ~30th frame (0.5s beat)!
         if (
-          (needFastSync && now - lastPlayerSyncMsRef.current >= 16) ||
+          (needFastSync && now - lastPlayerSyncMsRef.current >= 11) ||
           needIdleBeacon
         ) {
           lastPlayerSyncMsRef.current = now;
+          const isCollidingNow = now - lastPlayerCollisionMsRef.current < 45;
+          const txVx = isCollidingNow
+            ? round4(p.myVx * 0.45 + preCollisionMyVx * 0.55)
+            : p.myVx;
+          const txVy = isCollidingNow
+            ? round4(p.myVy * 0.45 + preCollisionMyVy * 0.55)
+            : p.myVy;
+
           lastSentPosRef.current = {
             x: p.myX,
             y: p.myY,
-            vx: p.myVx,
-            vy: p.myVy,
+            vx: txVx,
+            vy: txVy,
             keyMask,
           };
           syncLocalPlayerDisc(
@@ -1911,8 +1977,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             {
               x: p.myX,
               y: p.myY,
-              vx: p.myVx,
-              vy: p.myVy,
+              vx: txVx,
+              vy: txVy,
               kicking: p.myKicking,
               keyMask,
             },
@@ -1939,7 +2005,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           isBallAuthority &&
           ballMoving &&
           p.eventState === 'normal' &&
-          (localTouchedBall || now - lastBallSyncMsRef.current >= 16)
+          (localTouchedBall || now - lastBallSyncMsRef.current >= 11)
         ) {
           lastBallSyncMsRef.current = now;
           syncRoomGameplayState(currentRoom.roomId, {
