@@ -433,7 +433,7 @@ async function startServer() {
     room.matchStartedAtMs =
       typeof matchStartedAtMs === 'number' && matchStartedAtMs > 0
         ? matchStartedAtMs
-        : now + 3000;
+        : now;
     room.ballX = FIELD_CENTER_X;
     room.ballY = FIELD_CENTER_Y;
     room.ballVx = 0;

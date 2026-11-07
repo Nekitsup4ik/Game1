@@ -11,7 +11,7 @@ export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 
-export let isFirestoreQuotaExceeded = false;
+export let isFirestoreQuotaExceeded = true;
 
 export function markFirestoreQuotaExceeded() {
   isFirestoreQuotaExceeded = true;

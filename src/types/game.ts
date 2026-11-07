@@ -95,7 +95,7 @@ export const CORNER_KICK_IMPULSE = 8.8; // Moderate cross power when kicking a c
 export const POWERSHOT_IMPULSE = 12.6; // Stronger Powershot after 4s of ball control
 export const POWERSHOT_CHARGE_MS = 4000; // 4 seconds holding ball in gray circle to charge Powershot
 export const POWERSHOT_WINDOW_MS = 2500; // 2.5 seconds window to hit Powershot before it expires
-export const KICK_RANGE = PLAYER_RADIUS + BALL_RADIUS + 8;
+export const KICK_RANGE = PLAYER_RADIUS + BALL_RADIUS + 4;
 
 // Match Rules Constants (4v4)
 export const MAX_TEAM_SIZE = 4;

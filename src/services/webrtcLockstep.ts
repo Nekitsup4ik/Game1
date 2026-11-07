@@ -4,7 +4,6 @@ import {
   BALL_RADIUS,
   CANVAS_HEIGHT,
   CANVAS_WIDTH,
-  CORNER_KICK_IMPULSE,
   EventState,
   EventTeam,
   FIELD_BOTTOM,
@@ -31,24 +30,63 @@ import { realtimeWsBroker } from './realtimeWsBroker';
 // Fixed Lockstep Timestep: 60 Hz (DT = 1/60 s)
 export const LOCKSTEP_FPS = 60;
 export const LOCKSTEP_DT = 1 / LOCKSTEP_FPS;
+export const LOCKSTEP_STEP_MS = 1000 / LOCKSTEP_FPS; // 16.6667 ms
 export const MAX_EXTRAPOLATION_MS = 200;
-export const LOCKSTEP_WAIT_TIMEOUT_TICKS = 5; // 5 ticks (~83 ms) before empty input substitution
-export const LOCKSTEP_DISCONNECT_TIMEOUT_TICKS = 600; // 600 ticks (10.0 s) before closing peer connection
+export const LOCKSTEP_WAIT_TIMEOUT_TICKS = 5; // > 5 ticks without input -> substitute EMPTY_INPUT_KEYS
+export const LOCKSTEP_DISCONNECT_TIMEOUT_TICKS = 60; // > 60 ticks (1.0 s) on active channel -> close RTCPeerConnection
 export const PING_INTERVAL_MS = 3000; // Measure ping strictly every 3 seconds
 
 // Deterministic Tick Durations (at 60 Hz)
 export const POWERSHOT_CHARGE_TICKS = 4 * LOCKSTEP_FPS; // 240 ticks (4.0s)
 export const POWERSHOT_WINDOW_TICKS = Math.round(2.5 * LOCKSTEP_FPS); // 150 ticks (2.5s)
 export const GOAL_PAUSE_TICKS = 3 * LOCKSTEP_FPS; // 180 ticks (3.0s)
-export const OUT_PAUSE_TICKS = Math.round(0.45 * LOCKSTEP_FPS); // 27 ticks (0.45s)
-export const SET_PIECE_EXPIRE_TICKS = Math.round(4.5 * LOCKSTEP_FPS); // 270 ticks (4.5s)
-export const KICK_RADIUS = 8.0;
 
-/**
- * Mandatory 4-decimal float rounding for deterministic lockstep across machines
- */
+// HaxBall Kick Constants: 4 map units radius & KICK_STRENGTH
+export const KICK_RADIUS = 4.0;
+export const KICK_STRENGTH = KICK_IMPULSE;
+export const WALL_BCOEF = 1.0; // Perfectly elastic wall reflection (bCoef = 1.0)
+
+// ============================================================================
+// MODULE (b): Fixed-Point / Strict 4-Decimal Deterministic Math
+// ============================================================================
+export const FP_SCALE = 10000;
+
 export function round4(val: number): number {
-  return Math.round(val * 10000) / 10000;
+  return Math.round(val * FP_SCALE) / FP_SCALE;
+}
+
+export function fpAdd(a: number, b: number): number {
+  return (Math.round(a * FP_SCALE) + Math.round(b * FP_SCALE)) / FP_SCALE;
+}
+
+export function fpSub(a: number, b: number): number {
+  return (Math.round(a * FP_SCALE) - Math.round(b * FP_SCALE)) / FP_SCALE;
+}
+
+export function fpMul(a: number, b: number): number {
+  return Math.round((Math.round(a * FP_SCALE) * Math.round(b * FP_SCALE)) / FP_SCALE) / FP_SCALE;
+}
+
+export function fpDiv(a: number, b: number): number {
+  const denom = Math.round(b * FP_SCALE);
+  if (denom === 0) return 0;
+  return Math.round((Math.round(a * FP_SCALE) * FP_SCALE) / denom) / FP_SCALE;
+}
+
+export function fpSin(rad: number): number {
+  return round4(Math.sin(round4(rad)));
+}
+
+export function fpCos(rad: number): number {
+  return round4(Math.cos(round4(rad)));
+}
+
+export function fpAtan2(y: number, x: number): number {
+  return round4(Math.atan2(round4(y), round4(x)));
+}
+
+export function fpHypot(dx: number, dy: number): number {
+  return round4(Math.hypot(round4(dx), round4(dy)));
 }
 
 export interface PlayerInputKeys {
@@ -67,9 +105,235 @@ export const EMPTY_INPUT_KEYS: PlayerInputKeys = {
   kick: false,
 };
 
+export function encodeKeyMask(k: PlayerInputKeys): number {
+  return (
+    (k.up ? 1 : 0) |
+    (k.down ? 2 : 0) |
+    (k.left ? 4 : 0) |
+    (k.right ? 8 : 0) |
+    (k.kick ? 16 : 0)
+  );
+}
+
+export function decodeKeyMask(mask: number): PlayerInputKeys {
+  return {
+    up: (mask & 1) !== 0,
+    down: (mask & 2) !== 0,
+    left: (mask & 4) !== 0,
+    right: (mask & 8) !== 0,
+    kick: (mask & 16) !== 0,
+  };
+}
+
+// ============================================================================
+// MODULE (a): Pitch Wall Segments & Elastic Ball Reflection (Zero Outs!)
+// ============================================================================
+export interface WallSegment {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  nx: number; // Unit inward normal X
+  ny: number; // Unit inward normal Y
+  bCoef: number; // Elastic bounce coefficient (1.0)
+  wall: boolean;
+}
+
 /**
- * 1. Pure Input Transmission Packet (+ optional P2P state sync for hybrid smoothing)
+ * Field boundary wall segments (with goal openings on Left and Right between GOAL_TOP and GOAL_BOTTOM).
+ * All walls have `wall: true` and `bCoef: 1.0` for elastic reflection without outs or resets.
  */
+export const PITCH_WALL_SEGMENTS: WallSegment[] = [
+  // Top touchline wall (inward normal points down: 0, +1)
+  {
+    x0: FIELD_LEFT,
+    y0: FIELD_TOP,
+    x1: FIELD_RIGHT,
+    y1: FIELD_TOP,
+    nx: 0,
+    ny: 1,
+    bCoef: WALL_BCOEF,
+    wall: true,
+  },
+  // Bottom touchline wall (inward normal points up: 0, -1)
+  {
+    x0: FIELD_LEFT,
+    y0: FIELD_BOTTOM,
+    x1: FIELD_RIGHT,
+    y1: FIELD_BOTTOM,
+    nx: 0,
+    ny: -1,
+    bCoef: WALL_BCOEF,
+    wall: true,
+  },
+  // Left goal-line upper wall (above goal mouth, inward normal points right: +1, 0)
+  {
+    x0: FIELD_LEFT,
+    y0: FIELD_TOP,
+    x1: FIELD_LEFT,
+    y1: GOAL_TOP,
+    nx: 1,
+    ny: 0,
+    bCoef: WALL_BCOEF,
+    wall: true,
+  },
+  // Left goal-line lower wall (below goal mouth, inward normal points right: +1, 0)
+  {
+    x0: FIELD_LEFT,
+    y0: GOAL_BOTTOM,
+    x1: FIELD_LEFT,
+    y1: FIELD_BOTTOM,
+    nx: 1,
+    ny: 0,
+    bCoef: WALL_BCOEF,
+    wall: true,
+  },
+  // Right goal-line upper wall (above goal mouth, inward normal points left: -1, 0)
+  {
+    x0: FIELD_RIGHT,
+    y0: FIELD_TOP,
+    x1: FIELD_RIGHT,
+    y1: GOAL_TOP,
+    nx: -1,
+    ny: 0,
+    bCoef: WALL_BCOEF,
+    wall: true,
+  },
+  // Right goal-line lower wall (below goal mouth, inward normal points left: -1, 0)
+  {
+    x0: FIELD_RIGHT,
+    y0: GOAL_BOTTOM,
+    x1: FIELD_RIGHT,
+    y1: FIELD_BOTTOM,
+    nx: -1,
+    ny: 0,
+    bCoef: WALL_BCOEF,
+    wall: true,
+  },
+];
+
+/**
+ * Elastic reflection + position correction ("выталкивание") of the ball against pitch wall segments.
+ * Angle of incidence equals angle of reflection: normal velocity reverses sign (scaled by bCoef),
+ * tangential velocity is preserved. No outs or center resets ever occur.
+ */
+export function collideBallWithWallSegments(
+  ball: { x: number; y: number; vx: number; vy: number; radius: number },
+  segments: WallSegment[] = PITCH_WALL_SEGMENTS
+): boolean {
+  let bounced = false;
+  const inGoalMouthY = ball.y > GOAL_TOP && ball.y < GOAL_BOTTOM;
+
+  for (const seg of segments) {
+    if (!seg.wall) continue;
+
+    // Horizontal walls (Top & Bottom)
+    if (seg.ny !== 0) {
+      if (seg.ny === 1) {
+        // Top wall at y = FIELD_TOP (normal points +Y inside field)
+        const minBallY = fpAdd(seg.y0, ball.radius);
+        if (ball.y < minBallY) {
+          // Position correction: push ball inside field
+          ball.y = minBallY;
+          // Reflect normal velocity component (vy) while preserving tangential component (vx)
+          if (ball.vy < 0) {
+            ball.vy = fpMul(-ball.vy, seg.bCoef);
+          }
+          bounced = true;
+        }
+      } else if (seg.ny === -1) {
+        // Bottom wall at y = FIELD_BOTTOM (normal points -Y inside field)
+        const maxBallY = fpSub(seg.y0, ball.radius);
+        if (ball.y > maxBallY) {
+          ball.y = maxBallY;
+          if (ball.vy > 0) {
+            ball.vy = fpMul(-ball.vy, seg.bCoef);
+          }
+          bounced = true;
+        }
+      }
+      continue;
+    }
+
+    // Vertical walls (Left & Right goal-line segments outside the goal mouth)
+    if (seg.nx !== 0 && !inGoalMouthY) {
+      const segMinY = Math.min(seg.y0, seg.y1);
+      const segMaxY = Math.max(seg.y0, seg.y1);
+      if (ball.y >= segMinY - ball.radius && ball.y <= segMaxY + ball.radius) {
+        if (seg.nx === 1) {
+          // Left wall at x = FIELD_LEFT (normal points +X inside field)
+          const minBallX = fpAdd(seg.x0, ball.radius);
+          if (ball.x < minBallX) {
+            ball.x = minBallX;
+            if (ball.vx < 0) {
+              ball.vx = fpMul(-ball.vx, seg.bCoef);
+            }
+            bounced = true;
+          }
+        } else if (seg.nx === -1) {
+          // Right wall at x = FIELD_RIGHT (normal points -X inside field)
+          const maxBallX = fpSub(seg.x0, ball.radius);
+          if (ball.x > maxBallX) {
+            ball.x = maxBallX;
+            if (ball.vx > 0) {
+              ball.vx = fpMul(-ball.vx, seg.bCoef);
+            }
+            bounced = true;
+          }
+        }
+      }
+    }
+  }
+
+  return bounced;
+}
+
+// ============================================================================
+// MODULE (d): Client Jitter Damper / Spring-Lerp Visual Smoothing
+// ============================================================================
+export class JitterDamper2D {
+  public offsetX = 0;
+  public offsetY = 0;
+
+  /**
+   * When a confirmed position arrives and differs from the predicted position,
+   * absorb the difference into (offsetX, offsetY) so the rendered position does NOT jump.
+   */
+  public absorbCorrection(
+    prevVisualX: number,
+    prevVisualY: number,
+    newAuthX: number,
+    newAuthY: number,
+    maxSnapDist = 220
+  ) {
+    const dx = fpSub(prevVisualX, newAuthX);
+    const dy = fpSub(prevVisualY, newAuthY);
+    const dist = fpHypot(dx, dy);
+    if (dist < maxSnapDist) {
+      this.offsetX = dx;
+      this.offsetY = dy;
+    } else {
+      this.offsetX = 0;
+      this.offsetY = 0;
+    }
+  }
+
+  /**
+   * Smoothly decays the visual offset toward 0 over several frames (critically damped lerp).
+   */
+  public stepDecay(decayFactor = 0.78) {
+    this.offsetX =
+      Math.abs(this.offsetX) > 0.12 ? fpMul(this.offsetX, decayFactor) : 0;
+    this.offsetY =
+      Math.abs(this.offsetY) > 0.12 ? fpMul(this.offsetY, decayFactor) : 0;
+  }
+
+  public reset() {
+    this.offsetX = 0;
+    this.offsetY = 0;
+  }
+}
+
 export interface InputPacket {
   tick: number;
   playerId: string;
@@ -125,8 +389,8 @@ export interface StepEvents {
   kickedByUid: string | null;
   wasPowershot: boolean;
   postHit: boolean;
+  wallHit: boolean;
   goalScoredBy: TeamColor | null;
-  outOrCornerTriggered: boolean;
 }
 
 const GOALPOSTS = [
@@ -137,41 +401,42 @@ const GOALPOSTS = [
 ];
 
 /**
- * 4. Deterministic Kick Mechanics (`attemptKick(player, ball, input)`)
- * Follows exact specification: Math.hypot, Math.atan2, Math.cos, Math.sin, 4-decimal rounding.
+ * Deterministic Kick Mechanics (`attemptKick(player, ball, input)`)
+ * Distance = Math.hypot(dx, dy). Radius in HaxBall = 4 map units (KICK_RADIUS = 4.0).
+ * Impulse directed from player to ball via Math.atan2 -> Math.cos/sin -> 4-decimal rounding.
  */
 export function attemptKick(
   player: { x: number; y: number; vx: number; vy: number; radius: number },
   ball: { x: number; y: number; vx: number; vy: number; radius: number },
   input: { keys: PlayerInputKeys },
-  kickStrength: number = KICK_IMPULSE,
+  kickStrength: number = KICK_STRENGTH,
   kickRadius: number = KICK_RADIUS
 ): { impulseX: number; impulseY: number } | null {
   if (input.keys.kick === false) {
     return null;
   }
 
-  const dx = ball.x - player.x;
-  const dy = ball.y - player.y;
-  const distance = Math.hypot(dx, dy);
+  const dx = fpSub(ball.x, player.x);
+  const dy = fpSub(ball.y, player.y);
+  const distance = fpHypot(dx, dy);
+  const maxKickDist = fpAdd(fpAdd(player.radius, ball.radius), kickRadius);
 
-  if (distance >= player.radius + ball.radius + kickRadius || distance <= 0.0001) {
+  if (distance >= maxKickDist || distance <= 0.0001) {
     return null;
   }
 
-  const angle = Math.atan2(dy, dx);
-  const nx = round4(Math.cos(angle));
-  const ny = round4(Math.sin(angle));
+  const angle = fpAtan2(dy, dx);
+  const nx = fpCos(angle);
+  const ny = fpSin(angle);
 
-  const impulseX = Math.round(nx * kickStrength * 10000) / 10000;
-  const impulseY = Math.round(ny * kickStrength * 10000) / 10000;
+  const impulseX = fpMul(nx, kickStrength);
+  const impulseY = fpMul(ny, kickStrength);
 
-  // Preserve slight player momentum transfer while keeping 4-decimal determinism
-  const transferX = round4(player.vx * 0.25);
-  const transferY = round4(player.vy * 0.25);
+  const transferX = fpMul(player.vx, 0.25);
+  const transferY = fpMul(player.vy, 0.25);
 
-  ball.vx = Math.round((ball.vx * 0.2 + impulseX + transferX) * 10000) / 10000;
-  ball.vy = Math.round((ball.vy * 0.2 + impulseY + transferY) * 10000) / 10000;
+  ball.vx = fpAdd(fpAdd(fpMul(ball.vx, 0.2), impulseX), transferX);
+  ball.vy = fpAdd(fpAdd(fpMul(ball.vy, 0.2), impulseY), transferY);
 
   return { impulseX, impulseY };
 }
@@ -189,7 +454,7 @@ export function cloneWorldState(state: DeterministicWorldState): DeterministicWo
 }
 
 /**
- * 2. Deterministic Lockstep Physics Step (Fixed DT = 1/60s, integer Tick ID, 4-decimal rounding)
+ * Deterministic Lockstep Physics Step (Fixed DT = 1/60s, integer Tick ID, 4-decimal fixed-point rounding, zero outs)
  */
 export function stepDeterministicWorld(
   world: DeterministicWorldState,
@@ -201,14 +466,14 @@ export function stepDeterministicWorld(
     kickedByUid: null,
     wasPowershot: false,
     postHit: false,
+    wallHit: false,
     goalScoredBy: null,
-    outOrCornerTriggered: false,
   };
 
   world.tick += 1;
   const currentTick = world.tick;
 
-  // 1. Check expiration of Out/Corner pause or 3-second Post-Goal formation reset
+  // 1. Check expiration of 3-second Post-Goal formation reset
   if (world.eventState !== 'normal' && currentTick >= world.eventUntilTick) {
     const finishedEvent = world.eventState;
     world.eventState = 'normal';
@@ -234,6 +499,7 @@ export function stepDeterministicWorld(
           world.players[uid].vx = 0;
           world.players[uid].vy = 0;
           world.players[uid].kicking = false;
+          world.players[uid].kickLock = false;
         }
       });
       blueUids.forEach((uid, idx) => {
@@ -244,34 +510,18 @@ export function stepDeterministicWorld(
           world.players[uid].vx = 0;
           world.players[uid].vy = 0;
           world.players[uid].kicking = false;
+          world.players[uid].kickLock = false;
         }
       });
     }
   }
 
-  const isPausedForOutOrCorner =
-    (world.eventState === 'out' || world.eventState === 'corner') &&
-    currentTick < world.eventUntilTick;
-
-  if (world.awaitingSetPieceTouch && currentTick > world.setPieceExpireTick) {
-    world.awaitingSetPieceTouch = false;
-    world.isCornerSetPiece = false;
-  }
-
   const sortedUids = Object.keys(world.players).sort();
 
-  // 2. Step each player disc deterministically
+  // 2. Step each player disc deterministically (strictly per-operation 4-decimal rounding)
   for (const uid of sortedUids) {
     const pl = world.players[uid];
     const keys = inputs[uid] || EMPTY_INPUT_KEYS;
-
-    if (isPausedForOutOrCorner) {
-      pl.vx = 0;
-      pl.vy = 0;
-      pl.kicking = false;
-      pl.kickLock = false;
-      continue;
-    }
 
     let dirX = 0;
     let dirY = 0;
@@ -282,30 +532,30 @@ export function stepDeterministicWorld(
 
     const accel = keys.kick ? PLAYER_KICK_ACCEL : PLAYER_ACCEL;
     if (dirX !== 0 || dirY !== 0) {
-      const moveAngle = Math.atan2(dirY, dirX);
-      const ax = round4(Math.cos(moveAngle) * accel);
-      const ay = round4(Math.sin(moveAngle) * accel);
-      pl.vx = round4((pl.vx + ax) * PLAYER_DAMPING);
-      pl.vy = round4((pl.vy + ay) * PLAYER_DAMPING);
+      const moveAngle = fpAtan2(dirY, dirX);
+      const ax = fpMul(fpCos(moveAngle), accel);
+      const ay = fpMul(fpSin(moveAngle), accel);
+      pl.vx = fpMul(fpAdd(pl.vx, ax), PLAYER_DAMPING);
+      pl.vy = fpMul(fpAdd(pl.vy, ay), PLAYER_DAMPING);
     } else {
-      pl.vx = round4(pl.vx * PLAYER_DAMPING);
-      pl.vy = round4(pl.vy * PLAYER_DAMPING);
+      pl.vx = fpMul(pl.vx, PLAYER_DAMPING);
+      pl.vy = fpMul(pl.vy, PLAYER_DAMPING);
     }
 
-    const speed = Math.hypot(pl.vx, pl.vy);
+    const speed = fpHypot(pl.vx, pl.vy);
     if (speed > PLAYER_MAX_SPEED) {
-      const sAngle = Math.atan2(pl.vy, pl.vx);
-      pl.vx = round4(Math.cos(sAngle) * PLAYER_MAX_SPEED);
-      pl.vy = round4(Math.sin(sAngle) * PLAYER_MAX_SPEED);
+      const sAngle = fpAtan2(pl.vy, pl.vx);
+      pl.vx = fpMul(fpCos(sAngle), PLAYER_MAX_SPEED);
+      pl.vy = fpMul(fpSin(sAngle), PLAYER_MAX_SPEED);
     } else if (speed < 0.012 && dirX === 0 && dirY === 0) {
       pl.vx = 0;
       pl.vy = 0;
     }
 
-    pl.x = round4(pl.x + pl.vx);
-    pl.y = round4(pl.y + pl.vy);
+    pl.x = fpAdd(pl.x, pl.vx);
+    pl.y = fpAdd(pl.y, pl.vy);
 
-    // Arena outer wall bounds
+    // Arena outer wall bounds for player discs
     const minX = PLAYER_RADIUS + 12;
     const maxX = CANVAS_WIDTH - PLAYER_RADIUS - 12;
     const minY = PLAYER_RADIUS + 12;
@@ -317,90 +567,73 @@ export function stepDeterministicWorld(
 
     // Solid Goalpost Hitboxes for Player Disc
     for (const post of GOALPOSTS) {
-      const dxPost = pl.x - post.x;
-      const dyPost = pl.y - post.y;
-      const distPost = Math.hypot(dxPost, dyPost);
-      const minPostDist = PLAYER_RADIUS + POST_RADIUS;
+      const dxPost = fpSub(pl.x, post.x);
+      const dyPost = fpSub(pl.y, post.y);
+      const distPost = fpHypot(dxPost, dyPost);
+      const minPostDist = fpAdd(PLAYER_RADIUS, POST_RADIUS);
       if (distPost < minPostDist && distPost > 0.0001) {
-        const angle = Math.atan2(dyPost, dxPost);
-        const nx = round4(Math.cos(angle));
-        const ny = round4(Math.sin(angle));
-        pl.x = round4(post.x + nx * minPostDist);
-        pl.y = round4(post.y + ny * minPostDist);
-        const dot = pl.vx * nx + pl.vy * ny;
+        const angle = fpAtan2(dyPost, dxPost);
+        const nx = fpCos(angle);
+        const ny = fpSin(angle);
+        pl.x = fpAdd(post.x, fpMul(nx, minPostDist));
+        pl.y = fpAdd(post.y, fpMul(ny, minPostDist));
+        const dot = fpAdd(fpMul(pl.vx, nx), fpMul(pl.vy, ny));
         if (dot < 0) {
-          pl.vx = round4(pl.vx - dot * nx * 1.15);
-          pl.vy = round4(pl.vy - dot * ny * 1.15);
+          pl.vx = fpSub(pl.vx, fpMul(fpMul(dot, nx), 1.15));
+          pl.vy = fpSub(pl.vy, fpMul(fpMul(dot, ny), 1.15));
         }
       }
     }
 
-    // Set Piece 74px distance restriction for opposing team
-    const setPieceTeamHasPlayers =
-      world.eventTeam === 'red'
-        ? redUids.length > 0
-        : world.eventTeam === 'blue'
-          ? blueUids.length > 0
-          : false;
-
-    if (
-      world.awaitingSetPieceTouch &&
-      setPieceTeamHasPlayers &&
-      world.eventTeam !== 'none' &&
-      pl.team !== world.eventTeam
-    ) {
-      const dxB = pl.x - world.ball.x;
-      const dyB = pl.y - world.ball.y;
-      const distB = Math.hypot(dxB, dyB);
-      const minThrowInDist = 74;
-      if (distB < minThrowInDist && distB > 0.0001) {
-        const angle = Math.atan2(dyB, dxB);
-        pl.x = round4(world.ball.x + Math.cos(angle) * minThrowInDist);
-        pl.y = round4(world.ball.y + Math.sin(angle) * minThrowInDist);
-      }
-    }
-
-    pl.kicking = keys.kick;
     if (!keys.kick) {
       pl.kickLock = false;
     }
+    // White circle indicator is active only while holding kick BEFORE the kick locks
+    pl.kicking = Boolean(keys.kick && !pl.kickLock);
   }
 
-  // Player-to-Player Disc Collisions (Deterministic sorted order)
+  // 3. Player-to-Player Disc Collisions (Deterministic sorted order with momentum exchange)
   for (let i = 0; i < sortedUids.length; i++) {
     for (let j = i + 1; j < sortedUids.length; j++) {
       const a = world.players[sortedUids[i]];
       const b = world.players[sortedUids[j]];
-      const dx = b.x - a.x;
-      const dy = b.y - a.y;
-      const dist = Math.hypot(dx, dy);
+      const dx = fpSub(b.x, a.x);
+      const dy = fpSub(b.y, a.y);
+      const dist = fpHypot(dx, dy);
       const minDist = PLAYER_RADIUS * 2;
       if (dist < minDist && dist > 0.0001) {
-        const angle = Math.atan2(dy, dx);
-        const nx = round4(Math.cos(angle));
-        const ny = round4(Math.sin(angle));
-        const overlap = round4((minDist - dist) * 0.5);
-        a.x = round4(a.x - nx * overlap);
-        a.y = round4(a.y - ny * overlap);
-        b.x = round4(b.x + nx * overlap);
-        b.y = round4(b.y + ny * overlap);
+        const angle = fpAtan2(dy, dx);
+        const nx = fpCos(angle);
+        const ny = fpSin(angle);
+        const overlap = fpMul(fpSub(minDist, dist), 0.5);
+        a.x = fpSub(a.x, fpMul(nx, overlap));
+        a.y = fpSub(a.y, fpMul(ny, overlap));
+        b.x = fpAdd(b.x, fpMul(nx, overlap));
+        b.y = fpAdd(b.y, fpMul(ny, overlap));
+
+        const relVx = fpSub(a.vx, b.vx);
+        const relVy = fpSub(a.vy, b.vy);
+        const normalVel = fpAdd(fpMul(relVx, nx), fpMul(relVy, ny));
+        if (normalVel > 0) {
+          const impulse = fpMul(normalVel, 0.55);
+          a.vx = fpSub(a.vx, fpMul(impulse, nx));
+          a.vy = fpSub(a.vy, fpMul(impulse, ny));
+          b.vx = fpAdd(b.vx, fpMul(impulse, nx));
+          b.vy = fpAdd(b.vy, fpMul(impulse, ny));
+        }
       }
     }
   }
 
-  if (isPausedForOutOrCorner) {
-    return events;
-  }
-
-  // 3. Powershot Hold Timer (in deterministic ticks: 240 ticks = 4s hold, 150 ticks = 2.5s window)
-  const grayCircleHoldDist = PLAYER_RADIUS + BALL_RADIUS + KICK_RADIUS;
+  // 4. Powershot Hold Timer & Player-to-Ball Kick (`attemptKick`) + Disc-to-Ball Collision
+  const grayCircleHoldDist = fpAdd(fpAdd(PLAYER_RADIUS, BALL_RADIUS), KICK_RADIUS);
   let holderUid = '';
   let closestGrayDist = Infinity;
 
   if (world.eventState === 'normal' || world.eventState === 'goal') {
     for (const uid of sortedUids) {
       const pl = world.players[uid];
-      const d = Math.hypot(world.ball.x - pl.x, world.ball.y - pl.y);
+      const d = fpHypot(fpSub(world.ball.x, pl.x), fpSub(world.ball.y, pl.y));
       if (d <= grayCircleHoldDist && d < closestGrayDist) {
         closestGrayDist = d;
         holderUid = uid;
@@ -423,7 +656,6 @@ export function stepDeterministicWorld(
       }
     }
 
-    // 4. Player-to-Ball Kick (`attemptKick`) & Pure 2D Normal Collision
     for (const uid of sortedUids) {
       const pl = world.players[uid];
       const keys = inputs[uid] || EMPTY_INPUT_KEYS;
@@ -438,11 +670,7 @@ export function stepDeterministicWorld(
         heldTicks >= POWERSHOT_CHARGE_TICKS &&
         heldTicks <= POWERSHOT_CHARGE_TICKS + POWERSHOT_WINDOW_TICKS;
 
-      const kickStrength = hasChargedPowershot
-        ? POWERSHOT_IMPULSE
-        : world.isCornerSetPiece
-          ? CORNER_KICK_IMPULSE
-          : KICK_IMPULSE;
+      const kickStrength = hasChargedPowershot ? POWERSHOT_IMPULSE : KICK_STRENGTH;
 
       if (!pl.kickLock) {
         const kickRes = attemptKick(
@@ -454,9 +682,8 @@ export function stepDeterministicWorld(
         );
         if (kickRes) {
           pl.kickLock = true;
+          pl.kicking = false;
           world.lastTouchTeam = pl.team;
-          world.awaitingSetPieceTouch = false;
-          world.isCornerSetPiece = false;
           events.kickedByUid = uid;
           events.wasPowershot = hasChargedPowershot;
 
@@ -468,68 +695,71 @@ export function stepDeterministicWorld(
         }
       }
 
-      // Pure 2D Normal Circle Collision (Independent ball physics, zero sideways sticking)
-      const dx = world.ball.x - pl.x;
-      const dy = world.ball.y - pl.y;
-      const dist = Math.hypot(dx, dy);
-      const minDist = PLAYER_RADIUS + BALL_RADIUS;
+      // Pure 2D Normal Disc-to-Ball Collision
+      const dx = fpSub(world.ball.x, pl.x);
+      const dy = fpSub(world.ball.y, pl.y);
+      const dist = fpHypot(dx, dy);
+      const minDist = fpAdd(PLAYER_RADIUS, BALL_RADIUS);
 
       if (dist < minDist && dist > 0.0001) {
-        const angle = Math.atan2(dy, dx);
-        const nx = round4(Math.cos(angle));
-        const ny = round4(Math.sin(angle));
-        const overlap = round4(minDist - dist);
+        const angle = fpAtan2(dy, dx);
+        const nx = fpCos(angle);
+        const ny = fpSin(angle);
 
-        world.ball.x = round4(world.ball.x + nx * overlap * 0.88);
-        world.ball.y = round4(world.ball.y + ny * overlap * 0.88);
-        pl.x = round4(pl.x - nx * overlap * 0.12);
-        pl.y = round4(pl.y - ny * overlap * 0.12);
+        world.ball.x = fpAdd(pl.x, fpMul(nx, minDist));
+        world.ball.y = fpAdd(pl.y, fpMul(ny, minDist));
 
-        const relVx = world.ball.vx - pl.vx;
-        const relVy = world.ball.vy - pl.vy;
-        const normalVel = relVx * nx + relVy * ny;
+        const relVx = fpSub(world.ball.vx, pl.vx);
+        const relVy = fpSub(world.ball.vy, pl.vy);
+        const normalVel = fpAdd(fpMul(relVx, nx), fpMul(relVy, ny));
 
         if (normalVel < 0) {
-          const restitution = 0.12;
-          const impulse = round4(-(1 + restitution) * normalVel);
-          world.ball.vx = round4(world.ball.vx + impulse * nx);
-          world.ball.vy = round4(world.ball.vy + impulse * ny);
+          const restitution = -normalVel > 1.85 ? 0.08 : 0.0;
+          const impulse = fpMul(-(1 + restitution), normalVel);
+          world.ball.vx = fpAdd(world.ball.vx, fpMul(impulse, nx));
+          world.ball.vy = fpAdd(world.ball.vy, fpMul(impulse, ny));
         }
 
         world.lastTouchTeam = pl.team;
-        world.awaitingSetPieceTouch = false;
-        world.isCornerSetPiece = false;
       }
     }
   }
 
-  // 5. Sub-stepped Ball Movement & Goalpost / Goal Line / Out / Corner Detection
+  // 5. Sub-stepped Ball Movement, Wall Segment Elastic Reflection (NO OUTS!), Goalposts & Goal Line
   const subSteps = 2;
   for (let step = 0; step < subSteps; step++) {
-    world.ball.x = round4(world.ball.x + world.ball.vx / subSteps);
-    world.ball.y = round4(world.ball.y + world.ball.vy / subSteps);
+    world.ball.x = fpAdd(world.ball.x, fpDiv(world.ball.vx, subSteps));
+    world.ball.y = fpAdd(world.ball.y, fpDiv(world.ball.vy, subSteps));
 
+    // Elastic reflection off pitch wall segments (bCoef = 1.0, wall = true)
+    if (world.eventState === 'normal') {
+      if (collideBallWithWallSegments(world.ball, PITCH_WALL_SEGMENTS)) {
+        events.wallHit = true;
+      }
+    }
+
+    // Goalpost Circle Collisions
     for (const post of GOALPOSTS) {
-      const dx = world.ball.x - post.x;
-      const dy = world.ball.y - post.y;
-      const dist = Math.hypot(dx, dy);
-      const minDist = BALL_RADIUS + POST_RADIUS;
+      const dx = fpSub(world.ball.x, post.x);
+      const dy = fpSub(world.ball.y, post.y);
+      const dist = fpHypot(dx, dy);
+      const minDist = fpAdd(BALL_RADIUS, POST_RADIUS);
       if (dist < minDist && dist > 0.0001) {
-        const angle = Math.atan2(dy, dx);
-        const nx = round4(Math.cos(angle));
-        const ny = round4(Math.sin(angle));
-        world.ball.x = round4(post.x + nx * minDist);
-        world.ball.y = round4(post.y + ny * minDist);
-        const dot = world.ball.vx * nx + world.ball.vy * ny;
+        const angle = fpAtan2(dy, dx);
+        const nx = fpCos(angle);
+        const ny = fpSin(angle);
+        world.ball.x = fpAdd(post.x, fpMul(nx, minDist));
+        world.ball.y = fpAdd(post.y, fpMul(ny, minDist));
+        const dot = fpAdd(fpMul(world.ball.vx, nx), fpMul(world.ball.vy, ny));
         if (dot < 0) {
-          world.ball.vx = round4((world.ball.vx - 2 * dot * nx) * 0.82);
-          world.ball.vy = round4((world.ball.vy - 2 * dot * ny) * 0.82);
+          world.ball.vx = fpMul(fpSub(world.ball.vx, fpMul(2 * dot, nx)), 0.85);
+          world.ball.vy = fpMul(fpSub(world.ball.vy, fpMul(2 * dot, ny)), 0.85);
           events.postHit = true;
         }
       }
     }
 
-    // Check for Goal
+    // Check for Goal (ball crosses goal line between GOAL_TOP and GOAL_BOTTOM)
     if (world.eventState === 'normal') {
       const inGoalY = world.ball.y > GOAL_TOP && world.ball.y < GOAL_BOTTOM;
       if (inGoalY && world.ball.x + BALL_RADIUS * 0.6 < FIELD_LEFT) {
@@ -537,8 +767,6 @@ export function stepDeterministicWorld(
         world.eventState = 'goal';
         world.eventTeam = 'blue';
         world.eventUntilTick = currentTick + GOAL_PAUSE_TICKS;
-        world.awaitingSetPieceTouch = false;
-        world.isCornerSetPiece = false;
         world.controllingUid = '';
         world.controlStartedTick = 0;
         events.goalScoredBy = 'blue';
@@ -547,8 +775,6 @@ export function stepDeterministicWorld(
         world.eventState = 'goal';
         world.eventTeam = 'red';
         world.eventUntilTick = currentTick + GOAL_PAUSE_TICKS;
-        world.awaitingSetPieceTouch = false;
-        world.isCornerSetPiece = false;
         world.controllingUid = '';
         world.controlStartedTick = 0;
         events.goalScoredBy = 'red';
@@ -556,20 +782,20 @@ export function stepDeterministicWorld(
     }
   }
 
-  // Ball damping & max speed clamp (4-decimal rounded)
-  world.ball.vx = round4(world.ball.vx * BALL_DAMPING);
-  world.ball.vy = round4(world.ball.vy * BALL_DAMPING);
-  const bSpeed = Math.hypot(world.ball.vx, world.ball.vy);
+  // Ball damping & max speed clamp (4-decimal fixed-point rounded)
+  world.ball.vx = fpMul(world.ball.vx, BALL_DAMPING);
+  world.ball.vy = fpMul(world.ball.vy, BALL_DAMPING);
+  const bSpeed = fpHypot(world.ball.vx, world.ball.vy);
   if (bSpeed > BALL_MAX_SPEED) {
-    const bAngle = Math.atan2(world.ball.vy, world.ball.vx);
-    world.ball.vx = round4(Math.cos(bAngle) * BALL_MAX_SPEED);
-    world.ball.vy = round4(Math.sin(bAngle) * BALL_MAX_SPEED);
+    const bAngle = fpAtan2(world.ball.vy, world.ball.vx);
+    world.ball.vx = fpMul(fpCos(bAngle), BALL_MAX_SPEED);
+    world.ball.vy = fpMul(fpSin(bAngle), BALL_MAX_SPEED);
   } else if (bSpeed < 0.03) {
     world.ball.vx = 0;
     world.ball.vy = 0;
   }
 
-  // Soft goal-pocket containment inside deterministic world so ball stays in goal pocket
+  // Goal-pocket containment when ball is inside left or right goal net
   const inGoalMouthY =
     world.ball.y > GOAL_TOP - BALL_RADIUS &&
     world.ball.y < GOAL_BOTTOM + BALL_RADIUS;
@@ -577,90 +803,27 @@ export function stepDeterministicWorld(
     const minBackX = FIELD_LEFT - 56 + BALL_RADIUS;
     if (world.ball.x < minBackX) {
       world.ball.x = round4(minBackX);
-      world.ball.vx = round4(Math.abs(world.ball.vx) * 0.08);
-      world.ball.vy = round4(world.ball.vy * 0.5);
+      world.ball.vx = fpMul(Math.abs(world.ball.vx), 0.15);
     }
     if (world.ball.y - BALL_RADIUS < GOAL_TOP) {
       world.ball.y = round4(GOAL_TOP + BALL_RADIUS);
-      world.ball.vy = round4(Math.abs(world.ball.vy) * 0.12);
+      world.ball.vy = fpMul(Math.abs(world.ball.vy), 0.25);
     } else if (world.ball.y + BALL_RADIUS > GOAL_BOTTOM) {
       world.ball.y = round4(GOAL_BOTTOM - BALL_RADIUS);
-      world.ball.vy = round4(-Math.abs(world.ball.vy) * 0.12);
+      world.ball.vy = fpMul(-Math.abs(world.ball.vy), 0.25);
     }
   } else if (inGoalMouthY && world.ball.x > FIELD_RIGHT) {
     const maxBackX = FIELD_RIGHT + 56 - BALL_RADIUS;
     if (world.ball.x > maxBackX) {
       world.ball.x = round4(maxBackX);
-      world.ball.vx = round4(-Math.abs(world.ball.vx) * 0.08);
-      world.ball.vy = round4(world.ball.vy * 0.5);
+      world.ball.vx = fpMul(-Math.abs(world.ball.vx), 0.15);
     }
     if (world.ball.y - BALL_RADIUS < GOAL_TOP) {
       world.ball.y = round4(GOAL_TOP + BALL_RADIUS);
-      world.ball.vy = round4(Math.abs(world.ball.vy) * 0.12);
+      world.ball.vy = fpMul(Math.abs(world.ball.vy), 0.25);
     } else if (world.ball.y + BALL_RADIUS > GOAL_BOTTOM) {
       world.ball.y = round4(GOAL_BOTTOM - BALL_RADIUS);
-      world.ball.vy = round4(-Math.abs(world.ball.vy) * 0.12);
-    }
-  }
-
-  // Check Corner & Touchline Out during normal play
-  if (world.eventState === 'normal') {
-    const inGoalY = world.ball.y > GOAL_TOP && world.ball.y < GOAL_BOTTOM;
-    const crossedLeftOut = !inGoalY && world.ball.x + BALL_RADIUS < FIELD_LEFT;
-    const crossedRightOut = !inGoalY && world.ball.x - BALL_RADIUS > FIELD_RIGHT;
-
-    if (crossedLeftOut || crossedRightOut) {
-      const cornerX = crossedLeftOut ? FIELD_LEFT + 6 : FIELD_RIGHT - 6;
-      const cornerY =
-        world.ball.y < FIELD_CENTER_Y ? FIELD_TOP + 6 : FIELD_BOTTOM - 6;
-      const cornerTeam: EventTeam =
-        world.lastTouchTeam === 'red'
-          ? 'blue'
-          : world.lastTouchTeam === 'blue'
-            ? 'red'
-            : crossedLeftOut
-              ? 'blue'
-              : 'red';
-
-      world.eventState = 'corner';
-      world.eventTeam = cornerTeam;
-      world.eventUntilTick = currentTick + OUT_PAUSE_TICKS;
-      world.ball.x = round4(cornerX);
-      world.ball.y = round4(cornerY);
-      world.ball.vx = 0;
-      world.ball.vy = 0;
-      world.awaitingSetPieceTouch = true;
-      world.isCornerSetPiece = true;
-      world.setPieceExpireTick = currentTick + OUT_PAUSE_TICKS + SET_PIECE_EXPIRE_TICKS;
-      events.outOrCornerTriggered = true;
-    } else {
-      const crossedTop = world.ball.y + BALL_RADIUS < FIELD_TOP;
-      const crossedBottom = world.ball.y - BALL_RADIUS > FIELD_BOTTOM;
-      if (crossedTop || crossedBottom) {
-        const exitX = Math.max(
-          FIELD_LEFT + 36,
-          Math.min(FIELD_RIGHT - 36, world.ball.x)
-        );
-        const returnY = crossedTop ? FIELD_TOP + 4 : FIELD_BOTTOM - 4;
-        const throwTeam: EventTeam =
-          world.lastTouchTeam === 'red'
-            ? 'blue'
-            : world.lastTouchTeam === 'blue'
-              ? 'red'
-              : 'red';
-
-        world.eventState = 'out';
-        world.eventTeam = throwTeam;
-        world.eventUntilTick = currentTick + OUT_PAUSE_TICKS;
-        world.ball.x = round4(exitX);
-        world.ball.y = round4(returnY);
-        world.ball.vx = 0;
-        world.ball.vy = 0;
-        world.awaitingSetPieceTouch = true;
-        world.isCornerSetPiece = false;
-        world.setPieceExpireTick = currentTick + OUT_PAUSE_TICKS + SET_PIECE_EXPIRE_TICKS;
-        events.outOrCornerTriggered = true;
-      }
+      world.ball.vy = fpMul(-Math.abs(world.ball.vy), 0.25);
     }
   }
 
@@ -668,7 +831,7 @@ export function stepDeterministicWorld(
 }
 
 /**
- * 3. Extrapolation (`extrapolateWorld`)
+ * Extrapolation (`extrapolateWorld`)
  * Simulates the world forward by `extrapolationMs` (0..200ms) from the last confirmed state.
  */
 export function extrapolateWorld(
@@ -690,9 +853,91 @@ export function extrapolateWorld(
   return sim;
 }
 
+// ============================================================================
+// MODULE (c): Binary ArrayBuffer WebRTC DataChannel + Input Queue + Timeouts
+// ============================================================================
+const BIN_PKT_CLIENT_INPUT = 0x01;
+const BIN_PKT_HOST_FRAME = 0x02;
+
 /**
- * 5 & 6. WebRTC P2P DataChannel + Firebase Signaling + Lockstep Timeout Manager
+ * Encodes a single 60Hz client input packet into a compact 6-byte binary ArrayBuffer:
+ * [0]: 0x01 (BIN_PKT_CLIENT_INPUT)
+ * [1..4]: Uint32 tick (little-endian)
+ * [5]: Uint8 keyMask (bit0=up, bit1=down, bit2=left, bit3=right, bit4=kick)
  */
+export function encodeBinaryClientInput(tick: number, keys: PlayerInputKeys): ArrayBuffer {
+  const buf = new ArrayBuffer(6);
+  const view = new DataView(buf);
+  view.setUint8(0, BIN_PKT_CLIENT_INPUT);
+  view.setUint32(1, tick >>> 0, true);
+  view.setUint8(5, encodeKeyMask(keys));
+  return buf;
+}
+
+export function decodeBinaryClientInput(
+  buf: ArrayBuffer
+): { tick: number; keys: PlayerInputKeys; keyMask: number } | null {
+  if (buf.byteLength < 6) return null;
+  const view = new DataView(buf);
+  if (view.getUint8(0) !== BIN_PKT_CLIENT_INPUT) return null;
+  const tick = view.getUint32(1, true);
+  const keyMask = view.getUint8(5);
+  return {
+    tick,
+    keyMask,
+    keys: decodeKeyMask(keyMask),
+  };
+}
+
+/**
+ * Encodes Host's confirmed frame inputs for all players into a compact binary ArrayBuffer:
+ * [0]: 0x02 (BIN_PKT_HOST_FRAME)
+ * [1..4]: Uint32 tick (little-endian)
+ * [5]: Uint8 playerCount
+ * For each player: [slotIdx: Uint8, keyMask: Uint8] (2 bytes per player)
+ */
+export function encodeBinaryHostFrameInputs(
+  tick: number,
+  orderedMemberUids: string[],
+  frameInputs: Record<string, PlayerInputKeys>
+): ArrayBuffer {
+  const count = Math.min(16, orderedMemberUids.length);
+  const buf = new ArrayBuffer(6 + count * 2);
+  const view = new DataView(buf);
+  view.setUint8(0, BIN_PKT_HOST_FRAME);
+  view.setUint32(1, tick >>> 0, true);
+  view.setUint8(5, count);
+  for (let i = 0; i < count; i++) {
+    const uid = orderedMemberUids[i];
+    const keys = frameInputs[uid] || EMPTY_INPUT_KEYS;
+    view.setUint8(6 + i * 2, i);
+    view.setUint8(6 + i * 2 + 1, encodeKeyMask(keys));
+  }
+  return buf;
+}
+
+export function decodeBinaryHostFrameInputs(
+  buf: ArrayBuffer,
+  orderedMemberUids: string[]
+): { tick: number; inputs: Record<string, PlayerInputKeys> } | null {
+  if (buf.byteLength < 6) return null;
+  const view = new DataView(buf);
+  if (view.getUint8(0) !== BIN_PKT_HOST_FRAME) return null;
+  const tick = view.getUint32(1, true);
+  const count = view.getUint8(5);
+  if (buf.byteLength < 6 + count * 2) return null;
+  const inputs: Record<string, PlayerInputKeys> = {};
+  for (let i = 0; i < count; i++) {
+    const slotIdx = view.getUint8(6 + i * 2);
+    const keyMask = view.getUint8(6 + i * 2 + 1);
+    const uid = orderedMemberUids[slotIdx];
+    if (uid) {
+      inputs[uid] = decodeKeyMask(keyMask);
+    }
+  }
+  return { tick, inputs };
+}
+
 export interface WebRTCSignalMessage {
   roomId: string;
   fromUid: string;
@@ -731,8 +976,13 @@ export interface FastAuthoritativeSnapshot {
   >;
 }
 
-type DataChannelPacket =
-  | ({ kind: 'input' } & InputPacket)
+type DataChannelControlPacket =
+  | {
+      kind: 'frame';
+      tick: number;
+      inputs: Record<string, PlayerInputKeys>;
+      snap?: FastAuthoritativeSnapshot;
+    }
   | {
       kind: 'client_ball';
       playerId: string;
@@ -741,12 +991,6 @@ type DataChannelPacket =
       ballVx: number;
       ballVy: number;
       lastTouchTeam: EventTeam;
-    }
-  | {
-      kind: 'frame';
-      tick: number;
-      inputs: Record<string, PlayerInputKeys>;
-      snap?: FastAuthoritativeSnapshot;
     }
   | {
       kind: 'state_seed';
@@ -779,8 +1023,14 @@ export class WebRTCLockstepSession {
   private desynced = false;
   private desyncReason = '';
   private targetMemberUids: string[] = [];
+  private lastSentInputTick = -1;
+  private clientLastProcessedTick = -1;
+  private clientFutureFrameQueue = new Map<
+    number,
+    { inputs: Record<string, PlayerInputKeys>; snap?: FastAuthoritativeSnapshot }
+  >();
 
-  // Map of peerUid -> RTCPeerConnection & RTCDataChannel
+  // Map of peerUid -> RTCPeerConnection & RTCDataChannel + Host Lockstep Input Queue
   private peers = new Map<
     string,
     {
@@ -789,8 +1039,8 @@ export class WebRTCLockstepSession {
       open: boolean;
       createdAtPerf: number;
       pendingCandidates: RTCIceCandidateInit[];
-      missingTicks: number;
-      waitTicksForCurrentFrame: number;
+      ticksSinceLastInput: number;
+      lastProcessedTick: number;
       lastInputAtPerf: number;
       lastInputKeys: PlayerInputKeys;
       inputBuffer: Map<number, PlayerInputKeys>;
@@ -864,7 +1114,7 @@ export class WebRTCLockstepSession {
         this.sendPingProbes();
       }, PING_INTERVAL_MS);
 
-      // Fast WebRTC Handshake Retry if peer DataChannel is not open yet (> 3.2s)
+      // Fast WebRTC Handshake Retry if peer DataChannel is not open yet (> 3.0s)
       this.handshakeRetryId = window.setInterval(() => {
         const nowPerf = performance.now();
         for (const uid of this.targetMemberUids) {
@@ -876,7 +1126,7 @@ export class WebRTCLockstepSession {
               (entry.pc.connectionState === 'failed' ||
                 entry.pc.connectionState === 'closed' ||
                 entry.pc.iceConnectionState === 'failed' ||
-                nowPerf - entry.createdAtPerf > 3200));
+                nowPerf - entry.createdAtPerf > 3000));
           if (isStalled) {
             if (!this.isHost) {
               this.onSignalOut({
@@ -891,18 +1141,14 @@ export class WebRTCLockstepSession {
             }
           }
         }
-      }, 1800);
+      }, 1600);
     }
   }
 
-  /**
-   * 3. setExtrapolation(extrapolationMs) (analogous to node-haxball)
-   * Validates 0..200ms; if > 200ms, Host triggers desync.
-   */
   public setExtrapolation(ms: number) {
     this.extrapolationMs = Math.round(ms);
     if (!this.isHost) {
-      this.broadcastToPeers({
+      this.broadcastControlToPeers({
         kind: 'extrapolation',
         playerId: this.localUid,
         extrapolationMs: this.extrapolationMs,
@@ -927,6 +1173,25 @@ export class WebRTCLockstepSession {
     return { ...this.playerPings };
   }
 
+  /**
+   * Elastic Clock: If the incoming input queue has > 2 buffered ticks, slightly accelerate
+   * the local tick interval by fractions of a millisecond (e.g. 16.25ms instead of 16.6667ms)
+   * so the queue never bloats.
+   */
+  public getElasticStepMs(): number {
+    let maxBuffered = this.clientFutureFrameQueue.size;
+    if (this.isHost) {
+      for (const entry of this.peers.values()) {
+        if (entry.inputBuffer.size > maxBuffered) {
+          maxBuffered = entry.inputBuffer.size;
+        }
+      }
+    }
+    if (maxBuffered > 3) return LOCKSTEP_STEP_MS * 0.94; // ~15.67ms (catch up smoothly)
+    if (maxBuffered > 2) return LOCKSTEP_STEP_MS * 0.975; // ~16.25ms
+    return LOCKSTEP_STEP_MS; // 16.6667ms (exact 60 Hz)
+  }
+
   public connectToMemberPeers(memberUids: string[]) {
     this.targetMemberUids = [...memberUids];
     for (const uid of memberUids) {
@@ -936,7 +1201,6 @@ export class WebRTCLockstepSession {
         if (this.isHost) {
           this.initiateHostPeerConnection(uid);
         } else {
-          // Client announces readiness so Host sends WebRTC offer
           this.onSignalOut({
             roomId: this.roomId,
             fromUid: this.localUid,
@@ -949,11 +1213,6 @@ export class WebRTCLockstepSession {
     }
   }
 
-  /**
-   * 5. Create RTCPeerConnection strictly with Google STUN server:
-   * { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
-   * Host creates Data Channel: createDataChannel('gameChannel', { ordered: false, maxRetransmits: 0 })
-   */
   private createPeerEntry(peerUid: string) {
     const existing = this.peers.get(peerUid);
     if (existing) {
@@ -975,8 +1234,8 @@ export class WebRTCLockstepSession {
       open: false,
       createdAtPerf: performance.now(),
       pendingCandidates: [] as RTCIceCandidateInit[],
-      missingTicks: 0,
-      waitTicksForCurrentFrame: 0,
+      ticksSinceLastInput: 0,
+      lastProcessedTick: -1,
       lastInputAtPerf: performance.now(),
       lastInputKeys: { ...EMPTY_INPUT_KEYS },
       inputBuffer: new Map<number, PlayerInputKeys>(),
@@ -1017,10 +1276,11 @@ export class WebRTCLockstepSession {
     entry: NonNullable<ReturnType<typeof this.peers.get>>,
     dc: RTCDataChannel
   ) {
+    dc.binaryType = 'arraybuffer';
     entry.dc = dc;
     dc.onopen = () => {
       entry.open = true;
-      entry.missingTicks = 0;
+      entry.ticksSinceLastInput = 0;
       entry.lastInputAtPerf = performance.now();
       this.sendPingProbes();
     };
@@ -1028,14 +1288,78 @@ export class WebRTCLockstepSession {
       entry.open = false;
     };
     dc.onmessage = (ev) => {
-      if (typeof ev.data !== 'string') return;
-      try {
-        const pkt = JSON.parse(ev.data) as DataChannelPacket;
-        this.handleDataChannelPacket(peerUid, entry, pkt);
-      } catch {
-        // ignore malformed packet
+      // 1. Fast Path: Binary ArrayBuffer Packet (6-byte Client Input or Binary Host Frame)
+      if (ev.data instanceof ArrayBuffer) {
+        this.handleBinaryPacket(peerUid, entry, ev.data);
+        return;
+      }
+      // 2. Control Packet Path (Ping/Pong, Extrapolation, State Seed)
+      if (typeof ev.data === 'string') {
+        try {
+          const pkt = JSON.parse(ev.data) as DataChannelControlPacket;
+          this.handleControlPacket(peerUid, entry, pkt);
+        } catch {
+          // ignore malformed packet
+        }
       }
     };
+  }
+
+  private handleBinaryPacket(
+    peerUid: string,
+    entry: NonNullable<ReturnType<typeof this.peers.get>>,
+    buf: ArrayBuffer
+  ) {
+    if (buf.byteLength < 6) return;
+    const view = new DataView(buf);
+    const kind = view.getUint8(0);
+
+    if (kind === BIN_PKT_CLIENT_INPUT && this.isHost) {
+      const decoded = decodeBinaryClientInput(buf);
+      if (!decoded) return;
+
+      // Ignore duplicate / already processed ticks
+      if (decoded.tick <= entry.lastProcessedTick) {
+        return;
+      }
+
+      entry.ticksSinceLastInput = 0;
+      entry.lastInputAtPerf = performance.now();
+      entry.lastInputKeys = decoded.keys;
+      entry.inputBuffer.set(decoded.tick, decoded.keys);
+
+      // Keep buffer bounded (drain oldest if > 8 ticks ahead)
+      if (entry.inputBuffer.size > 8) {
+        const sortedTicks = Array.from(entry.inputBuffer.keys()).sort((a, b) => a - b);
+        while (sortedTicks.length > 4) {
+          const oldTick = sortedTicks.shift()!;
+          entry.inputBuffer.delete(oldTick);
+        }
+      }
+
+      if (this.onClientInputStateCallback) {
+        this.onClientInputStateCallback({
+          tick: decoded.tick,
+          playerId: peerUid,
+          keys: decoded.keys,
+          kicking: decoded.keys.kick,
+          keyMask: decoded.keyMask,
+        });
+      }
+      return;
+    }
+
+    if (kind === BIN_PKT_HOST_FRAME && !this.isHost) {
+      const decoded = decodeBinaryHostFrameInputs(buf, this.targetMemberUids);
+      if (!decoded) return;
+      if (decoded.tick <= this.clientLastProcessedTick) {
+        return; // Ignore duplicate tick
+      }
+      this.clientLastProcessedTick = decoded.tick;
+      if (this.onFrameInputsCallback) {
+        this.onFrameInputsCallback(decoded.tick, decoded.inputs);
+      }
+    }
   }
 
   private async flushPendingCandidates(
@@ -1063,8 +1387,7 @@ export class WebRTCLockstepSession {
         existing.pc.connectionState === 'failed' ||
         existing.pc.connectionState === 'closed' ||
         existing.pc.iceConnectionState === 'failed';
-      // Never kill an active handshake that is less than 3 seconds old!
-      if (!force && !failed && ageMs < 3000) {
+      if (!force && !failed && ageMs < 2800) {
         return;
       }
     }
@@ -1154,7 +1477,6 @@ export class WebRTCLockstepSession {
             // ignore
           }
         } else {
-          // Queue ICE candidate until remoteDescription is set!
           entry.pendingCandidates.push(msg.candidate);
         }
       }
@@ -1167,42 +1489,33 @@ export class WebRTCLockstepSession {
     if (!entry) {
       entry = this.createPeerEntry(pkt.playerId);
     }
-    entry.missingTicks = 0;
-    entry.waitTicksForCurrentFrame = 0;
+    if (pkt.tick <= entry.lastProcessedTick) return;
+    entry.ticksSinceLastInput = 0;
     entry.lastInputAtPerf = performance.now();
     entry.lastInputKeys = pkt.keys;
     entry.inputBuffer.set(pkt.tick, pkt.keys);
-    if (entry.inputBuffer.size > 120) {
+    if (entry.inputBuffer.size > 8) {
       const firstKey = entry.inputBuffer.keys().next().value;
       if (typeof firstKey === 'number') entry.inputBuffer.delete(firstKey);
     }
   }
 
-  private handleDataChannelPacket(
+  private handleControlPacket(
     peerUid: string,
     entry: NonNullable<ReturnType<typeof this.peers.get>>,
-    pkt: DataChannelPacket
+    pkt: DataChannelControlPacket
   ) {
-    if (pkt.kind === 'input' && this.isHost) {
-      entry.missingTicks = 0;
-      entry.waitTicksForCurrentFrame = 0;
-      entry.lastInputAtPerf = performance.now();
-      entry.lastInputKeys = pkt.keys;
-      entry.inputBuffer.set(pkt.tick, pkt.keys);
-      if (entry.inputBuffer.size > 120) {
-        const firstKey = entry.inputBuffer.keys().next().value;
-        if (typeof firstKey === 'number') entry.inputBuffer.delete(firstKey);
+    if (pkt.kind === 'frame' && !this.isHost) {
+      if (pkt.tick <= this.clientLastProcessedTick && !pkt.snap) {
+        return;
       }
-      if (this.onClientInputStateCallback) {
-        this.onClientInputStateCallback(pkt);
+      this.clientLastProcessedTick = Math.max(this.clientLastProcessedTick, pkt.tick);
+      if (this.onFrameInputsCallback) {
+        this.onFrameInputsCallback(pkt.tick, pkt.inputs, pkt.snap);
       }
     } else if (pkt.kind === 'client_ball' && this.isHost) {
       if (this.onClientBallCallback) {
         this.onClientBallCallback(pkt);
-      }
-    } else if (pkt.kind === 'frame' && !this.isHost) {
-      if (this.onFrameInputsCallback) {
-        this.onFrameInputsCallback(pkt.tick, pkt.inputs, pkt.snap);
       }
     } else if (pkt.kind === 'state_seed' && !this.isHost) {
       if (this.onStateSeedCallback) {
@@ -1210,8 +1523,7 @@ export class WebRTCLockstepSession {
       }
     } else if (pkt.kind === 'extrapolation' && this.isHost) {
       if (pkt.extrapolationMs < 0 || pkt.extrapolationMs > MAX_EXTRAPOLATION_MS) {
-        // Disconnect desynced client exceeding 200ms extrapolation
-        this.sendToPeer(peerUid, {
+        this.sendControlToPeer(peerUid, {
           kind: 'desync',
           reason: `Extrapolation ${pkt.extrapolationMs}ms exceeds maximum allowed 200ms.`,
         });
@@ -1221,7 +1533,7 @@ export class WebRTCLockstepSession {
       this.desynced = true;
       this.desyncReason = pkt.reason;
     } else if (pkt.kind === 'ping') {
-      this.sendToPeer(peerUid, {
+      this.sendControlToPeer(peerUid, {
         kind: 'pong',
         t0: pkt.t0,
         pings: this.playerPings,
@@ -1242,12 +1554,13 @@ export class WebRTCLockstepSession {
   }
 
   /**
-   * 1. Client sends pure input packet `{ tick, playerId, keys }` (+ optional P2P kinematics) to Host every tick (60 Hz)
+   * Client sends strictly ONE 6-byte binary ArrayBuffer input packet per 60Hz physics tick.
+   * Never sends packets faster than the 60Hz tick counter.
    */
   public sendClientInput(
     tick: number,
     keys: PlayerInputKeys,
-    state?: {
+    _state?: {
       x: number;
       y: number;
       vx: number;
@@ -1256,19 +1569,14 @@ export class WebRTCLockstepSession {
       keyMask: number;
     }
   ) {
-    const pkt: DataChannelPacket = {
-      kind: 'input',
-      tick,
-      playerId: this.localUid,
-      keys,
-      ...(state || {}),
-    };
-    this.broadcastToPeers(pkt);
+    if (tick <= this.lastSentInputTick) {
+      return; // Strictly 1 packet per physics tick (60 Hz)
+    }
+    this.lastSentInputTick = tick;
+    const binBuf = encodeBinaryClientInput(tick, keys);
+    this.broadcastBinaryToPeers(binBuf);
   }
 
-  /**
-   * Fast UDP-like ball touch relay over WebRTC DataChannel when Client touches/kicks ball
-   */
   public sendClientBallTouch(ball: {
     ballX: number;
     ballY: number;
@@ -1277,7 +1585,7 @@ export class WebRTCLockstepSession {
     lastTouchTeam: EventTeam;
   }) {
     if (this.isHost) return;
-    this.broadcastToPeers({
+    this.broadcastControlToPeers({
       kind: 'client_ball',
       playerId: this.localUid,
       ...ball,
@@ -1285,7 +1593,10 @@ export class WebRTCLockstepSession {
   }
 
   /**
-   * 2 & 6. Host Lockstep Resolution for Frame `targetTick` with 5-tick timeout & 60-tick disconnect guard
+   * Host Lockstep Input Queue & Timeout Manager:
+   * - Maintains `ticksSinceLastInput` per client peer.
+   * - If `ticksSinceLastInput > 5`: substitutes `EMPTY_INPUT_KEYS` and continues simulation without blocking.
+   * - If `ticksSinceLastInput > 60`: closes `RTCPeerConnection` and removes the lagging player.
    */
   public resolveHostLockstepFrame(
     targetTick: number,
@@ -1298,55 +1609,69 @@ export class WebRTCLockstepSession {
     const frameInputs: Record<string, PlayerInputKeys> = {
       [this.localUid]: hostKeys,
     };
-    const nowPerf = performance.now();
 
     for (const [peerUid, entry] of this.peers.entries()) {
-      const buffered = entry.inputBuffer.get(targetTick);
-      if (buffered) {
+      // 1. Pull exact or next queued input from peer's inputBuffer
+      let chosenInput: PlayerInputKeys | undefined = entry.inputBuffer.get(targetTick);
+      if (chosenInput) {
         entry.inputBuffer.delete(targetTick);
-        entry.waitTicksForCurrentFrame = 0;
-        entry.missingTicks = 0;
-        entry.lastInputKeys = buffered;
-        frameInputs[peerUid] = buffered;
+        entry.lastProcessedTick = targetTick;
+      } else if (entry.inputBuffer.size > 0) {
+        const sortedTicks = Array.from(entry.inputBuffer.keys()).sort((a, b) => a - b);
+        const nextTick = sortedTicks[0];
+        chosenInput = entry.inputBuffer.get(nextTick);
+        entry.inputBuffer.delete(nextTick);
+        entry.lastProcessedTick = Math.max(entry.lastProcessedTick, nextTick);
+      }
+
+      if (chosenInput) {
+        entry.ticksSinceLastInput = 0;
+        entry.lastInputKeys = chosenInput;
+        frameInputs[peerUid] = chosenInput;
         continue;
       }
 
-      // Check how many ticks (~16.67ms each) since the peer last sent an input packet
-      const silenceMs = nowPerf - entry.lastInputAtPerf;
-      const silenceTicks = Math.floor(silenceMs / (1000 / LOCKSTEP_FPS));
+      // 2. No new input arrived this tick -> increment ticksSinceLastInput
+      entry.ticksSinceLastInput += 1;
 
-      if (silenceTicks < LOCKSTEP_WAIT_TIMEOUT_TICKS) {
-        // Peer is actively streaming 60Hz inputs; use latest received input for smooth 60Hz lockstep
-        entry.missingTicks = 0;
+      if (entry.ticksSinceLastInput <= LOCKSTEP_WAIT_TIMEOUT_TICKS) {
+        // Within 5 ticks (~83 ms): hold last known input
         frameInputs[peerUid] = entry.lastInputKeys || { ...EMPTY_INPUT_KEYS };
       } else {
-        entry.missingTicks = silenceTicks;
-
-        // 6. If inputs are missing for 60 consecutive ticks (1 second) on an open WebRTC channel, close RTCPeerConnection
-        if (entry.open && entry.missingTicks >= LOCKSTEP_DISCONNECT_TIMEOUT_TICKS) {
+        // > 60 consecutive ticks (1.0s) without input on an open channel -> close RTCPeerConnection & remove peer
+        if (entry.open && entry.ticksSinceLastInput > LOCKSTEP_DISCONNECT_TIMEOUT_TICKS) {
           this.closeAndRemovePeer(peerUid);
           continue;
         }
-
-        // 6. After 5 frames (83 ms) without input, substitute empty input so simulation never freezes
+        // > 5 ticks without input -> substitute EMPTY_INPUT_KEYS so simulation never blocks
         frameInputs[peerUid] = { ...EMPTY_INPUT_KEYS };
       }
     }
 
-    // Broadcast confirmed inputs of all players (+ authoritative snapshot) to every Client over WebRTC DataChannel
-    this.broadcastToPeers({
-      kind: 'frame',
-      tick: targetTick,
-      inputs: frameInputs,
-      snap,
-    });
+    // Broadcast compact binary ArrayBuffer frame inputs every tick (60 Hz)
+    const binFrame = encodeBinaryHostFrameInputs(
+      targetTick,
+      this.targetMemberUids,
+      frameInputs
+    );
+    this.broadcastBinaryToPeers(binFrame);
+
+    // Send authoritative correction snapshot for client Jitter Damper every 2nd tick (30 Hz) or on score/event change
+    if (snap && targetTick % 2 === 0) {
+      this.broadcastControlToPeers({
+        kind: 'frame',
+        tick: targetTick,
+        inputs: frameInputs,
+        snap,
+      });
+    }
 
     return { ready: true, frameInputs };
   }
 
   public broadcastStateSeed(world: DeterministicWorldState) {
     if (!this.isHost) return;
-    this.broadcastToPeers({
+    this.broadcastControlToPeers({
       kind: 'state_seed',
       world,
     });
@@ -1354,13 +1679,13 @@ export class WebRTCLockstepSession {
 
   private sendPingProbes() {
     const nowPerf = performance.now();
-    this.broadcastToPeers({
+    this.broadcastControlToPeers({
       kind: 'ping',
       t0: nowPerf,
     });
   }
 
-  private sendToPeer(peerUid: string, pkt: DataChannelPacket) {
+  private sendControlToPeer(peerUid: string, pkt: DataChannelControlPacket) {
     const entry = this.peers.get(peerUid);
     if (entry && entry.open && entry.dc && entry.dc.readyState === 'open') {
       try {
@@ -1371,7 +1696,19 @@ export class WebRTCLockstepSession {
     }
   }
 
-  private broadcastToPeers(pkt: DataChannelPacket) {
+  private broadcastBinaryToPeers(buf: ArrayBuffer) {
+    for (const entry of this.peers.values()) {
+      if (entry.open && entry.dc && entry.dc.readyState === 'open') {
+        try {
+          entry.dc.send(buf);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  private broadcastControlToPeers(pkt: DataChannelControlPacket) {
     const raw = JSON.stringify(pkt);
     for (const entry of this.peers.values()) {
       if (entry.open && entry.dc && entry.dc.readyState === 'open') {

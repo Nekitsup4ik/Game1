@@ -1123,14 +1123,14 @@ export async function switchPlayerTeam(
   return { switched: true };
 }
 
-export const MATCH_COUNTDOWN_MS = 3000; // 3, 2, 1, СТАРТ! (3 seconds)
+export const MATCH_COUNTDOWN_MS = 0;
 
 export async function startMatchByHost(
   room: MatchRoomDoc,
   playersMap: Record<string, RoomPlayerDoc>
 ): Promise<void> {
   const now = Date.now();
-  const countdownTargetMs = now + MATCH_COUNTDOWN_MS;
+  const countdownTargetMs = now;
 
   postApiJson('/api/mp/room/start', {
     roomId: room.roomId,
@@ -1376,7 +1376,6 @@ export function applyWebRTCClientInputState(
 
   const km = typeof pkt.keyMask === 'number' ? pkt.keyMask : pkt.kicking ? 16 : 0;
   const isKickingNow = Boolean(pkt.kicking || (km & 16) !== 0);
-  const kickUntilMs = isKickingNow ? now + 160 : existing?.kickUntilMs || 0;
 
   pMap[pkt.playerId] = {
     playerId: pkt.playerId,
@@ -1390,8 +1389,8 @@ export function applyWebRTCClientInputState(
     y: pkt.y,
     vx: pkt.vx || 0,
     vy: pkt.vy || 0,
-    kicking: isKickingNow || now < kickUntilMs,
-    kickUntilMs,
+    kicking: isKickingNow,
+    kickUntilMs: 0,
     keyMask: km,
     pingMs: existing?.pingMs || 18,
     seq: nextSeq,
@@ -1466,7 +1465,6 @@ export function applyWebRTCAuthoritativeSnapshot(
           ? 16
           : existing?.keyMask;
     const isKickingNow = Boolean(pState.kicking || (km && (km & 16) !== 0));
-    const kickUntilMs = isKickingNow ? now + 160 : existing?.kickUntilMs || 0;
 
     pMap[uid] = {
       playerId: uid,
@@ -1482,8 +1480,8 @@ export function applyWebRTCAuthoritativeSnapshot(
       y: pState.y,
       vx: pState.vx,
       vy: pState.vy,
-      kicking: isKickingNow || now < kickUntilMs,
-      kickUntilMs,
+      kicking: isKickingNow,
+      kickUntilMs: 0,
       keyMask: km,
       pingMs: existing?.pingMs || 18,
       seq: nextSeq,

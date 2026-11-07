@@ -25,6 +25,7 @@ import {
   subscribeToLobbyRooms,
 } from './services/roomService';
 import { MatchArena } from './components/MatchArena';
+import { RoomLobbyView } from './components/RoomLobbyView';
 
 const STORAGE_NICKNAME_KEY = 'haxarena_nickname';
 const STORAGE_NUMBER_KEY = 'haxarena_jersey_number';
@@ -313,7 +314,8 @@ export default function App() {
   const isInActiveMatch = Boolean(
     profileConfirmed &&
       currentProfile &&
-      activeRoom
+      activeRoom &&
+      (activeRoom.status === 'playing' || activeRoom.status === 'finished')
   );
 
   return (
@@ -414,17 +416,27 @@ export default function App() {
       {/* Main Content Area */}
       <main className="flex-1 flex flex-col">
         {activeRoomId && activeRoom && currentProfile ? (
-          /* АКТИВНАЯ КОМНАТА: РАЗМИНКА (Rocket League Free-Play) -> ОТСЧЁТ 3, 2, 1 -> МАТЧ */
-          <MatchArena
-            room={activeRoom}
-            players={activePlayers}
-            profile={currentProfile}
-            onExitToLobby={handleLeaveCurrentRoom}
-            onCreateRematch={async () => {
-              await handleLeaveCurrentRoom();
-              await handleCreateRoom();
-            }}
-          />
+          activeRoom.status === 'waiting' ? (
+            /* ЛОББИ КОМНАТЫ: распределение по командам и запуск матча кнопкой «СТАРТ» */
+            <RoomLobbyView
+              room={activeRoom}
+              players={activePlayers}
+              profile={currentProfile}
+              onLeaveRoom={handleLeaveCurrentRoom}
+            />
+          ) : (
+            /* АКТИВНЫЙ МАТЧ (HaxBall P2P Lockstep 60 Гц без разминки и без аутов) */
+            <MatchArena
+              room={activeRoom}
+              players={activePlayers}
+              profile={currentProfile}
+              onExitToLobby={handleLeaveCurrentRoom}
+              onCreateRematch={async () => {
+                await handleLeaveCurrentRoom();
+                await handleCreateRoom();
+              }}
+            />
+          )
         ) : activeTab === 'rules' ? (
           /* ВКЛАДКА «ПРАВИЛА 4×4» */
           <div className="w-full max-w-5xl mx-auto px-6 py-10 space-y-8">
@@ -517,16 +529,16 @@ export default function App() {
 
               <div className="rounded-2xl bg-slate-900 border border-slate-800 p-6 space-y-3">
                 <div className="text-xs font-bold text-emerald-400 uppercase tracking-wider">
-                  4. Стандарты: Ауты и Угловые
+                  4. Стены стадиона (Без аутов как в HaxBall)
                 </div>
                 <h2 className="font-display font-bold text-lg text-white">
-                  Ввод мяча с боковой и подача корнера
+                  Упругий отскок мяча от стен (bCoef = 1.0)
                 </h2>
                 <p className="text-xs text-slate-300 leading-relaxed">
-                  Если мяч уходит за боковую линию, назначается <strong className="text-white">боковой аут</strong> в пользу команды, не касавшейся мяча последней. Если мяч уходит за лицевую линию мимо ворот — назначается <strong className="text-white">угловой удар (корнер)</strong> с угловой дуги.
+                  В игре нет остановок на ауты или угловые: поле окружено упругими сегментами-стенами (<code className="text-emerald-400">wall: true</code>). Мяч отскакивает от стен по закону упругого отражения (угол падения равен углу отражения, нормальная скорость меняет знак, тангенциальная сохраняется).
                 </p>
                 <p className="text-xs text-slate-400 leading-relaxed">
-                  При розыгрыше аута или углового вокруг мяча появляется пунктирный круг радиусом <strong className="text-white">74px</strong>, внутрь которого соперники не могут войти до первого касания.
+                  Это обеспечивает непрерывную динамику HaxBall без пауз и сбросов мяча, а также позволяет отдавать точные пасы от борта.
                 </p>
               </div>
             </div>
