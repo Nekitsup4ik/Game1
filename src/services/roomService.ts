@@ -1507,7 +1507,7 @@ export async function syncRoomGameplayState(
     lastTouchTeam: EventTeam;
     actorUid?: string;
   }
-): Promise<void> {
+): Promise<number> {
   const now = Date.now();
   const nextSeq = realtimeWsBroker.nextMonotonicSeq();
   const baseRoom =
@@ -1584,6 +1584,8 @@ export async function syncRoomGameplayState(
     },
     nextSeq
   );
+
+  return nextSeq;
 }
 
 export async function registerGoalInNet(
@@ -1595,6 +1597,7 @@ export async function registerGoalInNet(
   ballState: { x: number; y: number; vx: number; vy: number }
 ): Promise<void> {
   const now = Date.now();
+  const goalSeq = realtimeWsBroker.nextMonotonicSeq();
   const safeRed = clamp(Math.round(newRedScore), 0, 99);
   const safeBlue = clamp(Math.round(newBlueScore), 0, 99);
   const safeX = Math.round(clamp(ballState.x, -100, CANVAS_WIDTH + 100) * 10) / 10;
@@ -1621,7 +1624,7 @@ export async function registerGoalInNet(
     eventTeam: scoringTeam,
     eventUntilMs: Math.round(goalPauseUntilMs),
     lastTouchTeam: 'none',
-    seq: realtimeWsBroker.nextMonotonicSeq(),
+    seq: goalSeq,
     updatedAtMs: now,
     heartbeatAtMs: now,
   };
@@ -1645,7 +1648,7 @@ export async function registerGoalInNet(
       eventUntilMs: Math.round(goalPauseUntilMs),
       lastTouchTeam: 'none',
     },
-    now
+    goalSeq
   );
 
   if (apiReachable) {

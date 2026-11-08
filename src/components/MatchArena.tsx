@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  Gamepad2,
   LogOut,
   RotateCcw,
   Shield,
@@ -517,6 +518,146 @@ const GOALPOSTS = [
   { x: FIELD_RIGHT, y: GOAL_BOTTOM, color: '#3B82F6' },
 ];
 
+interface GamepadInputSnapshot {
+  connected: boolean;
+  name: string;
+  analogX: number;
+  analogY: number;
+  hasAnalogStick: boolean;
+  up: boolean;
+  down: boolean;
+  left: boolean;
+  right: boolean;
+  kick: boolean;
+  scoreboardHeld: boolean;
+}
+
+/**
+ * Опрос геймпада (PS4 DualShock 4, PS5 DualSense, Xbox, Generic):
+ * - Левый стик (axes[0], axes[1]) + крестовина (D-Pad buttons 12..15) — плавное 360° управление движением
+ * - Кнопка ✕ (Икс / Cross на PS4/PS5 = buttons[0], либо buttons[1] в DirectInput, а также Square/R1/R2) — удар по мячу
+ */
+function readGamepadInputState(): GamepadInputSnapshot {
+  if (
+    typeof navigator === 'undefined' ||
+    typeof navigator.getGamepads !== 'function'
+  ) {
+    return {
+      connected: false,
+      name: '',
+      analogX: 0,
+      analogY: 0,
+      hasAnalogStick: false,
+      up: false,
+      down: false,
+      left: false,
+      right: false,
+      kick: false,
+      scoreboardHeld: false,
+    };
+  }
+
+  let pads: (Gamepad | null)[] = [];
+  try {
+    pads = Array.from(navigator.getGamepads() || []);
+  } catch {
+    pads = [];
+  }
+
+  const DEADZONE = 0.16;
+  const DIGITAL_THRESHOLD = 0.3;
+
+  for (let i = 0; i < pads.length; i++) {
+    const gp = pads[i];
+    if (!gp || !gp.connected) continue;
+
+    // Левый стик: axes[0] (горизонталь), axes[1] (вертикаль)
+    const rawX = gp.axes[0] ?? 0;
+    const rawY = gp.axes[1] ?? 0;
+    const mag = Math.hypot(rawX, rawY);
+
+    let analogX = 0;
+    let analogY = 0;
+    let hasAnalogStick = false;
+
+    if (mag > DEADZONE) {
+      const normMag = Math.min(1, (mag - DEADZONE) / (1 - DEADZONE));
+      analogX = round4((rawX / mag) * normMag);
+      analogY = round4((rawY / mag) * normMag);
+      hasAnalogStick = true;
+    }
+
+    // Крестовина D-Pad (12 = Вверх, 13 = Вниз, 14 = Влево, 15 = Вправо)
+    const dpadUp = Boolean(gp.buttons[12]?.pressed);
+    const dpadDown = Boolean(gp.buttons[13]?.pressed);
+    const dpadLeft = Boolean(gp.buttons[14]?.pressed);
+    const dpadRight = Boolean(gp.buttons[15]?.pressed);
+
+    const up = dpadUp || analogY < -DIGITAL_THRESHOLD;
+    const down = dpadDown || analogY > DIGITAL_THRESHOLD;
+    const left = dpadLeft || analogX < -DIGITAL_THRESHOLD;
+    const right = dpadRight || analogX > DIGITAL_THRESHOLD;
+
+    if (!hasAnalogStick && (dpadUp || dpadDown || dpadLeft || dpadRight)) {
+      let dx = 0;
+      let dy = 0;
+      if (dpadLeft) dx -= 1;
+      if (dpadRight) dx += 1;
+      if (dpadUp) dy -= 1;
+      if (dpadDown) dy += 1;
+      if (dx !== 0 || dy !== 0) {
+        const dLen = Math.hypot(dx, dy);
+        analogX = round4(dx / dLen);
+        analogY = round4(dy / dLen);
+        hasAnalogStick = true;
+      }
+    }
+
+    // Удар (Икс / Cross ✕ на PS4/PS5 = buttons[0], также поддерживаем Circle/Square/R1/R2 для любых раскладок)
+    const kick = Boolean(
+      gp.buttons[0]?.pressed ||
+        gp.buttons[1]?.pressed ||
+        gp.buttons[2]?.pressed ||
+        gp.buttons[5]?.pressed ||
+        gp.buttons[7]?.pressed ||
+        (gp.buttons[7]?.value ?? 0) > 0.35
+    );
+
+    // Кнопка Share / Touchpad (buttons[8] / buttons[17]) открывает таблицу (Tab)
+    const scoreboardHeld = Boolean(
+      gp.buttons[8]?.pressed || gp.buttons[17]?.pressed
+    );
+
+    return {
+      connected: true,
+      name: gp.id || 'PS4 / Gamepad',
+      analogX,
+      analogY,
+      hasAnalogStick,
+      up,
+      down,
+      left,
+      right,
+      kick,
+      scoreboardHeld,
+    };
+  }
+
+  return {
+    connected: false,
+    name: '',
+    analogX: 0,
+    analogY: 0,
+    hasAnalogStick: false,
+    up: false,
+    down: false,
+    left: false,
+    right: false,
+    kick: false,
+    scoreboardHeld: false,
+  };
+}
+
 function formatTimerMMSS(elapsedSec: number): string {
   const clamped = Math.max(0, Math.min(MATCH_DURATION_SEC, Math.floor(elapsedSec)));
   const mins = Math.floor(clamped / 60);
@@ -613,7 +754,9 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     keyMask: number;
     kicking: boolean;
   }>({ x: -1, y: -1, vx: 0, vy: 0, keyMask: -1, kicking: false });
-  const lastAppliedBallSeqRef = useRef<number>(room.seq || 0);
+  const lastAppliedBallSeqRef = useRef<number>(
+    room.seq && room.seq < 1000000000 ? room.seq : 0
+  );
   const lastHandledEventUntilRef = useRef<number>(0);
   const pendingRtcBallRef = useRef<{
     ballX: number;
@@ -631,8 +774,13 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   const [localPing, setLocalPing] = useState<number>(() => getLocalPingMs());
   const [peerPings, setPeerPings] = useState<Record<string, number>>({});
   const [tabOpen, setTabOpen] = useState<boolean>(false);
-  const [extrapolationMs, setExtrapolationMs] = useState<number>(20);
-  const extrapolationMsRef = useRef<number>(20);
+  const [gamepadConnected, setGamepadConnected] = useState<boolean>(() =>
+    readGamepadInputState().connected
+  );
+  const gamepadConnectedRef = useRef<boolean>(gamepadConnected);
+  const gamepadTabWasHeldRef = useRef<boolean>(false);
+  const [extrapolationMs, setExtrapolationMs] = useState<number>(0);
+  const extrapolationMsRef = useRef<number>(0);
 
   useEffect(() => {
     soundEnabledRef.current = soundEnabled;
@@ -803,11 +951,25 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       }
     };
 
+    const handleGamepadConnected = () => {
+      gamepadConnectedRef.current = true;
+      setGamepadConnected(true);
+    };
+    const handleGamepadDisconnected = () => {
+      const state = readGamepadInputState();
+      gamepadConnectedRef.current = state.connected;
+      setGamepadConnected(state.connected);
+    };
+
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('gamepadconnected', handleGamepadConnected);
+    window.addEventListener('gamepaddisconnected', handleGamepadDisconnected);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('gamepadconnected', handleGamepadConnected);
+      window.removeEventListener('gamepaddisconnected', handleGamepadDisconnected);
     };
   }, []);
 
@@ -879,7 +1041,12 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             netRoom.eventUntilMs !== lastHandledEventUntilRef.current
           ) {
             lastHandledEventUntilRef.current = netRoom.eventUntilMs;
-            lastAppliedBallSeqRef.current = netRoom.seq || now;
+            if (typeof netRoom.seq === 'number' && netRoom.seq < 1000000000) {
+              lastAppliedBallSeqRef.current = Math.max(
+                lastAppliedBallSeqRef.current,
+                netRoom.seq
+              );
+            }
             p.eventState = 'goal';
             p.eventTeam = netRoom.eventTeam;
             p.eventUntilMs = now + GOAL_PAUSE_MS;
@@ -974,19 +1141,38 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         );
       }
 
-      // 1. Fixed-Step Local Player Disc Movement (DT = 1/60s, 4-decimal rounding)
+      // 1. Fixed-Step Local Player Disc Movement (DT = 1/60s, Keyboard + PS4/Xbox Gamepad Left Stick & Cross Kick)
       tickCounterRef.current += 1;
       const currentTick = tickCounterRef.current;
       const rtcSession = webrtcSessionRef.current;
       const extrapFrames = Math.min(8, (extrapolationMsRef.current / 1000) * 60);
 
+      // Опрос геймпада (PS4 DualShock/DualSense, Xbox и др.) на каждом 60 Гц тике
+      const gp = readGamepadInputState();
+      if (gp.connected !== gamepadConnectedRef.current) {
+        gamepadConnectedRef.current = gp.connected;
+        setGamepadConnected(gp.connected);
+      }
+      if (gp.scoreboardHeld !== gamepadTabWasHeldRef.current) {
+        gamepadTabWasHeldRef.current = gp.scoreboardHeld;
+        setTabOpen(gp.scoreboardHeld);
+      }
+
+      const k = keysRef.current;
+      const effectiveUp = k.up || gp.up;
+      const effectiveDown = k.down || gp.down;
+      const effectiveLeft = k.left || gp.left;
+      const effectiveRight = k.right || gp.right;
+      const effectiveKickHeld = k.kick || gp.kick;
+
       let localMovedOrChanged = false;
       if (!isMatchFinished) {
-        const k = keysRef.current;
-        if (!k.kick) {
+        if (!effectiveKickHeld) {
           p.myKickConsumed = false;
         }
-        const activeKickIndicator = Boolean(k.kick && !p.myKickConsumed);
+        const activeKickIndicator = Boolean(
+          effectiveKickHeld && !p.myKickConsumed
+        );
 
         let dirX = 0;
         let dirY = 0;
@@ -997,7 +1183,15 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
 
         const accel = activeKickIndicator ? PLAYER_KICK_ACCEL : PLAYER_ACCEL;
 
-        if (dirX !== 0 || dirY !== 0) {
+        // Если игрок отклоняет левый стик геймпада — используем плавный 360° вектор стика
+        if (gp.hasAnalogStick && dirX === 0 && dirY === 0) {
+          const ax = fpMul(gp.analogX, accel);
+          const ay = fpMul(gp.analogY, accel);
+          p.myVx = fpMul(fpAdd(p.myVx, ax), PLAYER_DAMPING);
+          p.myVy = fpMul(fpAdd(p.myVy, ay), PLAYER_DAMPING);
+          dirX = gp.analogX;
+          dirY = gp.analogY;
+        } else if (dirX !== 0 || dirY !== 0) {
           const moveAngle = fpAtan2(dirY, dirX);
           const ax = fpMul(fpCos(moveAngle), accel);
           const ay = fpMul(fpSin(moveAngle), accel);
@@ -1032,16 +1226,13 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           localMovedOrChanged = true;
           lastLocalActiveMoveMsRef.current = now;
         }
-        // White circle indicator: turns on immediately when holding kick, turns off the exact frame released or kick consumed
+        // White circle indicator: turns on immediately when holding kick (Space / X / PS4 Cross ✕), turns off the exact frame released or kick consumed
         p.myKicking = activeKickIndicator;
       } else {
         p.myVx = 0;
         p.myVy = 0;
         p.myKicking = false;
       }
-
-      const preCollisionMyVx = p.myVx;
-      const preCollisionMyVy = p.myVy;
 
       // 1a. Remote Players Fixed-Step Dead-Reckoning + Jitter Damper Reconciliation
       Object.values(allPlayers).forEach((rp) => {
@@ -1277,10 +1468,10 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             const diffDist = fpHypot(diffX, diffY);
             const inCollisionWindow = now - lastPlayerCollisionMsRef.current < 480;
             const isIdle =
-              !keysRef.current.up &&
-              !keysRef.current.down &&
-              !keysRef.current.left &&
-              !keysRef.current.right &&
+              !effectiveUp &&
+              !effectiveDown &&
+              !effectiveLeft &&
+              !effectiveRight &&
               fpHypot(p.myVx, p.myVy) < 0.08;
 
             if (
@@ -1330,22 +1521,21 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       }
 
       // Send strictly 1 Binary ArrayBuffer Input Packet per 60Hz Physics Tick over WebRTC DataChannel
-      const kNow = keysRef.current;
       const currentKeyMask =
-        (kNow.up ? 1 : 0) |
-        (kNow.down ? 2 : 0) |
-        (kNow.left ? 4 : 0) |
-        (kNow.right ? 8 : 0) |
+        (effectiveUp ? 1 : 0) |
+        (effectiveDown ? 2 : 0) |
+        (effectiveLeft ? 4 : 0) |
+        (effectiveRight ? 8 : 0) |
         (p.myKicking ? 16 : 0);
 
       if (rtcSession && !isMatchFinished && !rtcSession.isHost) {
         rtcSession.sendClientInput(
           currentTick,
           {
-            up: kNow.up,
-            down: kNow.down,
-            left: kNow.left,
-            right: kNow.right,
+            up: effectiveUp,
+            down: effectiveDown,
+            left: effectiveLeft,
+            right: effectiveRight,
             kick: p.myKicking,
           },
           {
@@ -1407,21 +1597,20 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           p.ballX = fpAdd(p.ballX, fpMul(p.ballVx, 0.5));
           p.ballY = fpAdd(p.ballY, fpMul(p.ballVy, 0.5));
 
-          // Local Disc-to-Ball Contact
+          // Disc-to-Ball Contact for ALL players (both local and remote discs, regardless of kicking flag)
           if (p.eventState === 'normal' || p.eventState === 'goal') {
             for (const disc of activeDiscs) {
-              if (disc.uid !== profile.uid) continue;
-
               const dx = fpSub(p.ballX, disc.x);
               const dy = fpSub(p.ballY, disc.y);
               const dist = fpHypot(dx, dy);
               const minDist = PLAYER_RADIUS + BALL_RADIUS;
 
-              if (dist < minDist && dist > 0.001 && !disc.kicking) {
+              if (dist < minDist && dist > 0.001) {
                 const cAngle = fpAtan2(dy, dx);
                 const nx = fpCos(cAngle);
                 const ny = fpSin(cAngle);
 
+                // Выталкивание мяча из кружка игрока (без застревания внутри фишки)
                 p.ballX = fpAdd(disc.x, fpMul(nx, minDist));
                 p.ballY = fpAdd(disc.y, fpMul(ny, minDist));
 
@@ -1430,19 +1619,22 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
                 const normalVel = fpAdd(fpMul(relVx, nx), fpMul(relVy, ny));
 
                 if (normalVel < 0) {
-                  const restitution = -normalVel > 1.85 ? 0.08 : 0.0;
+                  // Упругий контакт фишки и мяча по HaxBall (bCoef = 0.5 * 0.5 = 0.25)
+                  const restitution = -normalVel > 1.4 ? 0.25 : 0.08;
                   const impulse = round4(-(1 + restitution) * normalVel);
                   p.ballVx = fpAdd(p.ballVx, fpMul(impulse, nx));
                   p.ballVy = fpAdd(p.ballVy, fpMul(impulse, ny));
                 }
 
                 p.lastTouchTeam = disc.team;
-                localTouchedBall = true;
+                if (disc.uid === profile.uid) {
+                  localTouchedBall = true;
+                }
               }
             }
           }
 
-          // Goalpost Circle Collisions
+          // Goalpost Circle Collisions (Плавный упругий отскок от штанг)
           for (const post of GOALPOSTS) {
             const dx = fpSub(p.ballX, post.x);
             const dy = fpSub(p.ballY, post.y);
@@ -1454,10 +1646,14 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               const ny = fpSin(pAng);
               p.ballX = fpAdd(post.x, fpMul(nx, minDist));
               p.ballY = fpAdd(post.y, fpMul(ny, minDist));
-              const dot = fpAdd(fpMul(p.ballVx, nx), fpMul(p.ballVy, ny));
-              if (dot < 0) {
-                p.ballVx = fpMul(fpSub(p.ballVx, fpMul(fpMul(2, dot), nx)), 0.88);
-                p.ballVy = fpMul(fpSub(p.ballVy, fpMul(fpMul(2, dot), ny)), 0.88);
+              const vn = fpAdd(fpMul(p.ballVx, nx), fpMul(p.ballVy, ny));
+              if (vn < 0) {
+                const tx = -ny;
+                const ty = nx;
+                const vt = fpAdd(fpMul(p.ballVx, tx), fpMul(p.ballVy, ty));
+                const reflectedVn = fpMul(-vn, 0.9);
+                p.ballVx = fpAdd(fpMul(reflectedVn, nx), fpMul(vt, tx));
+                p.ballVy = fpAdd(fpMul(reflectedVn, ny), fpMul(vt, ty));
                 if (soundEnabledRef.current) {
                   soundFX.playPostHit();
                 }
@@ -1480,7 +1676,6 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               p.eventTeam = 'blue';
               p.eventUntilMs = pauseUntil;
               lastHandledEventUntilRef.current = pauseUntil;
-              lastAppliedBallSeqRef.current = now;
               roomRef.current.blueScore = newBlueScore;
               roomRef.current.eventState = 'goal';
               roomRef.current.eventTeam = 'blue';
@@ -1508,7 +1703,6 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               p.eventTeam = 'red';
               p.eventUntilMs = pauseUntil;
               lastHandledEventUntilRef.current = pauseUntil;
-              lastAppliedBallSeqRef.current = now;
               roomRef.current.redScore = newRedScore;
               roomRef.current.eventState = 'goal';
               roomRef.current.eventTeam = 'red';
@@ -1532,7 +1726,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             }
           }
 
-          // Module (a): Elastic Wall Segment Reflection (wall: true, bCoef = 1.0) + Position Correction ("выталкивание")
+          // Module (a): Elastic Wall Segment Reflection (wall: true, bCoef = 0.94) + Position Correction ("выталкивание")
           // Zero outs, zero corners!
           if (p.eventState === 'normal') {
             const wallState = {
@@ -1541,6 +1735,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               vx: p.ballVx,
               vy: p.ballVy,
               radius: BALL_RADIUS,
+              bCoef: 0.94,
             };
             collideBallWithWallSegments(wallState, PITCH_WALL_SEGMENTS);
             p.ballX = wallState.x;
@@ -1613,14 +1808,10 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             const ny = fpSin(kAngle);
             const shotPower = isPowershotReady ? POWERSHOT_IMPULSE : KICK_STRENGTH;
 
-            p.ballVx = fpAdd(
-              fpMul(nx, shotPower),
-              fpMul(preCollisionMyVx, 0.32)
-            );
-            p.ballVy = fpAdd(
-              fpMul(ny, shotPower),
-              fpMul(preCollisionMyVy, 0.32)
-            );
+            const impulseX = fpMul(nx, shotPower);
+            const impulseY = fpMul(ny, shotPower);
+            p.ballVx = fpAdd(p.ballVx, impulseX);
+            p.ballVy = fpAdd(p.ballVy, impulseY);
             p.lastTouchTeam = localTeam;
             localTouchedBall = true;
             // Immediately extinguish white kick circle on kick execution until key is released and pressed again
@@ -1664,10 +1855,15 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           p.ballOffsetY = 0;
         }
 
-        // Module (d): Jitter Damper for Ball Reconciliation
+        // Module (d): Jitter Damper for Ball Reconciliation (Zero Self-Echo Overwrite!)
+        const isHost = currentRoom.hostUid === profile.uid;
         if (!localTouchedBall && p.eventState === 'normal') {
           const rtcBall = pendingRtcBallRef.current;
-          if (rtcBall && now - rtcBall.ts < 350) {
+          if (
+            rtcBall &&
+            rtcBall.playerId !== profile.uid &&
+            now - rtcBall.ts < 350
+          ) {
             pendingRtcBallRef.current = null;
             const prevVisualX = fpAdd(p.ballX, p.ballOffsetX);
             const prevVisualY = fpAdd(p.ballY, p.ballOffsetY);
@@ -1691,6 +1887,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
                 vx: p.ballVx,
                 vy: p.ballVy,
                 radius: BALL_RADIUS,
+                bCoef: 0.94,
               };
               collideBallWithWallSegments(wallState, PITCH_WALL_SEGMENTS);
               p.ballX = wallState.x;
@@ -1710,9 +1907,22 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             }
           } else if (liveSnap.room) {
             const netRoom = liveSnap.room;
-            const incomingSeq = netRoom.seq || 0;
-            if (
-              incomingSeq !== lastAppliedBallSeqRef.current &&
+            const incomingSeq =
+              typeof netRoom.seq === 'number' && netRoom.seq < 1000000000
+                ? netRoom.seq
+                : 0;
+            const isFromOtherPlayer =
+              Boolean(netRoom.actorUid) && netRoom.actorUid !== profile.uid;
+
+            // Если пакет в памяти/WS наш собственный (actorUid === profile.uid), просто продвигаем seq и НЕ откатываем свой мяч!
+            if (netRoom.actorUid === profile.uid) {
+              if (incomingSeq > lastAppliedBallSeqRef.current) {
+                lastAppliedBallSeqRef.current = incomingSeq;
+              }
+            } else if (
+              incomingSeq > lastAppliedBallSeqRef.current &&
+              isFromOtherPlayer &&
+              (!isHost || isRemoteContestingClose) &&
               (!recentlyTouchedLocally || isRemoteContestingClose)
             ) {
               lastAppliedBallSeqRef.current = incomingSeq;
@@ -1738,6 +1948,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
                   vx: p.ballVx,
                   vy: p.ballVy,
                   radius: BALL_RADIUS,
+                  bCoef: 0.94,
                 };
                 collideBallWithWallSegments(wallState, PITCH_WALL_SEGMENTS);
                 p.ballX = wallState.x;
@@ -1759,7 +1970,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           }
         }
 
-        const ballDecay = 0.78;
+        const ballDecay = 0.8;
         p.ballOffsetX =
           Math.abs(p.ballOffsetX) > 0.15 ? fpMul(p.ballOffsetX, ballDecay) : 0;
         p.ballOffsetY =
@@ -1812,10 +2023,10 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         const resolved = rtcSession.resolveHostLockstepFrame(
           currentTick,
           {
-            up: kNow.up,
-            down: kNow.down,
-            left: kNow.left,
-            right: kNow.right,
+            up: effectiveUp,
+            down: effectiveDown,
+            left: effectiveLeft,
+            right: effectiveRight,
             kick: p.myKicking,
           },
           {
@@ -1919,7 +2130,6 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         (localTouchedBall || now - lastBallSyncMsRef.current >= ballSyncIntervalMs)
       ) {
         lastBallSyncMsRef.current = now;
-        lastAppliedBallSeqRef.current = now;
         syncRoomGameplayState(currentRoom.roomId, {
           redScore: roomRef.current.redScore,
           blueScore: roomRef.current.blueScore,
@@ -1932,7 +2142,13 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           eventUntilMs: p.eventUntilMs,
           lastTouchTeam: p.lastTouchTeam,
           actorUid: profile.uid,
-        }).catch(() => {});
+        })
+          .then((assignedSeq) => {
+            if (assignedSeq > lastAppliedBallSeqRef.current) {
+              lastAppliedBallSeqRef.current = assignedSeq;
+            }
+          })
+          .catch(() => {});
       }
     };
 
@@ -2029,7 +2245,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     <div className="h-screen w-screen overflow-hidden bg-slate-950 text-slate-50 flex flex-col items-center justify-between px-2 py-1.5 select-none">
       {/* Compact Single-Row Top Scoreboard HUD */}
       <div className="w-full max-w-[1560px] flex items-center justify-between gap-2 bg-slate-900/95 border border-slate-800 rounded-xl px-3 py-1.5 shadow-xl shrink-0">
-        {/* Left: Room Title & Elastic Walls Badge */}
+        {/* Left: Room Title & Elastic Walls + Gamepad Badge */}
         <div className="flex items-center gap-2 min-w-0">
           <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 shrink-0" />
           <div className="truncate">
@@ -2042,6 +2258,15 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               <span className="text-emerald-400 font-medium">
                 P2P 60Hz · Стены без аутов
               </span>
+              {gamepadConnected && (
+                <>
+                  <span>•</span>
+                  <span className="inline-flex items-center gap-1 text-sky-400 font-semibold">
+                    <Gamepad2 className="w-3.5 h-3.5" />
+                    <span>Геймпад (Л. стик + ✕)</span>
+                  </span>
+                </>
+              )}
             </div>
           </div>
         </div>
