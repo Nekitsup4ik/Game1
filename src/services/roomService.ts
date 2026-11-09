@@ -1366,9 +1366,7 @@ export function applyWebRTCClientInputState(
     keyMask?: number;
   }
 ): void {
-  if (typeof pkt.x !== 'number' || typeof pkt.y !== 'number') return;
   const now = Date.now();
-  const nextSeq = realtimeWsBroker.nextMonotonicSeq();
   const pMap = memoryPlayers.get(roomId) || {};
   const wsPlayers = realtimeWsBroker.getRoomPlayers(roomId);
   const existing = pMap[pkt.playerId] || wsPlayers[pkt.playerId];
@@ -1376,6 +1374,21 @@ export function applyWebRTCClientInputState(
 
   const km = typeof pkt.keyMask === 'number' ? pkt.keyMask : pkt.kicking ? 16 : 0;
   const isKickingNow = Boolean(pkt.kicking || (km & 16) !== 0);
+
+  if (typeof pkt.x !== 'number' || typeof pkt.y !== 'number') {
+    if (existing) {
+      pMap[pkt.playerId] = {
+        ...existing,
+        kicking: isKickingNow,
+        keyMask: km,
+        updatedAtMs: now,
+      };
+      memoryPlayers.set(roomId, pMap);
+    }
+    return;
+  }
+
+  const nextSeq = realtimeWsBroker.nextMonotonicSeq();
 
   pMap[pkt.playerId] = {
     playerId: pkt.playerId,

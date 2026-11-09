@@ -809,6 +809,9 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         }
       },
       onClientInputState: (pkt) => {
+        if (pkt.keys) {
+          peerInputsRef.current[pkt.playerId] = pkt.keys;
+        }
         applyWebRTCClientInputState(roomRef.current.roomId, pkt);
       },
       onClientBall: (pkt) => {
@@ -1453,37 +1456,22 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           }
         });
 
-        // Jitter-damped convergence with Host authoritative state
+        // Only reconcile local player position with Host on extreme collision desync (> 95px)
+        // so normal client movement never rubberbands against 1-RTT-old snapshots.
         if (currentRoom.hostUid !== profile.uid) {
           const hostAuthMe = getHostAuthoritativePlayerState(
             currentRoom.roomId,
             profile.uid
           );
-          if (hostAuthMe && now - hostAuthMe.ts < 180) {
-            const leadFrames = Math.min(2.5, getLocalPingMs() / 33.3);
-            const targetX = fpAdd(hostAuthMe.x, fpMul(p.myVx, leadFrames));
-            const targetY = fpAdd(hostAuthMe.y, fpMul(p.myVy, leadFrames));
-            const diffX = fpSub(targetX, p.myX);
-            const diffY = fpSub(targetY, p.myY);
+          if (hostAuthMe && now - hostAuthMe.ts < 120) {
+            const diffX = fpSub(hostAuthMe.x, p.myX);
+            const diffY = fpSub(hostAuthMe.y, p.myY);
             const diffDist = fpHypot(diffX, diffY);
-            const inCollisionWindow = now - lastPlayerCollisionMsRef.current < 480;
-            const isIdle =
-              !effectiveUp &&
-              !effectiveDown &&
-              !effectiveLeft &&
-              !effectiveRight &&
-              fpHypot(p.myVx, p.myVy) < 0.08;
-
-            if (
-              (inCollisionWindow && diffDist > 1.8) ||
-              (isIdle && diffDist > 1.5) ||
-              diffDist > 8.5
-            ) {
+            if (diffDist > 95) {
               const prevVisX = fpAdd(p.myX, p.myOffsetX);
               const prevVisY = fpAdd(p.myY, p.myOffsetY);
-              const blend = diffDist > 60 ? 0.55 : inCollisionWindow ? 0.28 : 0.18;
-              p.myX = fpAdd(p.myX, fpMul(diffX, blend));
-              p.myY = fpAdd(p.myY, fpMul(diffY, blend));
+              p.myX = fpAdd(p.myX, fpMul(diffX, 0.35));
+              p.myY = fpAdd(p.myY, fpMul(diffY, 0.35));
               p.myOffsetX = fpSub(prevVisX, p.myX);
               p.myOffsetY = fpSub(prevVisY, p.myY);
               lastLocalActiveMoveMsRef.current = now;
@@ -1651,7 +1639,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
                 const tx = -ny;
                 const ty = nx;
                 const vt = fpAdd(fpMul(p.ballVx, tx), fpMul(p.ballVy, ty));
-                const reflectedVn = fpMul(-vn, 0.9);
+                const reflectedVn = fpMul(-vn, 0.6);
                 p.ballVx = fpAdd(fpMul(reflectedVn, nx), fpMul(vt, tx));
                 p.ballVy = fpAdd(fpMul(reflectedVn, ny), fpMul(vt, ty));
                 if (soundEnabledRef.current) {
@@ -1726,7 +1714,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             }
           }
 
-          // Module (a): Elastic Wall Segment Reflection (wall: true, bCoef = 0.94) + Position Correction ("выталкивание")
+          // Module (a): Elastic Wall Segment Reflection (wall: true, bCoef = 0.5) + Position Correction ("выталкивание")
           // Zero outs, zero corners!
           if (p.eventState === 'normal') {
             const wallState = {
@@ -1735,7 +1723,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               vx: p.ballVx,
               vy: p.ballVy,
               radius: BALL_RADIUS,
-              bCoef: 0.94,
+              bCoef: 0.5,
             };
             collideBallWithWallSegments(wallState, PITCH_WALL_SEGMENTS);
             p.ballX = wallState.x;
@@ -1828,6 +1816,30 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               soundFX.playKick();
             }
           }
+
+          // Deterministic remote kick execution on Host so P2P client kicks take effect immediately
+          for (const disc of activeDiscs) {
+            if (disc.uid !== profile.uid && disc.kicking) {
+              const dxRemKick = fpSub(p.ballX, disc.x);
+              const dyRemKick = fpSub(p.ballY, disc.y);
+              const distRemKick = fpHypot(dxRemKick, dyRemKick);
+              if (distRemKick <= KICK_RANGE && distRemKick > 0.001) {
+                const kAngle = fpAtan2(dyRemKick, dxRemKick);
+                const nx = fpCos(kAngle);
+                const ny = fpSin(kAngle);
+                p.ballVx = fpAdd(p.ballVx, fpMul(nx, KICK_STRENGTH));
+                p.ballVy = fpAdd(p.ballVy, fpMul(ny, KICK_STRENGTH));
+                p.lastTouchTeam = disc.team;
+                const rState = p.remoteRenderPos[disc.uid];
+                if (rState) {
+                  rState.kicking = false;
+                }
+                if (soundEnabledRef.current) {
+                  soundFX.playKick();
+                }
+              }
+            }
+          }
         }
 
         // Fixed-Step Ball Damping & Max Speed Clamp
@@ -1887,7 +1899,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
                 vx: p.ballVx,
                 vy: p.ballVy,
                 radius: BALL_RADIUS,
-                bCoef: 0.94,
+                bCoef: 0.5,
               };
               collideBallWithWallSegments(wallState, PITCH_WALL_SEGMENTS);
               p.ballX = wallState.x;
@@ -1948,7 +1960,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
                   vx: p.ballVx,
                   vy: p.ballVy,
                   radius: BALL_RADIUS,
-                  bCoef: 0.94,
+                  bCoef: 0.5,
                 };
                 collideBallWithWallSegments(wallState, PITCH_WALL_SEGMENTS);
                 p.ballX = wallState.x;
@@ -2361,7 +2373,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
 
         {/* TAB Scoreboard Overlay: Teams, Nicknames, Ping (updated every 3s), and Extrapolation */}
         {tabOpen && !isFinished && (
-          <div className="absolute inset-0 z-20 flex items-center justify-center bg-slate-950/75 backdrop-blur-sm p-4">
+          <div className="absolute inset-0 z-20 flex items-center justify-center bg-slate-950/75 p-4">
             <div className="w-full max-w-3xl rounded-2xl bg-slate-900/95 border border-slate-700/90 shadow-2xl overflow-hidden">
               {/* Header */}
               <div className="px-6 py-4 bg-slate-950 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
@@ -2544,7 +2556,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
 
         {/* 5-Minute Match Over Modal («Матч окончен! Победила команда [Цвет]») */}
         {isFinished && (
-          <div className="absolute inset-0 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4">
+          <div className="absolute inset-0 flex items-center justify-center bg-slate-950/80 p-4">
             <div
               className={`max-w-lg w-full rounded-2xl border p-6 sm:p-8 text-center shadow-2xl ${
                 getWinnerBannerText().accentClass

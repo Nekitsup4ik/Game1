@@ -220,8 +220,8 @@ export function collideDiscWithWallSegment(
 ): boolean {
   if (!seg.wall) return false;
 
-  // Для мяча используем упругий отскок от стены (0.94), чтобы мяч не терял половину скорости об стену
-  const discBCoef = disc.bCoef ?? 0.94;
+  // Для мяча используем мягкий упругий отскок HaxBall (BALL_BCOEF = 0.5), чтобы мяч не отлетал слишком сильно от стен
+  const discBCoef = disc.bCoef ?? BALL_BCOEF;
   const combinedBCoef = round4(discBCoef * seg.bCoef);
 
   // Горизонтальная стена (верхняя y = FIELD_TOP или нижняя y = FIELD_BOTTOM)
@@ -1178,6 +1178,17 @@ type DataChannelControlPacket =
       lastTouchTeam: EventTeam;
     }
   | {
+      kind: 'client_state';
+      tick: number;
+      playerId: string;
+      x: number;
+      y: number;
+      vx: number;
+      vy: number;
+      kicking: boolean;
+      keyMask: number;
+    }
+  | {
       kind: 'state_seed';
       world: DeterministicWorldState;
     }
@@ -1685,6 +1696,24 @@ export class WebRTCLockstepSession {
       if (this.onClientBallCallback) {
         this.onClientBallCallback(pkt);
       }
+    } else if (pkt.kind === 'client_state' && this.isHost) {
+      const keys = decodeKeyMask(pkt.keyMask);
+      entry.ticksSinceLastInput = 0;
+      entry.lastInputAtPerf = performance.now();
+      entry.lastInputKeys = keys;
+      if (this.onClientInputStateCallback) {
+        this.onClientInputStateCallback({
+          tick: pkt.tick,
+          playerId: peerUid,
+          keys,
+          x: pkt.x,
+          y: pkt.y,
+          vx: pkt.vx,
+          vy: pkt.vy,
+          kicking: pkt.kicking,
+          keyMask: pkt.keyMask,
+        });
+      }
     } else if (pkt.kind === 'state_seed' && !this.isHost) {
       if (this.onStateSeedCallback) {
         this.onStateSeedCallback(pkt.world);
@@ -1722,13 +1751,20 @@ export class WebRTCLockstepSession {
   }
 
   /**
-   * Клиент отправляет строго ОДИН 4-байтовый бинарный пакет ArrayBuffer на тик (60 Гц).
-   * В пакете только: tick (2 байта), playerId (1 байт), keyMask (1 байт). Никаких координат!
+   * Клиент отправляет 4-байтовый бинарный пакет ArrayBuffer на каждый тик (60 Гц)
+   * и синхронизирует состояние по P2P DataChannel без задержек.
    */
   public sendClientInput(
     tick: number,
     keys: PlayerInputKeys,
-    _unusedState?: unknown
+    state?: {
+      x: number;
+      y: number;
+      vx: number;
+      vy: number;
+      kicking: boolean;
+      keyMask: number;
+    }
   ) {
     if (tick <= this.lastSentInputTick) {
       return;
@@ -1737,16 +1773,38 @@ export class WebRTCLockstepSession {
     const mySlotId = Math.max(0, this.targetMemberUids.indexOf(this.localUid));
     const binBuf = encodeBinaryClientInput4B(tick, mySlotId, keys);
     this.broadcastBinaryToPeers(binBuf);
+
+    if (state && (tick % 2 === 0 || state.kicking)) {
+      this.broadcastControlToPeers({
+        kind: 'client_state',
+        tick,
+        playerId: this.localUid,
+        x: state.x,
+        y: state.y,
+        vx: state.vx,
+        vy: state.vy,
+        kicking: state.kicking,
+        keyMask: state.keyMask,
+      });
+    }
   }
 
-  public sendClientBallTouch(_ball: {
+  public sendClientBallTouch(ball: {
     ballX: number;
     ballY: number;
     ballVx: number;
     ballVy: number;
     lastTouchTeam: EventTeam;
   }) {
-    // Согласно п. 8 спецификации: координаты мяча не передаются клиентом во время матча — только инпуты!
+    this.broadcastControlToPeers({
+      kind: 'client_ball',
+      playerId: this.localUid,
+      ballX: ball.ballX,
+      ballY: ball.ballY,
+      ballVx: ball.ballVx,
+      ballVy: ball.ballVy,
+      lastTouchTeam: ball.lastTouchTeam,
+    });
   }
 
   /**
@@ -1813,7 +1871,7 @@ export class WebRTCLockstepSession {
     );
     this.broadcastBinaryToPeers(binFrame);
 
-    if (snap && targetTick % 3 === 0) {
+    if (snap && targetTick % 2 === 0) {
       this.broadcastControlToPeers({
         kind: 'frame',
         tick: targetTick,
