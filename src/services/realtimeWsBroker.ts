@@ -162,6 +162,7 @@ class RealtimeMultiplayerBroker {
   private rxSeqCounter = 1000;
   private txSeqCounter = 1;
   private lastSenderSeq = new Map<string, number>();
+  private kickoffClearedForScore = new Map<string, number>();
   private localPlayerUid = '';
   private directWs: WebSocket | null = null;
   private directWsConnected = false;
@@ -481,6 +482,10 @@ class RealtimeMultiplayerBroker {
 
     const fastPrefix = `${TOPIC_PREFIX}/fast/`;
     if (topic.startsWith(fastPrefix)) {
+      // If ultra-fast same-origin /ws is connected, ignore 150ms-delayed duplicate fast ticks from public MQTT brokers!
+      if (this.directWsConnected && !fromDirectWs) {
+        return;
+      }
       const roomId = topic.slice(fastPrefix.length);
       if (!roomId || payloadBytes.length === 0) return;
       if (this.deletedRoomIds.has(roomId)) return;
@@ -546,8 +551,35 @@ class RealtimeMultiplayerBroker {
         } else if (pkt.t === 'b') {
           const room = this.rooms.get(roomId);
           if (!room) return;
-          const nextKickoffActive =
+
+          const nextRedScore = Math.max(room.redScore, pkt.rs);
+          const nextBlueScore = Math.max(room.blueScore, pkt.bs);
+          const scoreTotal = nextRedScore + nextBlueScore;
+          const prevScoreTotal = room.redScore + room.blueScore;
+
+          // Ignore stale packets from a previous goal state
+          if (pkt.rs + pkt.bs < prevScoreTotal) {
+            return;
+          }
+
+          let nextKickoffActive =
             typeof pkt.ka === 'number' ? pkt.ka === 1 : room.kickoffActive;
+
+          const clearedScore = this.kickoffClearedForScore.get(roomId) ?? -1;
+          if (nextKickoffActive === false) {
+            this.kickoffClearedForScore.set(
+              roomId,
+              Math.max(clearedScore, scoreTotal)
+            );
+          } else if (
+            nextKickoffActive === true &&
+            scoreTotal <= clearedScore &&
+            pkt.es === 'normal'
+          ) {
+            // NEVER allow a late packet at the same score total to re-enable kickoffActive once cleared!
+            nextKickoffActive = false;
+          }
+
           const nextKickoffTeam = pkt.kt || room.kickoffTeam || 'red';
           const nextCountdownEnds =
             typeof pkt.ce === 'number' && pkt.ce > 0
@@ -558,10 +590,9 @@ class RealtimeMultiplayerBroker {
             : room.readyUids || [];
 
           const scoreOrEventChanged =
-            room.redScore !== pkt.rs ||
-            room.blueScore !== pkt.bs ||
+            room.redScore !== nextRedScore ||
+            room.blueScore !== nextBlueScore ||
             room.eventState !== pkt.es ||
-            room.eventUntilMs !== pkt.eu ||
             room.kickoffActive !== nextKickoffActive ||
             room.kickoffTeam !== nextKickoffTeam ||
             (room.countdownEndsAtMs || 0) !== nextCountdownEnds ||
@@ -571,8 +602,8 @@ class RealtimeMultiplayerBroker {
           room.ballY = pkt.by;
           room.ballVx = pkt.bvx;
           room.ballVy = pkt.bvy;
-          room.redScore = Math.max(room.redScore, pkt.rs);
-          room.blueScore = Math.max(room.blueScore, pkt.bs);
+          room.redScore = nextRedScore;
+          room.blueScore = nextBlueScore;
           room.eventState = pkt.es;
           room.eventTeam = pkt.et;
           room.eventUntilMs = pkt.eu;
@@ -615,6 +646,7 @@ class RealtimeMultiplayerBroker {
           return;
         }
         this.deletedRoomIds.set(roomId, Date.now());
+        this.kickoffClearedForScore.delete(roomId);
         this.rooms.delete(roomId);
         this.players.delete(roomId);
         this.emitStructuralChange(roomId);
@@ -628,6 +660,11 @@ class RealtimeMultiplayerBroker {
         const now = Date.now();
         const hb = parsed.heartbeatAtMs || parsed.updatedAtMs || 0;
         const isActiveLocalMatch = existing && existing.status === 'playing';
+
+        // If directWs is active during a live match, ignore delayed retained room echoes from external MQTT brokers
+        if (isActiveLocalMatch && this.directWsConnected && !fromDirectWs) {
+          return;
+        }
 
         // Never delete an active playing room due to sender clock skew or old MQTT retained messages!
         if (
@@ -643,6 +680,7 @@ class RealtimeMultiplayerBroker {
               true
             );
           }
+          this.kickoffClearedForScore.delete(roomId);
           this.rooms.delete(roomId);
           this.players.delete(roomId);
           this.emitStructuralChange(roomId);
@@ -675,6 +713,40 @@ class RealtimeMultiplayerBroker {
             ? parsed.matchStartedAtMs
             : existing?.matchStartedAtMs || 0;
 
+        const nextRedScore = Math.max(existing?.redScore || 0, parsed.redScore || 0);
+        const nextBlueScore = Math.max(existing?.blueScore || 0, parsed.blueScore || 0);
+        const scoreTotal = nextRedScore + nextBlueScore;
+        const clearedScore = this.kickoffClearedForScore.get(roomId) ?? -1;
+
+        let resolvedKickoffActive =
+          typeof parsed.kickoffActive === 'boolean'
+            ? parsed.kickoffActive
+            : existing?.kickoffActive ?? true;
+
+        if (resolvedKickoffActive === false) {
+          this.kickoffClearedForScore.set(
+            roomId,
+            Math.max(clearedScore, scoreTotal)
+          );
+        } else if (
+          resolvedKickoffActive === true &&
+          scoreTotal <= clearedScore &&
+          parsed.eventState === 'normal'
+        ) {
+          resolvedKickoffActive = false;
+        }
+
+        const isPostGoalCenterReset =
+          parsed.eventState === 'normal' &&
+          existing?.eventState === 'goal' &&
+          Math.hypot(parsed.ballX - 700, parsed.ballY - 380) < 2;
+
+        const keepExistingLiveBall =
+          existing &&
+          existing.status === 'playing' &&
+          parsed.eventState === 'normal' &&
+          !isPostGoalCenterReset;
+
         const localRxSeq = this.nextMonotonicSeq();
         this.rooms.set(roomId, {
           ...parsed,
@@ -684,36 +756,19 @@ class RealtimeMultiplayerBroker {
           launchAtMs: monotonicLaunchAtMs,
           matchStartedAtMs: monotonicMatchStartedAtMs,
           kickoffTeam: parsed.kickoffTeam || existing?.kickoffTeam || 'red',
-          kickoffActive:
-            typeof parsed.kickoffActive === 'boolean'
-              ? parsed.kickoffActive
-              : existing?.kickoffActive ?? true,
+          kickoffActive: resolvedKickoffActive,
           elapsedMatchMs: Math.max(
             existing?.elapsedMatchMs || 0,
             parsed.elapsedMatchMs || 0
           ),
-          redScore: Math.max(existing?.redScore || 0, parsed.redScore || 0),
-          blueScore: Math.max(existing?.blueScore || 0, parsed.blueScore || 0),
-          ballX:
-            existing && existing.status === 'playing' && parsed.eventState === 'normal'
-              ? existing.ballX
-              : parsed.ballX,
-          ballY:
-            existing && existing.status === 'playing' && parsed.eventState === 'normal'
-              ? existing.ballY
-              : parsed.ballY,
-          ballVx:
-            existing && existing.status === 'playing' && parsed.eventState === 'normal'
-              ? existing.ballVx
-              : parsed.ballVx,
-          ballVy:
-            existing && existing.status === 'playing' && parsed.eventState === 'normal'
-              ? existing.ballVy
-              : parsed.ballVy,
+          redScore: nextRedScore,
+          blueScore: nextBlueScore,
+          ballX: keepExistingLiveBall ? existing.ballX : parsed.ballX,
+          ballY: keepExistingLiveBall ? existing.ballY : parsed.ballY,
+          ballVx: keepExistingLiveBall ? existing.ballVx : parsed.ballVx,
+          ballVy: keepExistingLiveBall ? existing.ballVy : parsed.ballVy,
           seq:
-            existing &&
-            existing.status === 'playing' &&
-            parsed.eventState === 'normal' &&
+            keepExistingLiveBall &&
             existing.seq &&
             existing.seq < 1000000000
               ? existing.seq
@@ -760,14 +815,10 @@ class RealtimeMultiplayerBroker {
           existing.nickname !== parsed.nickname ||
           existing.jerseyNumber !== parsed.jerseyNumber;
 
-        // Only accept coordinates from retained players/ metadata packets on initial join or explicit spawn reset
+        // Only accept coordinates from retained players/ metadata packets on initial join or team switch
         const hasRecentLiveCoords =
           existing && Date.now() - (existing.updatedAtMs || 0) < 12000;
-        const isSpawnReset =
-          parsed.vx === 0 &&
-          parsed.vy === 0 &&
-          structuralChanged;
-        const shouldAcceptCoords = !existing || !hasRecentLiveCoords || isSpawnReset;
+        const shouldAcceptCoords = !existing || !hasRecentLiveCoords || structuralChanged;
 
         const localRxSeq = this.nextMonotonicSeq();
         rPlayers[uid] = {
@@ -817,6 +868,8 @@ class RealtimeMultiplayerBroker {
   ) {
     this.start();
 
+    const isFastTopic = !retain && topic.includes('/fast/');
+
     // 1. Always send over direct same-origin WebSocket (/ws) immediately at full 60Hz (<5ms latency, zero throttling)
     if (
       this.directWsConnected &&
@@ -833,17 +886,18 @@ class RealtimeMultiplayerBroker {
       } catch {
         // ignore
       }
+      // When direct same-origin /ws is active, do NOT send 60Hz fast gameplay packets to external public MQTT brokers!
+      // This eliminates main-thread socket serialization overhead and prevents 180ms-delayed MQTT echoes.
+      if (isFastTopic) {
+        return;
+      }
     }
 
-    // 2. For external public MQTT brokers (broker.emqx.io / broker.hivemq.com):
-    // Public brokers forcibly disconnect clients that flood >25 msg/sec (causing 2.5s+0.5s = 3s teleport stalls!).
-    // Always allow retained messages and '/rtc/' WebRTC signaling immediately,
-    // and rate-limit 'fast/' non-retained packets on external MQTT to ~16Hz (60ms per stream key).
-    const isFastTopic = !retain && topic.includes('/fast/');
+    // 2. Fallback for external public MQTT brokers (when direct /ws is unavailable, e.g. static hosting):
     if (isFastTopic) {
       const nowPerf = performance.now();
       const rateKey = `${topic}:${subKey}`;
-      const minIntervalMs = this.directWsConnected ? 90 : 55;
+      const minIntervalMs = 55;
       const prevPerf = this.lastExternalMqttFastSentMs.get(rateKey) || 0;
       if (nowPerf - prevPerf < minIntervalMs) {
         return;
@@ -871,6 +925,16 @@ class RealtimeMultiplayerBroker {
   public publishRoom(room: SyncedRoomRecord, retain = true) {
     this.start();
     const now = Date.now();
+    const scoreTotal = (room.redScore || 0) + (room.blueScore || 0);
+    if (room.status === 'waiting' && scoreTotal === 0) {
+      this.kickoffClearedForScore.delete(room.roomId);
+    } else if (room.kickoffActive === false) {
+      const prevCleared = this.kickoffClearedForScore.get(room.roomId) ?? -1;
+      this.kickoffClearedForScore.set(
+        room.roomId,
+        Math.max(prevCleared, scoreTotal)
+      );
+    }
     const stamped: SyncedRoomRecord = {
       ...room,
       seq: this.nextMonotonicSeq(),
@@ -979,6 +1043,14 @@ class RealtimeMultiplayerBroker {
     }
     const localSeq = this.nextMonotonicSeq();
     const outSeq = this.nextOutgoingSeq();
+    const scoreTotal = (patch.redScore || 0) + (patch.blueScore || 0);
+    if (patch.kickoffActive === false) {
+      const prevCleared = this.kickoffClearedForScore.get(roomId) ?? -1;
+      this.kickoffClearedForScore.set(
+        roomId,
+        Math.max(prevCleared, scoreTotal)
+      );
+    }
     const room = this.rooms.get(roomId);
     if (room) {
       room.redScore = Math.max(room.redScore, patch.redScore);

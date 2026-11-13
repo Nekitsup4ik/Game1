@@ -56,6 +56,7 @@ if (typeof window !== 'undefined') {
 // Fast in-memory store (zero JSON.parse/stringify overhead on main thread!)
 const memoryRooms = new Map<string, SyncedRoomRecord>();
 const memoryPlayers = new Map<string, Record<string, SyncedPlayerRecord>>();
+const memoryKickoffClearedScore = new Map<string, number>();
 
 // Start global WebSocket multiplayer broker immediately
 realtimeWsBroker.start();
@@ -89,10 +90,26 @@ if (bc) {
       const mergedReady = Array.from(
         new Set([...(prev?.readyUids || []), ...(r.readyUids || [])])
       );
+      const nextRed = Math.max(prev?.redScore || 0, r.redScore || 0);
+      const nextBlue = Math.max(prev?.blueScore || 0, r.blueScore || 0);
+      const scoreTotal = nextRed + nextBlue;
+      const clearedScore = memoryKickoffClearedScore.get(r.roomId) ?? -1;
+      let nextKickoffActive =
+        typeof r.kickoffActive === 'boolean'
+          ? r.kickoffActive
+          : prev?.kickoffActive ?? true;
+      if (nextKickoffActive === false) {
+        memoryKickoffClearedScore.set(r.roomId, Math.max(clearedScore, scoreTotal));
+      } else if (nextKickoffActive === true && scoreTotal <= clearedScore && r.eventState === 'normal') {
+        nextKickoffActive = false;
+      }
       memoryRooms.set(r.roomId, {
         ...r,
         status: nextStatus,
         readyUids: mergedReady,
+        redScore: nextRed,
+        blueScore: nextBlue,
+        kickoffActive: nextKickoffActive,
         countdownEndsAtMs:
           (r.countdownEndsAtMs || 0) > 0
             ? r.countdownEndsAtMs
@@ -114,6 +131,7 @@ if (bc) {
     } else if (data.type === 'delete_room' && data.roomId) {
       memoryRooms.delete(data.roomId);
       memoryPlayers.delete(data.roomId);
+      memoryKickoffClearedScore.delete(data.roomId);
     }
   });
 }
@@ -209,7 +227,7 @@ export function getLocalPingMs(): number {
 }
 
 /**
- * Direct 60 FPS Zero-Allocation Snapshot Reader for MatchArena.tsx
+ * Direct 60 FPS Snapshot Reader for MatchArena.tsx
  * Bypasses React state re-renders completely during active gameplay!
  */
 export function getLiveMatchSnapshot(roomId: string): {
@@ -233,9 +251,37 @@ export function getLiveMatchSnapshot(roomId: string): {
           ? 'playing'
           : primary.status;
 
-    const mergedReadyUids = Array.from(
-      new Set([...(memRoom.readyUids || []), ...(wsRoom.readyUids || [])])
-    );
+    const mergedReadyUids =
+      (memRoom.readyUids?.length || 0) === (wsRoom.readyUids?.length || 0)
+        ? primary.readyUids || []
+        : Array.from(
+            new Set([...(memRoom.readyUids || []), ...(wsRoom.readyUids || [])])
+          );
+
+    const nextRed = Math.max(memRoom.redScore || 0, wsRoom.redScore || 0);
+    const nextBlue = Math.max(memRoom.blueScore || 0, wsRoom.blueScore || 0);
+    const scoreTotal = nextRed + nextBlue;
+    const clearedScore = memoryKickoffClearedScore.get(roomId) ?? -1;
+
+    let resolvedKickoffActive =
+      typeof primary.kickoffActive === 'boolean'
+        ? primary.kickoffActive
+        : typeof secondary.kickoffActive === 'boolean'
+          ? secondary.kickoffActive
+          : true;
+
+    if (resolvedKickoffActive === false) {
+      memoryKickoffClearedScore.set(
+        roomId,
+        Math.max(clearedScore, scoreTotal)
+      );
+    } else if (
+      resolvedKickoffActive === true &&
+      scoreTotal <= clearedScore &&
+      primary.eventState === 'normal'
+    ) {
+      resolvedKickoffActive = false;
+    }
 
     bestRoom = {
       ...primary,
@@ -250,18 +296,13 @@ export function getLiveMatchSnapshot(roomId: string): {
           ? primary.countdownEndsAtMs
           : secondary.countdownEndsAtMs || 0,
       kickoffTeam: primary.kickoffTeam || secondary.kickoffTeam || 'red',
-      kickoffActive:
-        typeof primary.kickoffActive === 'boolean'
-          ? primary.kickoffActive
-          : typeof secondary.kickoffActive === 'boolean'
-            ? secondary.kickoffActive
-            : true,
+      kickoffActive: resolvedKickoffActive,
       elapsedMatchMs: Math.max(
         memRoom.elapsedMatchMs || 0,
         wsRoom.elapsedMatchMs || 0
       ),
-      redScore: Math.max(memRoom.redScore || 0, wsRoom.redScore || 0),
-      blueScore: Math.max(memRoom.blueScore || 0, wsRoom.blueScore || 0),
+      redScore: nextRed,
+      blueScore: nextBlue,
     };
   }
 
@@ -1541,6 +1582,29 @@ export function applyWebRTCAuthoritativeSnapshot(
         ? snap.countdownEndsAtMs
         : baseRoom.countdownEndsAtMs || 0;
 
+    const nextRed = Math.max(baseRoom.redScore, snap.redScore);
+    const nextBlue = Math.max(baseRoom.blueScore, snap.blueScore);
+    const scoreTotal = nextRed + nextBlue;
+    const clearedScore = memoryKickoffClearedScore.get(roomId) ?? -1;
+
+    let resolvedKickoffActive =
+      typeof snap.kickoffActive === 'boolean'
+        ? snap.kickoffActive
+        : baseRoom.kickoffActive ?? true;
+
+    if (resolvedKickoffActive === false) {
+      memoryKickoffClearedScore.set(
+        roomId,
+        Math.max(clearedScore, scoreTotal)
+      );
+    } else if (
+      resolvedKickoffActive === true &&
+      scoreTotal <= clearedScore &&
+      snap.eventState === 'normal'
+    ) {
+      resolvedKickoffActive = false;
+    }
+
     memoryRooms.set(roomId, {
       ...baseRoom,
       status: nextStatus,
@@ -1550,16 +1614,13 @@ export function applyWebRTCAuthoritativeSnapshot(
       readyUids: mergedReady,
       countdownEndsAtMs: nextCountdownEnds,
       kickoffTeam: snap.kickoffTeam || baseRoom.kickoffTeam || 'red',
-      kickoffActive:
-        typeof snap.kickoffActive === 'boolean'
-          ? snap.kickoffActive
-          : baseRoom.kickoffActive ?? true,
+      kickoffActive: resolvedKickoffActive,
       elapsedMatchMs:
         typeof snap.elapsedMatchMs === 'number'
           ? Math.max(baseRoom.elapsedMatchMs || 0, snap.elapsedMatchMs)
           : baseRoom.elapsedMatchMs || 0,
-      redScore: Math.max(baseRoom.redScore, snap.redScore),
-      blueScore: Math.max(baseRoom.blueScore, snap.blueScore),
+      redScore: nextRed,
+      blueScore: nextBlue,
       ballX: isEchoOfLocalBall ? baseRoom.ballX : snap.ballX,
       ballY: isEchoOfLocalBall ? baseRoom.ballY : snap.ballY,
       ballVx: isEchoOfLocalBall ? baseRoom.ballVx : snap.ballVx,
@@ -1673,6 +1734,32 @@ export async function syncRoomGameplayState(
       ? Array.from(new Set([...(baseRoom.readyUids || []), ...patch.readyUids]))
       : baseRoom.readyUids || [];
 
+    const nextRed = Math.max(baseRoom.redScore, clamp(Math.round(patch.redScore), 0, 99));
+    const nextBlue = Math.max(
+      baseRoom.blueScore,
+      clamp(Math.round(patch.blueScore), 0, 99)
+    );
+    const scoreTotal = nextRed + nextBlue;
+    const clearedScore = memoryKickoffClearedScore.get(roomId) ?? -1;
+
+    let resolvedKickoffActive =
+      typeof patch.kickoffActive === 'boolean'
+        ? patch.kickoffActive
+        : baseRoom.kickoffActive ?? false;
+
+    if (resolvedKickoffActive === false) {
+      memoryKickoffClearedScore.set(
+        roomId,
+        Math.max(clearedScore, scoreTotal)
+      );
+    } else if (
+      resolvedKickoffActive === true &&
+      scoreTotal <= clearedScore &&
+      patch.eventState === 'normal'
+    ) {
+      resolvedKickoffActive = false;
+    }
+
     const updatedRoom: SyncedRoomRecord = inGoalCelebration
       ? {
           ...baseRoom,
@@ -1687,11 +1774,8 @@ export async function syncRoomGameplayState(
         }
       : {
           ...baseRoom,
-          redScore: Math.max(baseRoom.redScore, clamp(Math.round(patch.redScore), 0, 99)),
-          blueScore: Math.max(
-            baseRoom.blueScore,
-            clamp(Math.round(patch.blueScore), 0, 99)
-          ),
+          redScore: nextRed,
+          blueScore: nextBlue,
           ballX: safeBallX,
           ballY: safeBallY,
           ballVx: safeBallVx,
@@ -1701,10 +1785,7 @@ export async function syncRoomGameplayState(
           eventUntilMs: Math.max(0, Math.round(patch.eventUntilMs)),
           lastTouchTeam: patch.lastTouchTeam,
           kickoffTeam: patch.kickoffTeam || baseRoom.kickoffTeam || 'red',
-          kickoffActive:
-            typeof patch.kickoffActive === 'boolean'
-              ? patch.kickoffActive
-              : baseRoom.kickoffActive ?? false,
+          kickoffActive: resolvedKickoffActive,
           elapsedMatchMs:
             typeof patch.elapsedMatchMs === 'number'
               ? Math.max(baseRoom.elapsedMatchMs || 0, patch.elapsedMatchMs)
@@ -1839,6 +1920,7 @@ export async function resetFormationAfterGoalDelay(
   if (room.hostUid !== currentUid) return;
 
   const now = Date.now();
+  const resetSeq = realtimeWsBroker.nextMonotonicSeq();
   const baseRoom =
     memoryRooms.get(room.roomId) ||
     realtimeWsBroker.getRoom(room.roomId) ||
@@ -1864,7 +1946,7 @@ export async function resetFormationAfterGoalDelay(
     lastTouchTeam: 'none',
     kickoffTeam: resolvedKickoffTeam,
     kickoffActive: true,
-    seq: realtimeWsBroker.nextMonotonicSeq(),
+    seq: resetSeq,
     updatedAtMs: now,
     heartbeatAtMs: now,
   };
@@ -1923,6 +2005,26 @@ export async function resetFormationAfterGoalDelay(
     bc?.postMessage({ type: 'player', player: pDoc });
   }
   realtimeWsBroker.publishRoom(updatedRoom, true);
+  realtimeWsBroker.publishFastBallTick(
+    room.roomId,
+    currentUid,
+    {
+      redScore: updatedRoom.redScore,
+      blueScore: updatedRoom.blueScore,
+      ballX: FIELD_CENTER_X,
+      ballY: FIELD_CENTER_Y,
+      ballVx: 0,
+      ballVy: 0,
+      eventState: 'normal',
+      eventTeam: 'none',
+      eventUntilMs: 0,
+      lastTouchTeam: 'none',
+      kickoffTeam: resolvedKickoffTeam,
+      kickoffActive: true,
+      elapsedMatchMs: updatedRoom.elapsedMatchMs,
+    },
+    resetSeq
+  );
 
   if (apiReachable) {
     postApiJson('/api/mp/room/reset-formation', {

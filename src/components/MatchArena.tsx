@@ -113,6 +113,8 @@ interface GoalNetNode {
 interface LocalPhysicsState {
   myX: number;
   myY: number;
+  prevMyX: number;
+  prevMyY: number;
   myOffsetX: number;
   myOffsetY: number;
   myVx: number;
@@ -121,11 +123,14 @@ interface LocalPhysicsState {
   myKickConsumed?: boolean;
   ballX: number;
   ballY: number;
+  prevBallX: number;
+  prevBallY: number;
   ballVx: number;
   ballVy: number;
   ballOffsetX: number;
   ballOffsetY: number;
   ballAngle: number;
+  prevBallAngle: number;
   lastTouchTeam: EventTeam;
   eventState: EventState;
   eventTeam: EventTeam;
@@ -145,6 +150,8 @@ interface LocalPhysicsState {
     {
       x: number;
       y: number;
+      prevX: number;
+      prevY: number;
       offsetX: number;
       offsetY: number;
       simX: number;

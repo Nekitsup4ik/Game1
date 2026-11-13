@@ -55,8 +55,8 @@ export const LOCKSTEP_STEP_MS = 1000 / LOCKSTEP_FPS; // 16.6667 мс
 export const MAX_EXTRAPOLATION_MS = 200;
 export const DEFAULT_EXTRAPOLATION_MS = 0; // Рекомендуемое значение — 0 мс
 export const SMOOTHING_FACTOR = 0.2; // Коэффициент сглаживания Jitter Damper (0.2)
-export const LOCKSTEP_WAIT_TIMEOUT_TICKS = 5; // 5 тиков (83 мс) -> пустой инпут
-export const LOCKSTEP_DISCONNECT_TIMEOUT_TICKS = 60; // 60 тиков (1 сек) -> закрыть RTCPeerConnection
+export const LOCKSTEP_WAIT_TIMEOUT_TICKS = 18; // 18 тиков (300 мс) удержания инпута для комфортной игры при пинге 100+ мс
+export const LOCKSTEP_DISCONNECT_TIMEOUT_TICKS = 180; // 180 тиков (3 сек) -> закрыть RTCPeerConnection
 export const PING_INTERVAL_MS = 3000;
 export const GOAL_PAUSE_TICKS = 3 * LOCKSTEP_FPS; // 180 тиков
 export const POWERSHOT_CHARGE_TICKS = 4 * LOCKSTEP_FPS; // 240 тиков
@@ -1182,6 +1182,7 @@ type DataChannelControlPacket =
       ballVx: number;
       ballVy: number;
       lastTouchTeam: EventTeam;
+      kickoffActive?: boolean;
     }
   | {
       kind: 'client_state';
@@ -1266,6 +1267,7 @@ export class WebRTCLockstepSession {
         ballVx: number;
         ballVy: number;
         lastTouchTeam: EventTeam;
+        kickoffActive?: boolean;
       }) => void)
     | null = null;
   private onStateSeedCallback:
@@ -1294,6 +1296,7 @@ export class WebRTCLockstepSession {
       ballVx: number;
       ballVy: number;
       lastTouchTeam: EventTeam;
+      kickoffActive?: boolean;
     }) => void;
     onStateSeed?: (world: DeterministicWorldState) => void;
     onPeerDisconnected?: (peerUid: string) => void;
@@ -1801,6 +1804,7 @@ export class WebRTCLockstepSession {
     ballVx: number;
     ballVy: number;
     lastTouchTeam: EventTeam;
+    kickoffActive?: boolean;
   }) {
     this.broadcastControlToPeers({
       kind: 'client_ball',
@@ -1810,19 +1814,21 @@ export class WebRTCLockstepSession {
       ballVx: ball.ballVx,
       ballVy: ball.ballVy,
       lastTouchTeam: ball.lastTouchTeam,
+      kickoffActive: ball.kickoffActive,
     });
   }
 
   /**
    * Менеджер Lockstep на Хосте:
    * - Очередь инпутов по tick для каждого клиента
-   * - Таймаут > 5 тиков (83 мс): подставляет пустой инпут EMPTY_INPUT_KEYS и продолжает симуляцию
-   * - Таймаут > 60 тиков (1 сек): закрывает RTCPeerConnection и удаляет игрока
+   * - Таймаут > 18 тиков (300 мс): подставляет пустой инпут EMPTY_INPUT_KEYS и продолжает симуляцию
+   * - Таймаут > 180 тиков (3 сек): закрывает RTCPeerConnection и удаляет игрока
    */
   public resolveHostLockstepFrame(
     targetTick: number,
     hostKeys: PlayerInputKeys,
-    snap?: FastAuthoritativeSnapshot
+    snap?: FastAuthoritativeSnapshot,
+    forceSnap = false
   ): {
     ready: boolean;
     frameInputs: Record<string, PlayerInputKeys>;
@@ -1856,15 +1862,14 @@ export class WebRTCLockstepSession {
       entry.ticksSinceLastInput += 1;
 
       if (entry.ticksSinceLastInput <= LOCKSTEP_WAIT_TIMEOUT_TICKS) {
-        // До 5 тиков (83 мс) удерживаем последний валидный инпут
+        // Удерживаем последний валидный инпут для плавного движения при пинге 100+ мс
         frameInputs[peerUid] = entry.lastInputKeys || { ...EMPTY_INPUT_KEYS };
       } else {
-        // Более 60 тиков (1 сек) без пакетов -> закрываем RTCPeerConnection и удаляем игрока
+        // Более 180 тиков (3 сек) без пакетов -> закрываем RTCPeerConnection и удаляем игрока
         if (entry.open && entry.ticksSinceLastInput > LOCKSTEP_DISCONNECT_TIMEOUT_TICKS) {
           this.closeAndRemovePeer(peerUid);
           continue;
         }
-        // Более 5 тиков (83 мс) -> подставляем пустой инпут { up:false, down:false, left:false, right:false, kick:false }
         frameInputs[peerUid] = { ...EMPTY_INPUT_KEYS };
       }
     }
@@ -1877,7 +1882,7 @@ export class WebRTCLockstepSession {
     );
     this.broadcastBinaryToPeers(binFrame);
 
-    if (snap && targetTick % 2 === 0) {
+    if (snap && (forceSnap || targetTick % 2 === 0)) {
       this.broadcastControlToPeers({
         kind: 'frame',
         tick: targetTick,
