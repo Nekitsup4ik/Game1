@@ -1137,6 +1137,12 @@ export interface FastAuthoritativeSnapshot {
   tick: number;
   roomStatus?: 'waiting' | 'playing' | 'finished';
   matchStartedAtMs?: number;
+  launchAtMs?: number;
+  readyUids?: string[];
+  countdownEndsAtMs?: number;
+  kickoffTeam?: TeamColor;
+  kickoffActive?: boolean;
+  elapsedMatchMs?: number;
   ballX: number;
   ballY: number;
   ballVx: number;

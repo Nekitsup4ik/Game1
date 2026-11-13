@@ -111,7 +111,16 @@ export default function App() {
 
     const unsub = subscribeToActiveRoom(activeRoomId, (roomData, playersData) => {
       if (roomData) {
-        setActiveRoom(roomData);
+        setActiveRoom((prev) => {
+          if (prev && prev.roomId === roomData.roomId) {
+            const rank = (s: MatchRoomDoc['status']) =>
+              s === 'finished' ? 2 : s === 'playing' ? 1 : 0;
+            if (rank(roomData.status) < rank(prev.status)) {
+              return { ...roomData, status: prev.status };
+            }
+          }
+          return roomData;
+        });
         setActivePlayers(playersData);
       } else {
         setActiveRoom(null);

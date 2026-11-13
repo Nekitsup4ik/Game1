@@ -1,4 +1,4 @@
-import { EventState, EventTeam, MatchRoomDoc, RoomPlayerDoc } from '../types/game';
+import { EventState, EventTeam, MatchRoomDoc, RoomPlayerDoc, TeamColor } from '../types/game';
 
 const TOPIC_PREFIX = 'haxarena2d/v3_live';
 const ROOMS_WILDCARD = `${TOPIC_PREFIX}/rooms/+`;
@@ -141,6 +141,11 @@ interface FastBallTickPacket {
   et: EventTeam;
   eu: number;
   lt: EventTeam;
+  kt?: TeamColor;
+  ka?: number;
+  em?: number;
+  ce?: number;
+  ru?: string[];
   s: number;
 }
 
@@ -541,11 +546,26 @@ class RealtimeMultiplayerBroker {
         } else if (pkt.t === 'b') {
           const room = this.rooms.get(roomId);
           if (!room) return;
+          const nextKickoffActive =
+            typeof pkt.ka === 'number' ? pkt.ka === 1 : room.kickoffActive;
+          const nextKickoffTeam = pkt.kt || room.kickoffTeam || 'red';
+          const nextCountdownEnds =
+            typeof pkt.ce === 'number' && pkt.ce > 0
+              ? pkt.ce
+              : room.countdownEndsAtMs || 0;
+          const mergedReady = Array.isArray(pkt.ru)
+            ? Array.from(new Set([...(room.readyUids || []), ...pkt.ru]))
+            : room.readyUids || [];
+
           const scoreOrEventChanged =
             room.redScore !== pkt.rs ||
             room.blueScore !== pkt.bs ||
             room.eventState !== pkt.es ||
-            room.eventUntilMs !== pkt.eu;
+            room.eventUntilMs !== pkt.eu ||
+            room.kickoffActive !== nextKickoffActive ||
+            room.kickoffTeam !== nextKickoffTeam ||
+            (room.countdownEndsAtMs || 0) !== nextCountdownEnds ||
+            (room.readyUids?.length || 0) !== mergedReady.length;
 
           room.ballX = pkt.bx;
           room.ballY = pkt.by;
@@ -557,6 +577,15 @@ class RealtimeMultiplayerBroker {
           room.eventTeam = pkt.et;
           room.eventUntilMs = pkt.eu;
           room.lastTouchTeam = pkt.lt;
+          room.kickoffTeam = nextKickoffTeam;
+          room.kickoffActive = nextKickoffActive;
+          if (typeof pkt.em === 'number') {
+            room.elapsedMatchMs = Math.max(room.elapsedMatchMs || 0, pkt.em);
+          }
+          if (nextCountdownEnds > 0) {
+            room.countdownEndsAtMs = nextCountdownEnds;
+          }
+          room.readyUids = mergedReady;
           room.actorUid = pkt.u;
           room.seq = localRxSeq;
           room.updatedAtMs = Date.now();
@@ -625,9 +654,46 @@ class RealtimeMultiplayerBroker {
           return;
         }
 
+        // NEVER allow a stale 'waiting' packet from another broker to downgrade an already 'playing' room!
+        const monotonicStatus =
+          existing && existing.status === 'playing' && parsed.status === 'waiting'
+            ? 'playing'
+            : parsed.status;
+        const mergedReadyUids = Array.from(
+          new Set([...(existing?.readyUids || []), ...(parsed.readyUids || [])])
+        );
+        const monotonicCountdownEndsAtMs =
+          (parsed.countdownEndsAtMs || 0) > 0
+            ? parsed.countdownEndsAtMs
+            : existing?.countdownEndsAtMs || 0;
+        const monotonicLaunchAtMs =
+          (parsed.launchAtMs || 0) > 0
+            ? parsed.launchAtMs
+            : existing?.launchAtMs || 0;
+        const monotonicMatchStartedAtMs =
+          (parsed.matchStartedAtMs || 0) > 0
+            ? parsed.matchStartedAtMs
+            : existing?.matchStartedAtMs || 0;
+
         const localRxSeq = this.nextMonotonicSeq();
         this.rooms.set(roomId, {
           ...parsed,
+          status: monotonicStatus,
+          readyUids: mergedReadyUids,
+          countdownEndsAtMs: monotonicCountdownEndsAtMs,
+          launchAtMs: monotonicLaunchAtMs,
+          matchStartedAtMs: monotonicMatchStartedAtMs,
+          kickoffTeam: parsed.kickoffTeam || existing?.kickoffTeam || 'red',
+          kickoffActive:
+            typeof parsed.kickoffActive === 'boolean'
+              ? parsed.kickoffActive
+              : existing?.kickoffActive ?? true,
+          elapsedMatchMs: Math.max(
+            existing?.elapsedMatchMs || 0,
+            parsed.elapsedMatchMs || 0
+          ),
+          redScore: Math.max(existing?.redScore || 0, parsed.redScore || 0),
+          blueScore: Math.max(existing?.blueScore || 0, parsed.blueScore || 0),
           ballX:
             existing && existing.status === 'playing' && parsed.eventState === 'normal'
               ? existing.ballX
@@ -899,6 +965,11 @@ class RealtimeMultiplayerBroker {
       eventTeam: EventTeam;
       eventUntilMs: number;
       lastTouchTeam: EventTeam;
+      kickoffTeam?: TeamColor;
+      kickoffActive?: boolean;
+      elapsedMatchMs?: number;
+      countdownEndsAtMs?: number;
+      readyUids?: string[];
     },
     _seq: number
   ) {
@@ -920,6 +991,21 @@ class RealtimeMultiplayerBroker {
       room.eventTeam = patch.eventTeam;
       room.eventUntilMs = patch.eventUntilMs;
       room.lastTouchTeam = patch.lastTouchTeam;
+      if (patch.kickoffTeam) room.kickoffTeam = patch.kickoffTeam;
+      if (typeof patch.kickoffActive === 'boolean') {
+        room.kickoffActive = patch.kickoffActive;
+      }
+      if (typeof patch.elapsedMatchMs === 'number') {
+        room.elapsedMatchMs = Math.max(room.elapsedMatchMs || 0, patch.elapsedMatchMs);
+      }
+      if (typeof patch.countdownEndsAtMs === 'number' && patch.countdownEndsAtMs > 0) {
+        room.countdownEndsAtMs = patch.countdownEndsAtMs;
+      }
+      if (Array.isArray(patch.readyUids)) {
+        room.readyUids = Array.from(
+          new Set([...(room.readyUids || []), ...patch.readyUids])
+        );
+      }
       room.actorUid = actorUid;
       room.seq = localSeq;
       room.updatedAtMs = Date.now();
@@ -939,6 +1025,11 @@ class RealtimeMultiplayerBroker {
       et: patch.eventTeam,
       eu: patch.eventUntilMs,
       lt: patch.lastTouchTeam,
+      kt: patch.kickoffTeam,
+      ka: typeof patch.kickoffActive === 'boolean' ? (patch.kickoffActive ? 1 : 0) : undefined,
+      em: patch.elapsedMatchMs,
+      ce: patch.countdownEndsAtMs,
+      ru: patch.readyUids,
       s: outSeq,
     };
     this.broadcastMqtt(

@@ -38,6 +38,12 @@ export interface MatchRoomDoc {
   eventTeam: EventTeam;
   eventUntilMs: number;
   lastTouchTeam: EventTeam;
+  launchAtMs?: number;
+  readyUids?: string[];
+  countdownEndsAtMs?: number;
+  kickoffTeam?: TeamColor;
+  kickoffActive?: boolean;
+  elapsedMatchMs?: number;
   seq?: number;
   actorUid?: string;
   heartbeatAtMs?: number;
@@ -73,6 +79,7 @@ export const FIELD_TOP = 60;
 export const FIELD_BOTTOM = 700;
 export const FIELD_CENTER_X = (FIELD_LEFT + FIELD_RIGHT) / 2; // 700
 export const FIELD_CENTER_Y = (FIELD_TOP + FIELD_BOTTOM) / 2; // 380
+export const CENTER_CIRCLE_RADIUS = 82;
 
 // Goal Dimensions
 export const GOAL_HALF_WIDTH = 108;
@@ -123,25 +130,145 @@ export const MATCH_DURATION_SEC = 300; // 5 minutes (300 seconds)
 export const MATCH_DURATION_MS = MATCH_DURATION_SEC * 1000;
 export const OUT_PAUSE_MS = 0; // Outs removed completely
 export const GOAL_PAUSE_MS = 3000; // 3 seconds after goal
+export const PREMATCH_MAX_WAIT_MS = 10000; // 10 seconds max wait for slow loaders
+export const COUNTDOWN_DURATION_MS = 3000; // 3-2-1 synchronized countdown
 
 /**
- * Computes starting 4v4 formation coordinates on each team's half of the pitch
+ * Computes starting 4v4 formation coordinates on each team's half of the pitch.
+ * Slot 0 stands in front right outside the center circle; Slot 1 stands in back as goalkeeper;
+ * Slots 2 & 3 stand on the top and bottom wings.
  */
 export function getTeamSpawnPosition(team: TeamColor, indexInTeam: number): { x: number; y: number } {
   const safeIndex = Math.max(0, Math.min(3, indexInTeam));
   const redFormation: Array<{ x: number; y: number }> = [
-    { x: FIELD_CENTER_X - 52, y: FIELD_CENTER_Y },
-    { x: FIELD_LEFT + 44, y: FIELD_CENTER_Y },
+    { x: FIELD_CENTER_X - 102, y: FIELD_CENTER_Y },
+    { x: FIELD_LEFT + 52, y: FIELD_CENTER_Y },
     { x: FIELD_CENTER_X - 250, y: FIELD_CENTER_Y - 105 },
     { x: FIELD_CENTER_X - 250, y: FIELD_CENTER_Y + 105 },
   ];
 
   const blueFormation: Array<{ x: number; y: number }> = [
-    { x: FIELD_CENTER_X + 52, y: FIELD_CENTER_Y },
-    { x: FIELD_RIGHT - 44, y: FIELD_CENTER_Y },
+    { x: FIELD_CENTER_X + 102, y: FIELD_CENTER_Y },
+    { x: FIELD_RIGHT - 52, y: FIELD_CENTER_Y },
     { x: FIELD_CENTER_X + 250, y: FIELD_CENTER_Y - 105 },
     { x: FIELD_CENTER_X + 250, y: FIELD_CENTER_Y + 105 },
   ];
 
   return team === 'red' ? redFormation[safeIndex] : blueFormation[safeIndex];
 }
+
+/**
+ * Enforces HaxBall / Rocket League kickoff half-line and center-circle restrictions
+ * while `kickoffActive === true` (before the kickoff team touches the ball):
+ * - The kicking team (`playerTeam === kickoffTeam`) can move on their own half AND inside the
+ *   opponent's half of the white center circle (`CENTER_CIRCLE_RADIUS`), but cannot cross onto
+ *   the opponent's half outside the center circle.
+ * - The defending team (`playerTeam !== kickoffTeam`) cannot cross the halfway line onto the
+ *   kicking team's half AND cannot enter the white center circle.
+ */
+export function enforceKickoffZoneConstraint(
+  x: number,
+  y: number,
+  vx: number,
+  vy: number,
+  playerTeam: TeamColor,
+  kickoffTeam: TeamColor
+): { x: number; y: number; vx: number; vy: number } {
+  let nx = x;
+  let ny = y;
+  let nvx = vx;
+  let nvy = vy;
+
+  const isKickingTeam = playerTeam === kickoffTeam;
+  const maxCircleInsideR = CENTER_CIRCLE_RADIUS - 2; // Allow kicking team inside the white circle
+  const minCircleOutsideR = CENTER_CIRCLE_RADIUS + PLAYER_RADIUS; // Keep defending team outside the white circle
+
+  if (isKickingTeam) {
+    if (playerTeam === 'red') {
+      // Red has kickoff: can be anywhere with x <= FIELD_CENTER_X, OR inside the right half of the white center circle
+      if (nx > FIELD_CENTER_X - PLAYER_RADIUS) {
+        const dx = nx - FIELD_CENTER_X;
+        const dy = ny - FIELD_CENTER_Y;
+        const dist = Math.hypot(dx, dy);
+        if (Math.abs(dy) >= maxCircleInsideR && nx > FIELD_CENTER_X - PLAYER_RADIUS) {
+          nx = FIELD_CENTER_X - PLAYER_RADIUS;
+          if (nvx > 0) nvx = 0;
+        } else if (nx > FIELD_CENTER_X && dist > maxCircleInsideR && dist > 0.001) {
+          const ux = dx / dist;
+          const uy = dy / dist;
+          nx = FIELD_CENTER_X + ux * maxCircleInsideR;
+          ny = FIELD_CENTER_Y + uy * maxCircleInsideR;
+          const radialV = nvx * ux + nvy * uy;
+          if (radialV > 0) {
+            nvx -= radialV * ux;
+            nvy -= radialV * uy;
+          }
+        }
+      }
+    } else {
+      // Blue has kickoff: can be anywhere with x >= FIELD_CENTER_X, OR inside the left half of the white center circle
+      if (nx < FIELD_CENTER_X + PLAYER_RADIUS) {
+        const dx = nx - FIELD_CENTER_X;
+        const dy = ny - FIELD_CENTER_Y;
+        const dist = Math.hypot(dx, dy);
+        if (Math.abs(dy) >= maxCircleInsideR && nx < FIELD_CENTER_X + PLAYER_RADIUS) {
+          nx = FIELD_CENTER_X + PLAYER_RADIUS;
+          if (nvx < 0) nvx = 0;
+        } else if (nx < FIELD_CENTER_X && dist > maxCircleInsideR && dist > 0.001) {
+          const ux = dx / dist;
+          const uy = dy / dist;
+          nx = FIELD_CENTER_X + ux * maxCircleInsideR;
+          ny = FIELD_CENTER_Y + uy * maxCircleInsideR;
+          const radialV = nvx * ux + nvy * uy;
+          if (radialV > 0) {
+            nvx -= radialV * ux;
+            nvy -= radialV * uy;
+          }
+        }
+      }
+    }
+  } else {
+    // Defending team: cannot cross halfway line AND cannot enter the white center circle
+    if (playerTeam === 'blue') {
+      if (nx < FIELD_CENTER_X + PLAYER_RADIUS) {
+        nx = FIELD_CENTER_X + PLAYER_RADIUS;
+        if (nvx < 0) nvx = 0;
+      }
+    } else {
+      if (nx > FIELD_CENTER_X - PLAYER_RADIUS) {
+        nx = FIELD_CENTER_X - PLAYER_RADIUS;
+        if (nvx > 0) nvx = 0;
+      }
+    }
+
+    const dx = nx - FIELD_CENTER_X;
+    const dy = ny - FIELD_CENTER_Y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < minCircleOutsideR) {
+      const safeDist = dist > 0.001 ? dist : 1;
+      const ux = dist > 0.001 ? dx / safeDist : playerTeam === 'blue' ? 1 : -1;
+      const uy = dist > 0.001 ? dy / safeDist : 0;
+      nx = FIELD_CENTER_X + ux * minCircleOutsideR;
+      ny = FIELD_CENTER_Y + uy * minCircleOutsideR;
+      if (playerTeam === 'blue' && nx < FIELD_CENTER_X + PLAYER_RADIUS) {
+        nx = FIELD_CENTER_X + PLAYER_RADIUS;
+      }
+      if (playerTeam === 'red' && nx > FIELD_CENTER_X - PLAYER_RADIUS) {
+        nx = FIELD_CENTER_X - PLAYER_RADIUS;
+      }
+      const radialV = nvx * ux + nvy * uy;
+      if (radialV < 0) {
+        nvx -= radialV * ux;
+        nvy -= radialV * uy;
+      }
+    }
+  }
+
+  return {
+    x: Math.round(nx * 10000) / 10000,
+    y: Math.round(ny * 10000) / 10000,
+    vx: Math.round(nvx * 10000) / 10000,
+    vy: Math.round(nvy * 10000) / 10000,
+  };
+}
+

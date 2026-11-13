@@ -81,8 +81,24 @@ if (bc) {
     if (!data) return;
     if (data.type === 'room' && data.room) {
       const r = data.room as SyncedRoomRecord;
+      const prev = memoryRooms.get(r.roomId);
+      const nextStatus =
+        prev && prev.status === 'playing' && r.status === 'waiting'
+          ? 'playing'
+          : r.status;
+      const mergedReady = Array.from(
+        new Set([...(prev?.readyUids || []), ...(r.readyUids || [])])
+      );
       memoryRooms.set(r.roomId, {
         ...r,
+        status: nextStatus,
+        readyUids: mergedReady,
+        countdownEndsAtMs:
+          (r.countdownEndsAtMs || 0) > 0
+            ? r.countdownEndsAtMs
+            : prev?.countdownEndsAtMs || 0,
+        launchAtMs:
+          (r.launchAtMs || 0) > 0 ? r.launchAtMs : prev?.launchAtMs || 0,
         seq: realtimeWsBroker.nextMonotonicSeq(),
         updatedAtMs: Date.now(),
       });
@@ -206,14 +222,47 @@ export function getLiveMatchSnapshot(roomId: string): {
 
   let bestRoom: SyncedRoomRecord | null = memRoom || wsRoom || null;
   if (memRoom && wsRoom) {
-    bestRoom =
-      normSeq(wsRoom.seq) >= normSeq(memRoom.seq)
-        ? wsRoom
-        : memRoom;
-    if (memRoom.redScore > bestRoom.redScore) bestRoom.redScore = memRoom.redScore;
-    if (memRoom.blueScore > bestRoom.blueScore) bestRoom.blueScore = memRoom.blueScore;
-    if (wsRoom.redScore > bestRoom.redScore) bestRoom.redScore = wsRoom.redScore;
-    if (wsRoom.blueScore > bestRoom.blueScore) bestRoom.blueScore = wsRoom.blueScore;
+    const primary =
+      normSeq(wsRoom.seq) >= normSeq(memRoom.seq) ? wsRoom : memRoom;
+    const secondary = primary === wsRoom ? memRoom : wsRoom;
+
+    const monotonicStatus =
+      primary.status === 'finished' || secondary.status === 'finished'
+        ? 'finished'
+        : primary.status === 'playing' || secondary.status === 'playing'
+          ? 'playing'
+          : primary.status;
+
+    const mergedReadyUids = Array.from(
+      new Set([...(memRoom.readyUids || []), ...(wsRoom.readyUids || [])])
+    );
+
+    bestRoom = {
+      ...primary,
+      status: monotonicStatus,
+      readyUids: mergedReadyUids,
+      launchAtMs:
+        (primary.launchAtMs || 0) > 0
+          ? primary.launchAtMs
+          : secondary.launchAtMs || 0,
+      countdownEndsAtMs:
+        (primary.countdownEndsAtMs || 0) > 0
+          ? primary.countdownEndsAtMs
+          : secondary.countdownEndsAtMs || 0,
+      kickoffTeam: primary.kickoffTeam || secondary.kickoffTeam || 'red',
+      kickoffActive:
+        typeof primary.kickoffActive === 'boolean'
+          ? primary.kickoffActive
+          : typeof secondary.kickoffActive === 'boolean'
+            ? secondary.kickoffActive
+            : true,
+      elapsedMatchMs: Math.max(
+        memRoom.elapsedMatchMs || 0,
+        wsRoom.elapsedMatchMs || 0
+      ),
+      redScore: Math.max(memRoom.redScore || 0, wsRoom.redScore || 0),
+      blueScore: Math.max(memRoom.blueScore || 0, wsRoom.blueScore || 0),
+    };
   }
 
   const memP = memoryPlayers.get(roomId) || {};
@@ -574,12 +623,13 @@ export function subscribeToActiveRoom(
       return;
     }
 
-    // Build structural signature (status, matchStartedAtMs, score, events, teams, nicknames, numbers)
+    // Build structural signature (status, countdown, readyUids, kickoff, score, events, teams, nicknames, numbers)
     const playerMetaSig = Object.values(players)
       .map((p) => `${p.playerId}:${p.team}:${p.nickname}:${p.jerseyNumber}`)
       .sort()
       .join('|');
-    const sig = `${room.status}:${room.matchStartedAtMs}:${room.redScore}:${room.blueScore}:${room.eventState}:${room.eventTeam}:${room.eventUntilMs}:${room.winnerTeam}:${room.memberUids.join(',')}:${room.redUids.join(',')}:${room.blueUids.join(',')}:${playerMetaSig}`;
+    const readySig = (room.readyUids || []).slice().sort().join(',');
+    const sig = `${room.status}:${room.matchStartedAtMs}:${room.launchAtMs || 0}:${room.countdownEndsAtMs || 0}:${readySig}:${room.kickoffTeam || 'red'}:${Boolean(room.kickoffActive)}:${room.redScore}:${room.blueScore}:${room.eventState}:${room.eventTeam}:${room.eventUntilMs}:${room.winnerTeam}:${room.memberUids.join(',')}:${room.redUids.join(',')}:${room.blueUids.join(',')}:${playerMetaSig}`;
 
     const now = Date.now();
     // Emit immediately if structural state changed, or every 3000ms (3s) to refresh pingMs in the Tab scoreboard
@@ -596,53 +646,17 @@ export function subscribeToActiveRoom(
     }
   });
 
-  // Real-time Firestore listener on rooms/{roomId} so room status ('waiting' -> 'playing'),
-  // 3-2-1 countdown (matchStartedAtMs), and team roster changes sync instantly across all clients
-  let unsubRoomFirestore: (() => void) | null = null;
-  if (!isFirestoreQuotaExceeded) {
-    unsubRoomFirestore = onSnapshot(
-      doc(db, 'rooms', roomId),
-      (snap) => {
-        if (cancelled || !snap.exists()) return;
-        const fRoom = snap.data() as MatchRoomDoc;
-        const now = Date.now();
-        const existing = memoryRooms.get(roomId) || realtimeWsBroker.getRoom(roomId);
-        const isPlayingalready = existing && existing.status === 'playing' && fRoom.status === 'playing';
-        const nextRoom: SyncedRoomRecord = {
-          ...(existing || fRoom),
-          status: fRoom.status,
-          hostUid: fRoom.hostUid,
-          hostName: fRoom.hostName,
-          memberUids: fRoom.memberUids || existing?.memberUids || [],
-          redUids: fRoom.redUids || existing?.redUids || [],
-          blueUids: fRoom.blueUids || existing?.blueUids || [],
-          matchStartedAtMs: fRoom.matchStartedAtMs || existing?.matchStartedAtMs || 0,
-          redScore: Math.max(existing?.redScore || 0, fRoom.redScore || 0),
-          blueScore: Math.max(existing?.blueScore || 0, fRoom.blueScore || 0),
-          winnerTeam: fRoom.winnerTeam || existing?.winnerTeam || 'none',
-          ballX: isPlayingalready ? existing.ballX : fRoom.ballX,
-          ballY: isPlayingalready ? existing.ballY : fRoom.ballY,
-          ballVx: isPlayingalready ? existing.ballVx : fRoom.ballVx,
-          ballVy: isPlayingalready ? existing.ballVy : fRoom.ballVy,
-          seq: existing?.seq || realtimeWsBroker.nextMonotonicSeq(),
-          updatedAtMs: now,
-          heartbeatAtMs: now,
-        };
-        memoryRooms.set(roomId, nextRoom);
-        emitIfStructuralOrPeriodic(false);
-      },
-      () => {
-        // ignore snapshot errors
-      }
-    );
-  }
-
-  // Poll Express API for room status/roster changes while waiting (NEVER overwrite live 60Hz positions!)
+  // Poll Express API for room status/roster/ready changes while waiting or loading (NEVER downgrade status or overwrite live 60Hz positions!)
   const fetchRoomApi = async () => {
     if (cancelled || inFlight || !apiReachable) return;
     const existingLocal = memoryRooms.get(roomId) || realtimeWsBroker.getRoom(roomId);
-    if (existingLocal && existingLocal.status === 'playing') {
-      // During active gameplay, WebRTC DataChannel & WebSocket handle 60Hz ticks
+    if (
+      existingLocal &&
+      existingLocal.status === 'playing' &&
+      (existingLocal.countdownEndsAtMs || 0) > 0 &&
+      Date.now() > (existingLocal.countdownEndsAtMs || 0) + 1500
+    ) {
+      // Once countdown has finished and live 60Hz gameplay is active, WebRTC DataChannel & WebSocket handle everything
       return;
     }
     inFlight = true;
@@ -652,17 +666,42 @@ export function subscribeToActiveRoom(
     }>(`/api/mp/room/${encodeURIComponent(roomId)}`);
 
     if (!cancelled && data && data.room) {
-      const prevRoom = memoryRooms.get(roomId);
+      const prevRoom = memoryRooms.get(roomId) || realtimeWsBroker.getRoom(roomId);
+      const monotonicStatus =
+        prevRoom && prevRoom.status === 'playing' && data.room.status === 'waiting'
+          ? 'playing'
+          : data.room.status;
+      const mergedReady = Array.from(
+        new Set([...(prevRoom?.readyUids || []), ...(data.room.readyUids || [])])
+      );
+      const nextCountdownEnds =
+        (data.room.countdownEndsAtMs || 0) > 0
+          ? data.room.countdownEndsAtMs
+          : prevRoom?.countdownEndsAtMs || 0;
+
       if (
         !prevRoom ||
-        data.room.status !== prevRoom.status ||
-        data.room.matchStartedAtMs !== prevRoom.matchStartedAtMs ||
+        monotonicStatus !== prevRoom.status ||
+        nextCountdownEnds !== (prevRoom.countdownEndsAtMs || 0) ||
+        mergedReady.length !== (prevRoom.readyUids?.length || 0) ||
         data.room.memberUids.length !== prevRoom.memberUids.length ||
         data.room.redUids.length !== prevRoom.redUids.length ||
         data.room.blueUids.length !== prevRoom.blueUids.length
       ) {
         memoryRooms.set(roomId, {
           ...data.room,
+          status: monotonicStatus,
+          readyUids: mergedReady,
+          countdownEndsAtMs: nextCountdownEnds,
+          launchAtMs:
+            (data.room.launchAtMs || 0) > 0
+              ? data.room.launchAtMs
+              : prevRoom?.launchAtMs || 0,
+          kickoffTeam: data.room.kickoffTeam || prevRoom?.kickoffTeam || 'red',
+          kickoffActive:
+            typeof data.room.kickoffActive === 'boolean'
+              ? data.room.kickoffActive
+              : prevRoom?.kickoffActive ?? true,
           seq: realtimeWsBroker.nextMonotonicSeq(),
           updatedAtMs: data.room.updatedAtMs || Date.now(),
           heartbeatAtMs: Date.now(),
@@ -700,7 +739,6 @@ export function subscribeToActiveRoom(
   return () => {
     cancelled = true;
     unsubWs();
-    if (unsubRoomFirestore) unsubRoomFirestore();
     window.clearInterval(apiPollId);
     window.clearInterval(uiPingRefreshId);
   };
@@ -1123,18 +1161,25 @@ export async function switchPlayerTeam(
   return { switched: true };
 }
 
-export const MATCH_COUNTDOWN_MS = 0;
+export const MATCH_COUNTDOWN_MS = 3000;
 
 export async function startMatchByHost(
   room: MatchRoomDoc,
   playersMap: Record<string, RoomPlayerDoc>
 ): Promise<void> {
   const now = Date.now();
-  const countdownTargetMs = now;
+  const initialReadyUids = [room.hostUid];
+  const allReadyImmediately = room.memberUids.every((uid) =>
+    initialReadyUids.includes(uid)
+  );
+  const initialCountdownEndsAtMs = allReadyImmediately ? now + 3000 : 0;
 
   postApiJson('/api/mp/room/start', {
     roomId: room.roomId,
-    matchStartedAtMs: countdownTargetMs,
+    matchStartedAtMs: now,
+    launchAtMs: now,
+    readyUids: initialReadyUids,
+    countdownEndsAtMs: initialCountdownEndsAtMs,
   }).catch(() => {});
 
   const updatedRoom: SyncedRoomRecord = {
@@ -1142,7 +1187,13 @@ export async function startMatchByHost(
     status: 'playing',
     redScore: 0,
     blueScore: 0,
-    matchStartedAtMs: countdownTargetMs,
+    matchStartedAtMs: now,
+    launchAtMs: now,
+    readyUids: initialReadyUids,
+    countdownEndsAtMs: initialCountdownEndsAtMs,
+    kickoffTeam: 'red',
+    kickoffActive: true,
+    elapsedMatchMs: 0,
     winnerTeam: 'none',
     ballX: FIELD_CENTER_X,
     ballY: FIELD_CENTER_Y,
@@ -1218,42 +1269,92 @@ export async function startMatchByHost(
     realtimeWsBroker.publishPlayer(pDoc, true);
   }
   realtimeWsBroker.publishRoom(updatedRoom, true);
+}
 
-  if (!isFirestoreQuotaExceeded) {
-    try {
-      const batch = writeBatch(db);
-      batch.update(doc(db, 'rooms', room.roomId), {
-        status: 'playing',
-        redScore: 0,
-        blueScore: 0,
-        matchStartedAtMs: countdownTargetMs,
-        ballX: FIELD_CENTER_X,
-        ballY: FIELD_CENTER_Y,
-        ballVx: 0,
-        ballVy: 0,
-        eventState: 'normal',
-        eventTeam: 'none',
-        eventUntilMs: 0,
-        lastTouchTeam: 'none',
-        updatedAt: serverTimestamp(),
-      });
-      for (const pDoc of resetPlayersList) {
-        batch.update(doc(db, 'rooms', room.roomId, 'players', pDoc.playerId), {
-          x: pDoc.x,
-          y: pDoc.y,
-          vx: 0,
-          vy: 0,
-          kicking: false,
-          updatedAt: serverTimestamp(),
-        });
-      }
-      batch.commit().catch((err) => {
-        handleFirestoreError(err, OperationType.UPDATE, `rooms/${room.roomId}`);
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `rooms/${room.roomId}`);
+/**
+ * Rocket League Pre-Match Loading Signal:
+ * Marks `uid` as loaded and standing on their starting formation slot.
+ * Once all `memberUids` are ready OR 10 seconds have elapsed since `launchAtMs`,
+ * starts the synchronized 3-2-1 countdown (`countdownEndsAtMs = now + 3000`).
+ */
+export async function markPlayerLoadedOnPitch(
+  roomId: string,
+  uid: string,
+  forceCountdownEndsAtMs?: number
+): Promise<void> {
+  const safeUid = sanitizeId(uid);
+  const now = Date.now();
+  const baseRoom =
+    memoryRooms.get(roomId) || realtimeWsBroker.getRoom(roomId);
+
+  if (baseRoom) {
+    const nextReady = Array.from(
+      new Set([...(baseRoom.readyUids || []), safeUid])
+    );
+    const allLoaded = baseRoom.memberUids.every((id) => nextReady.includes(id));
+    const waitElapsed = now - (baseRoom.launchAtMs || baseRoom.matchStartedAtMs || now);
+
+    let nextCountdownEnds = baseRoom.countdownEndsAtMs || 0;
+    if (
+      typeof forceCountdownEndsAtMs === 'number' &&
+      forceCountdownEndsAtMs > 0 &&
+      nextCountdownEnds === 0
+    ) {
+      nextCountdownEnds = forceCountdownEndsAtMs;
+    } else if (nextCountdownEnds === 0 && (allLoaded || waitElapsed >= 10000)) {
+      nextCountdownEnds = now + 3000;
+    }
+
+    const changed =
+      nextReady.length !== (baseRoom.readyUids?.length || 0) ||
+      nextCountdownEnds !== (baseRoom.countdownEndsAtMs || 0);
+
+    const updatedRoom: SyncedRoomRecord = {
+      ...baseRoom,
+      status: 'playing',
+      readyUids: nextReady,
+      countdownEndsAtMs: nextCountdownEnds,
+      seq: realtimeWsBroker.nextMonotonicSeq(),
+      updatedAtMs: now,
+      heartbeatAtMs: now,
+    };
+
+    memoryRooms.set(roomId, updatedRoom);
+    bc?.postMessage({ type: 'room', room: updatedRoom });
+    if (changed) {
+      realtimeWsBroker.publishRoom(updatedRoom, true);
     }
   }
+
+  postApiJson<{ ok: boolean; room?: SyncedRoomRecord }>('/api/mp/room/ready', {
+    roomId,
+    uid: safeUid,
+    forceCountdownEndsAtMs,
+  })
+    .then((res) => {
+      if (res && res.room) {
+        const prev = memoryRooms.get(roomId);
+        const mergedReady = Array.from(
+          new Set([...(prev?.readyUids || []), ...(res.room.readyUids || [])])
+        );
+        const nextCountdownEnds =
+          (res.room.countdownEndsAtMs || 0) > 0
+            ? res.room.countdownEndsAtMs
+            : prev?.countdownEndsAtMs || 0;
+        const merged: SyncedRoomRecord = {
+          ...(prev || res.room),
+          status: 'playing',
+          readyUids: mergedReady,
+          countdownEndsAtMs: nextCountdownEnds,
+          seq: realtimeWsBroker.nextMonotonicSeq(),
+          updatedAtMs: Date.now(),
+          heartbeatAtMs: Date.now(),
+        };
+        memoryRooms.set(roomId, merged);
+        realtimeWsBroker.publishRoom(merged, true);
+      }
+    })
+    .catch(() => {});
 }
 
 export async function syncLocalPlayerDisc(
@@ -1425,18 +1526,38 @@ export function applyWebRTCAuthoritativeSnapshot(
 
   if (baseRoom) {
     const nextStatus =
-      snap.roomStatus === 'playing' && baseRoom.status === 'waiting'
+      snap.roomStatus === 'playing' || baseRoom.status === 'playing'
         ? 'playing'
         : baseRoom.status;
     const nextMatchStartedAtMs =
       snap.matchStartedAtMs && snap.matchStartedAtMs > 0
         ? snap.matchStartedAtMs
         : baseRoom.matchStartedAtMs;
+    const mergedReady = Array.from(
+      new Set([...(baseRoom.readyUids || []), ...(snap.readyUids || [])])
+    );
+    const nextCountdownEnds =
+      (snap.countdownEndsAtMs || 0) > 0
+        ? snap.countdownEndsAtMs
+        : baseRoom.countdownEndsAtMs || 0;
 
     memoryRooms.set(roomId, {
       ...baseRoom,
       status: nextStatus,
       matchStartedAtMs: nextMatchStartedAtMs,
+      launchAtMs:
+        (snap.launchAtMs || 0) > 0 ? snap.launchAtMs : baseRoom.launchAtMs || 0,
+      readyUids: mergedReady,
+      countdownEndsAtMs: nextCountdownEnds,
+      kickoffTeam: snap.kickoffTeam || baseRoom.kickoffTeam || 'red',
+      kickoffActive:
+        typeof snap.kickoffActive === 'boolean'
+          ? snap.kickoffActive
+          : baseRoom.kickoffActive ?? true,
+      elapsedMatchMs:
+        typeof snap.elapsedMatchMs === 'number'
+          ? Math.max(baseRoom.elapsedMatchMs || 0, snap.elapsedMatchMs)
+          : baseRoom.elapsedMatchMs || 0,
       redScore: Math.max(baseRoom.redScore, snap.redScore),
       blueScore: Math.max(baseRoom.blueScore, snap.blueScore),
       ballX: isEchoOfLocalBall ? baseRoom.ballX : snap.ballX,
@@ -1518,6 +1639,11 @@ export async function syncRoomGameplayState(
     eventTeam: EventTeam;
     eventUntilMs: number;
     lastTouchTeam: EventTeam;
+    kickoffTeam?: TeamColor;
+    kickoffActive?: boolean;
+    elapsedMatchMs?: number;
+    countdownEndsAtMs?: number;
+    readyUids?: string[];
     actorUid?: string;
   }
 ): Promise<number> {
@@ -1542,6 +1668,10 @@ export async function syncRoomGameplayState(
       baseRoom.eventState === 'goal' &&
       now < baseRoom.eventUntilMs &&
       patch.eventState !== 'goal';
+
+    const mergedReady = Array.isArray(patch.readyUids)
+      ? Array.from(new Set([...(baseRoom.readyUids || []), ...patch.readyUids]))
+      : baseRoom.readyUids || [];
 
     const updatedRoom: SyncedRoomRecord = inGoalCelebration
       ? {
@@ -1570,6 +1700,20 @@ export async function syncRoomGameplayState(
           eventTeam: patch.eventTeam,
           eventUntilMs: Math.max(0, Math.round(patch.eventUntilMs)),
           lastTouchTeam: patch.lastTouchTeam,
+          kickoffTeam: patch.kickoffTeam || baseRoom.kickoffTeam || 'red',
+          kickoffActive:
+            typeof patch.kickoffActive === 'boolean'
+              ? patch.kickoffActive
+              : baseRoom.kickoffActive ?? false,
+          elapsedMatchMs:
+            typeof patch.elapsedMatchMs === 'number'
+              ? Math.max(baseRoom.elapsedMatchMs || 0, patch.elapsedMatchMs)
+              : baseRoom.elapsedMatchMs || 0,
+          countdownEndsAtMs:
+            (patch.countdownEndsAtMs || 0) > 0
+              ? patch.countdownEndsAtMs
+              : baseRoom.countdownEndsAtMs || 0,
+          readyUids: mergedReady,
           actorUid: patch.actorUid,
           seq: nextSeq,
           updatedAtMs: now,
@@ -1594,6 +1738,11 @@ export async function syncRoomGameplayState(
       eventTeam: patch.eventTeam,
       eventUntilMs: Math.max(0, Math.round(patch.eventUntilMs)),
       lastTouchTeam: patch.lastTouchTeam,
+      kickoffTeam: patch.kickoffTeam,
+      kickoffActive: patch.kickoffActive,
+      elapsedMatchMs: patch.elapsedMatchMs,
+      countdownEndsAtMs: patch.countdownEndsAtMs,
+      readyUids: patch.readyUids,
     },
     nextSeq
   );
@@ -1619,6 +1768,7 @@ export async function registerGoalInNet(
     Math.round(clamp(ballState.vx, -BALL_MAX_SPEED, BALL_MAX_SPEED) * 100) / 100;
   const safeVy =
     Math.round(clamp(ballState.vy, -BALL_MAX_SPEED, BALL_MAX_SPEED) * 100) / 100;
+  const concedingTeam: TeamColor = scoringTeam === 'red' ? 'blue' : 'red';
 
   const baseRoom =
     memoryRooms.get(room.roomId) ||
@@ -1636,6 +1786,8 @@ export async function registerGoalInNet(
     eventState: 'goal',
     eventTeam: scoringTeam,
     eventUntilMs: Math.round(goalPauseUntilMs),
+    kickoffTeam: concedingTeam,
+    kickoffActive: true,
     lastTouchTeam: 'none',
     seq: goalSeq,
     updatedAtMs: now,
@@ -1660,6 +1812,8 @@ export async function registerGoalInNet(
       eventTeam: scoringTeam,
       eventUntilMs: Math.round(goalPauseUntilMs),
       lastTouchTeam: 'none',
+      kickoffTeam: concedingTeam,
+      kickoffActive: true,
     },
     goalSeq
   );
@@ -1674,30 +1828,13 @@ export async function registerGoalInNet(
       ballState: { x: safeX, y: safeY, vx: safeVx, vy: safeVy },
     }).catch(() => {});
   }
-
-  if (!isFirestoreQuotaExceeded) {
-    updateDoc(doc(db, 'rooms', room.roomId), {
-      redScore: safeRed,
-      blueScore: safeBlue,
-      ballX: safeX,
-      ballY: safeY,
-      ballVx: safeVx,
-      ballVy: safeVy,
-      eventState: 'goal',
-      eventTeam: scoringTeam,
-      eventUntilMs: Math.round(goalPauseUntilMs),
-      lastTouchTeam: 'none',
-      updatedAt: serverTimestamp(),
-    }).catch((err) => {
-      handleFirestoreError(err, OperationType.UPDATE, `rooms/${room.roomId}`);
-    });
-  }
 }
 
 export async function resetFormationAfterGoalDelay(
   room: MatchRoomDoc,
   playersMap: Record<string, RoomPlayerDoc>,
-  currentUid: string
+  currentUid: string,
+  nextKickoffTeam?: TeamColor
 ): Promise<void> {
   if (room.hostUid !== currentUid) return;
 
@@ -1706,6 +1843,14 @@ export async function resetFormationAfterGoalDelay(
     memoryRooms.get(room.roomId) ||
     realtimeWsBroker.getRoom(room.roomId) ||
     ({ ...room, updatedAtMs: now } as SyncedRoomRecord);
+
+  const resolvedKickoffTeam: TeamColor =
+    nextKickoffTeam ||
+    (baseRoom.eventTeam === 'red'
+      ? 'blue'
+      : baseRoom.eventTeam === 'blue'
+        ? 'red'
+        : baseRoom.kickoffTeam || 'red');
 
   const updatedRoom: SyncedRoomRecord = {
     ...baseRoom,
@@ -1717,6 +1862,8 @@ export async function resetFormationAfterGoalDelay(
     eventTeam: 'none',
     eventUntilMs: 0,
     lastTouchTeam: 'none',
+    kickoffTeam: resolvedKickoffTeam,
+    kickoffActive: true,
     seq: realtimeWsBroker.nextMonotonicSeq(),
     updatedAtMs: now,
     heartbeatAtMs: now,
@@ -1778,9 +1925,10 @@ export async function resetFormationAfterGoalDelay(
   realtimeWsBroker.publishRoom(updatedRoom, true);
 
   if (apiReachable) {
-    postApiJson('/api/mp/room/reset-formation', { roomId: room.roomId }).catch(
-      () => {}
-    );
+    postApiJson('/api/mp/room/reset-formation', {
+      roomId: room.roomId,
+      kickoffTeam: resolvedKickoffTeam,
+    }).catch(() => {});
   }
 }
 

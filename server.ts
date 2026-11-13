@@ -414,11 +414,14 @@ async function startServer() {
     res.json({ switched: true, room });
   });
 
-  // 6. Start Match by Host (with Rocket League 3-2-1 Countdown)
+  // 6. Start Match by Host (Rocket League Pre-Match Loading -> 3-2-1 Countdown -> Red Kickoff)
   app.post('/api/mp/room/start', (req, res) => {
-    const { roomId, matchStartedAtMs } = req.body as {
+    const { roomId, matchStartedAtMs, launchAtMs, countdownEndsAtMs, readyUids } = req.body as {
       roomId: string;
       matchStartedAtMs?: number;
+      launchAtMs?: number;
+      countdownEndsAtMs?: number;
+      readyUids?: string[];
     };
     const room = roomsStore.get(roomId);
     if (!room) {
@@ -427,13 +430,29 @@ async function startServer() {
     }
 
     const now = Date.now();
+    const initialReady = Array.isArray(readyUids) && readyUids.length > 0
+      ? readyUids
+      : [room.hostUid];
+    const allReady = room.memberUids.every((uid) => initialReady.includes(uid));
+
     room.status = 'playing';
     room.redScore = 0;
     room.blueScore = 0;
+    room.launchAtMs = typeof launchAtMs === 'number' && launchAtMs > 0 ? launchAtMs : now;
+    room.readyUids = initialReady;
+    room.countdownEndsAtMs =
+      typeof countdownEndsAtMs === 'number' && countdownEndsAtMs > 0
+        ? countdownEndsAtMs
+        : allReady
+          ? now + 3000
+          : 0;
     room.matchStartedAtMs =
       typeof matchStartedAtMs === 'number' && matchStartedAtMs > 0
         ? matchStartedAtMs
         : now;
+    room.kickoffTeam = 'red';
+    room.kickoffActive = true;
+    room.elapsedMatchMs = 0;
     room.ballX = FIELD_CENTER_X;
     room.ballY = FIELD_CENTER_Y;
     room.ballVx = 0;
@@ -475,6 +494,43 @@ async function startServer() {
     });
     playersStore.set(roomId, roomPlayers);
 
+    res.json({ ok: true, room });
+  });
+
+  // 6b. Player Loaded onto Pitch (Rocket League Ready Check + 10s Timeout)
+  app.post('/api/mp/room/ready', (req, res) => {
+    const { roomId, uid, forceCountdownEndsAtMs } = req.body as {
+      roomId: string;
+      uid: string;
+      forceCountdownEndsAtMs?: number;
+    };
+    const room = roomsStore.get(roomId);
+    if (!room) {
+      res.json({ ok: false });
+      return;
+    }
+    const now = Date.now();
+    const nextReady = Array.from(new Set([...(room.readyUids || []), uid]));
+    room.readyUids = nextReady;
+
+    const allLoaded = room.memberUids.every((id) => nextReady.includes(id));
+    const waitElapsed = now - (room.launchAtMs || now);
+
+    if (
+      typeof forceCountdownEndsAtMs === 'number' &&
+      forceCountdownEndsAtMs > 0 &&
+      !(room.countdownEndsAtMs && room.countdownEndsAtMs > 0)
+    ) {
+      room.countdownEndsAtMs = forceCountdownEndsAtMs;
+    } else if (
+      !(room.countdownEndsAtMs && room.countdownEndsAtMs > 0) &&
+      (allLoaded || waitElapsed >= 10000)
+    ) {
+      room.countdownEndsAtMs = now + 3000;
+    }
+
+    room.updatedAtMs = now;
+    room.heartbeatAtMs = now;
     res.json({ ok: true, room });
   });
 
@@ -547,6 +603,11 @@ async function startServer() {
         eventTeam: EventTeam;
         eventUntilMs: number;
         lastTouchTeam: EventTeam;
+        kickoffTeam?: TeamColor;
+        kickoffActive?: boolean;
+        elapsedMatchMs?: number;
+        countdownEndsAtMs?: number;
+        readyUids?: string[];
         actorUid?: string;
         seq?: number;
       };
@@ -591,6 +652,21 @@ async function startServer() {
     room.eventTeam = patch.eventTeam;
     room.eventUntilMs = Math.max(0, Math.round(patch.eventUntilMs));
     room.lastTouchTeam = patch.lastTouchTeam;
+    if (patch.kickoffTeam) room.kickoffTeam = patch.kickoffTeam;
+    if (typeof patch.kickoffActive === 'boolean') {
+      room.kickoffActive = patch.kickoffActive;
+    }
+    if (typeof patch.elapsedMatchMs === 'number') {
+      room.elapsedMatchMs = Math.max(room.elapsedMatchMs || 0, patch.elapsedMatchMs);
+    }
+    if (typeof patch.countdownEndsAtMs === 'number' && patch.countdownEndsAtMs > 0) {
+      room.countdownEndsAtMs = patch.countdownEndsAtMs;
+    }
+    if (Array.isArray(patch.readyUids)) {
+      room.readyUids = Array.from(
+        new Set([...(room.readyUids || []), ...patch.readyUids])
+      );
+    }
     room.actorUid = patch.actorUid;
     room.seq = (room.seq || 0) + 1;
     room.updatedAtMs = now;
@@ -632,20 +708,32 @@ async function startServer() {
     room.eventState = 'goal';
     room.eventTeam = scoringTeam;
     room.eventUntilMs = Math.round(goalPauseUntilMs);
+    room.kickoffTeam = scoringTeam === 'red' ? 'blue' : 'red';
+    room.kickoffActive = true;
     room.lastTouchTeam = 'none';
     room.updatedAtMs = now;
     res.json({ ok: true, room });
   });
 
-  // 10. Reset Formation After 3s Goal Delay
+  // 10. Reset Formation After 3s Goal Delay (Conceding Team gets Kickoff!)
   app.post('/api/mp/room/reset-formation', (req, res) => {
-    const { roomId } = req.body as { roomId: string };
+    const { roomId, kickoffTeam } = req.body as {
+      roomId: string;
+      kickoffTeam?: TeamColor;
+    };
     const room = roomsStore.get(roomId);
     if (!room) {
       res.json({ ok: false });
       return;
     }
     const now = Date.now();
+    const nextKickoffTeam: TeamColor =
+      kickoffTeam ||
+      (room.eventTeam === 'red'
+        ? 'blue'
+        : room.eventTeam === 'blue'
+          ? 'red'
+          : room.kickoffTeam || 'red');
     room.ballX = FIELD_CENTER_X;
     room.ballY = FIELD_CENTER_Y;
     room.ballVx = 0;
@@ -654,6 +742,8 @@ async function startServer() {
     room.eventTeam = 'none';
     room.eventUntilMs = 0;
     room.lastTouchTeam = 'none';
+    room.kickoffTeam = nextKickoffTeam;
+    room.kickoffActive = true;
     room.updatedAtMs = now;
 
     const roomPlayers = playersStore.get(roomId) || {};
