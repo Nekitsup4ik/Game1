@@ -1183,6 +1183,11 @@ type DataChannelControlPacket =
       ballVy: number;
       lastTouchTeam: EventTeam;
       kickoffActive?: boolean;
+      redScore?: number;
+      blueScore?: number;
+      eventState?: EventState;
+      eventTeam?: EventTeam;
+      eventUntilMs?: number;
     }
   | {
       kind: 'client_state';
@@ -1268,6 +1273,11 @@ export class WebRTCLockstepSession {
         ballVy: number;
         lastTouchTeam: EventTeam;
         kickoffActive?: boolean;
+        redScore?: number;
+        blueScore?: number;
+        eventState?: EventState;
+        eventTeam?: EventTeam;
+        eventUntilMs?: number;
       }) => void)
     | null = null;
   private onStateSeedCallback:
@@ -1297,6 +1307,11 @@ export class WebRTCLockstepSession {
       ballVy: number;
       lastTouchTeam: EventTeam;
       kickoffActive?: boolean;
+      redScore?: number;
+      blueScore?: number;
+      eventState?: EventState;
+      eventTeam?: EventTeam;
+      eventUntilMs?: number;
     }) => void;
     onStateSeed?: (world: DeterministicWorldState) => void;
     onPeerDisconnected?: (peerUid: string) => void;
@@ -1783,7 +1798,7 @@ export class WebRTCLockstepSession {
     const binBuf = encodeBinaryClientInput4B(tick, mySlotId, keys);
     this.broadcastBinaryToPeers(binBuf);
 
-    if (state && (tick % 2 === 0 || state.kicking)) {
+    if (state) {
       this.broadcastControlToPeers({
         kind: 'client_state',
         tick,
@@ -1805,6 +1820,11 @@ export class WebRTCLockstepSession {
     ballVy: number;
     lastTouchTeam: EventTeam;
     kickoffActive?: boolean;
+    redScore?: number;
+    blueScore?: number;
+    eventState?: EventState;
+    eventTeam?: EventTeam;
+    eventUntilMs?: number;
   }) {
     this.broadcastControlToPeers({
       kind: 'client_ball',
@@ -1815,6 +1835,11 @@ export class WebRTCLockstepSession {
       ballVy: ball.ballVy,
       lastTouchTeam: ball.lastTouchTeam,
       kickoffActive: ball.kickoffActive,
+      redScore: ball.redScore,
+      blueScore: ball.blueScore,
+      eventState: ball.eventState,
+      eventTeam: ball.eventTeam,
+      eventUntilMs: ball.eventUntilMs,
     });
   }
 
@@ -1882,7 +1907,7 @@ export class WebRTCLockstepSession {
     );
     this.broadcastBinaryToPeers(binFrame);
 
-    if (snap && (forceSnap || targetTick % 2 === 0)) {
+    if (snap || forceSnap) {
       this.broadcastControlToPeers({
         kind: 'frame',
         tick: targetTick,

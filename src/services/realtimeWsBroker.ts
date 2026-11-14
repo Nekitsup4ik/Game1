@@ -606,10 +606,10 @@ class RealtimeMultiplayerBroker {
           }
 
           const nextKickoffTeam = pkt.kt || room.kickoffTeam || 'red';
-          const nextCountdownEnds =
-            typeof pkt.ce === 'number' && pkt.ce > 0
-              ? pkt.ce
-              : room.countdownEndsAtMs || 0;
+          const nextCountdownEnds = Math.max(
+            room.countdownEndsAtMs || 0,
+            typeof pkt.ce === 'number' && pkt.ce > 0 ? pkt.ce : 0
+          );
           const mergedReady = Array.isArray(pkt.ru)
             ? Array.from(new Set([...(room.readyUids || []), ...pkt.ru]))
             : room.readyUids || [];
@@ -725,10 +725,10 @@ class RealtimeMultiplayerBroker {
         const mergedReadyUids = Array.from(
           new Set([...(existing?.readyUids || []), ...(parsed.readyUids || [])])
         );
-        const monotonicCountdownEndsAtMs =
-          (parsed.countdownEndsAtMs || 0) > 0
-            ? parsed.countdownEndsAtMs
-            : existing?.countdownEndsAtMs || 0;
+        const monotonicCountdownEndsAtMs = Math.max(
+          existing?.countdownEndsAtMs || 0,
+          parsed.countdownEndsAtMs || 0
+        );
         const monotonicLaunchAtMs =
           (parsed.launchAtMs || 0) > 0
             ? parsed.launchAtMs
@@ -833,6 +833,12 @@ class RealtimeMultiplayerBroker {
           return;
         }
 
+        const room = this.rooms.get(roomId);
+        const isPlayingMatch = room?.status === 'playing';
+        if (isPlayingMatch && this.directWsConnected && !fromDirectWs) {
+          return;
+        }
+
         const existing = rPlayers[uid];
         const structuralChanged =
           !existing ||
@@ -840,14 +846,25 @@ class RealtimeMultiplayerBroker {
           existing.nickname !== parsed.nickname ||
           existing.jerseyNumber !== parsed.jerseyNumber;
 
-        // Only accept coordinates from retained players/ metadata packets on initial join or team switch
-        const hasRecentLiveCoords =
-          existing && Date.now() - (existing.updatedAtMs || 0) < 12000;
-        const shouldAcceptCoords = !existing || !hasRecentLiveCoords || structuralChanged;
+        // Never allow retained players/ metadata packets to overwrite live 60Hz coordinates during an active match!
+        const shouldAcceptCoords = !existing || !isPlayingMatch;
 
         const localRxSeq = this.nextMonotonicSeq();
         rPlayers[uid] = {
           ...parsed,
+          nickname:
+            parsed.nickname && parsed.nickname !== 'Player'
+              ? parsed.nickname
+              : existing?.nickname || parsed.nickname || 'Player',
+          jerseyNumber:
+            parsed.nickname && parsed.nickname !== 'Player'
+              ? parsed.jerseyNumber
+              : existing?.jerseyNumber || parsed.jerseyNumber || 10,
+          team: room?.blueUids?.includes(uid)
+            ? 'blue'
+            : room?.redUids?.includes(uid)
+              ? 'red'
+              : parsed.team || existing?.team || 'red',
           x: shouldAcceptCoords ? parsed.x : existing.x,
           y: shouldAcceptCoords ? parsed.y : existing.y,
           vx: shouldAcceptCoords ? parsed.vx : existing.vx,
@@ -856,7 +873,7 @@ class RealtimeMultiplayerBroker {
           kickUntilMs: existing?.kickUntilMs,
           keyMask: existing?.keyMask,
           seq: shouldAcceptCoords ? localRxSeq : existing.seq || localRxSeq,
-          updatedAtMs: Date.now(),
+          updatedAtMs: shouldAcceptCoords ? Date.now() : existing.updatedAtMs,
         };
         this.players.set(roomId, rPlayers);
         if (structuralChanged) {
@@ -1075,6 +1092,23 @@ class RealtimeMultiplayerBroker {
     this.players.set(player.roomId, rPlayers);
   }
 
+  public syncInMemoryFromWebRTC(
+    roomId: string,
+    room?: SyncedRoomRecord,
+    players?: Record<string, SyncedPlayerRecord>
+  ) {
+    if (room) {
+      this.rooms.set(roomId, { ...room });
+    }
+    if (players) {
+      const rPlayers = this.players.get(roomId) || {};
+      for (const [uid, pDoc] of Object.entries(players)) {
+        rPlayers[uid] = { ...pDoc };
+      }
+      this.players.set(roomId, rPlayers);
+    }
+  }
+
   public publishFastBallTick(
     roomId: string,
     actorUid: string,
@@ -1098,9 +1132,6 @@ class RealtimeMultiplayerBroker {
     _seq: number
   ) {
     this.start();
-    if (actorUid) {
-      this.localPlayerUid = actorUid;
-    }
     const localSeq = this.nextMonotonicSeq();
     const outSeq = this.nextOutgoingSeq();
     const scoreTotal = (patch.redScore || 0) + (patch.blueScore || 0);
@@ -1131,7 +1162,10 @@ class RealtimeMultiplayerBroker {
         room.elapsedMatchMs = Math.max(room.elapsedMatchMs || 0, patch.elapsedMatchMs);
       }
       if (typeof patch.countdownEndsAtMs === 'number' && patch.countdownEndsAtMs > 0) {
-        room.countdownEndsAtMs = patch.countdownEndsAtMs;
+        room.countdownEndsAtMs = Math.max(
+          room.countdownEndsAtMs || 0,
+          patch.countdownEndsAtMs
+        );
       }
       if (Array.isArray(patch.readyUids)) {
         room.readyUids = Array.from(

@@ -110,10 +110,10 @@ if (bc) {
         redScore: nextRed,
         blueScore: nextBlue,
         kickoffActive: nextKickoffActive,
-        countdownEndsAtMs:
-          (r.countdownEndsAtMs || 0) > 0
-            ? r.countdownEndsAtMs
-            : prev?.countdownEndsAtMs || 0,
+        countdownEndsAtMs: Math.max(
+          prev?.countdownEndsAtMs || 0,
+          r.countdownEndsAtMs || 0
+        ),
         launchAtMs:
           (r.launchAtMs || 0) > 0 ? r.launchAtMs : prev?.launchAtMs || 0,
         seq: realtimeWsBroker.nextMonotonicSeq(),
@@ -291,10 +291,10 @@ export function getLiveMatchSnapshot(roomId: string): {
         (primary.launchAtMs || 0) > 0
           ? primary.launchAtMs
           : secondary.launchAtMs || 0,
-      countdownEndsAtMs:
-        (primary.countdownEndsAtMs || 0) > 0
-          ? primary.countdownEndsAtMs
-          : secondary.countdownEndsAtMs || 0,
+      countdownEndsAtMs: Math.max(
+        primary.countdownEndsAtMs || 0,
+        secondary.countdownEndsAtMs || 0
+      ),
       kickoffTeam: primary.kickoffTeam || secondary.kickoffTeam || 'red',
       kickoffActive: resolvedKickoffActive,
       elapsedMatchMs: Math.max(
@@ -749,10 +749,10 @@ export function subscribeToActiveRoom(
       const mergedReady = Array.from(
         new Set([...(prevRoom?.readyUids || []), ...(data.room.readyUids || [])])
       );
-      const nextCountdownEnds =
-        (data.room.countdownEndsAtMs || 0) > 0
-          ? data.room.countdownEndsAtMs
-          : prevRoom?.countdownEndsAtMs || 0;
+      const nextCountdownEnds = Math.max(
+        prevRoom?.countdownEndsAtMs || 0,
+        data.room.countdownEndsAtMs || 0
+      );
 
       if (
         !prevRoom ||
@@ -1596,6 +1596,9 @@ export function applyWebRTCClientInputState(
     updatedAtMs: now,
   };
   memoryPlayers.set(roomId, pMap);
+  realtimeWsBroker.syncInMemoryFromWebRTC(roomId, undefined, {
+    [pkt.playerId]: pMap[pkt.playerId],
+  });
 }
 
 export function applyWebRTCAuthoritativeSnapshot(
@@ -1621,10 +1624,14 @@ export function applyWebRTCAuthoritativeSnapshot(
     const mergedReady = Array.from(
       new Set([...(baseRoom.readyUids || []), ...(snap.readyUids || [])])
     );
-    const nextCountdownEnds =
-      (snap.countdownEndsAtMs || 0) > 0
-        ? snap.countdownEndsAtMs
-        : baseRoom.countdownEndsAtMs || 0;
+    const nextCountdownEnds = Math.max(
+      baseRoom.countdownEndsAtMs || 0,
+      snap.countdownEndsAtMs || 0
+    );
+
+    const baseScoreTotal = (baseRoom.redScore || 0) + (baseRoom.blueScore || 0);
+    const snapScoreTotal = (snap.redScore || 0) + (snap.blueScore || 0);
+    const localHasNewerGoal = baseScoreTotal > snapScoreTotal;
 
     const nextRed = Math.max(baseRoom.redScore, snap.redScore);
     const nextBlue = Math.max(baseRoom.blueScore, snap.blueScore);
@@ -1634,7 +1641,7 @@ export function applyWebRTCAuthoritativeSnapshot(
     let resolvedKickoffActive =
       typeof snap.kickoffActive === 'boolean'
         ? snap.kickoffActive
-        : baseRoom.kickoffActive ?? true;
+        : baseRoom.kickoffActive ?? false;
 
     if (resolvedKickoffActive === false) {
       memoryKickoffClearedScore.set(
@@ -1649,6 +1656,8 @@ export function applyWebRTCAuthoritativeSnapshot(
       resolvedKickoffActive = false;
     }
 
+    const keepBaseBall = isEchoOfLocalBall || localHasNewerGoal;
+
     memoryRooms.set(roomId, {
       ...baseRoom,
       status: nextStatus,
@@ -1657,7 +1666,9 @@ export function applyWebRTCAuthoritativeSnapshot(
         (snap.launchAtMs || 0) > 0 ? snap.launchAtMs : baseRoom.launchAtMs || 0,
       readyUids: mergedReady,
       countdownEndsAtMs: nextCountdownEnds,
-      kickoffTeam: snap.kickoffTeam || baseRoom.kickoffTeam || 'red',
+      kickoffTeam: localHasNewerGoal
+        ? baseRoom.kickoffTeam || 'red'
+        : snap.kickoffTeam || baseRoom.kickoffTeam || 'red',
       kickoffActive: resolvedKickoffActive,
       elapsedMatchMs:
         typeof snap.elapsedMatchMs === 'number'
@@ -1665,15 +1676,15 @@ export function applyWebRTCAuthoritativeSnapshot(
           : baseRoom.elapsedMatchMs || 0,
       redScore: nextRed,
       blueScore: nextBlue,
-      ballX: isEchoOfLocalBall ? baseRoom.ballX : snap.ballX,
-      ballY: isEchoOfLocalBall ? baseRoom.ballY : snap.ballY,
-      ballVx: isEchoOfLocalBall ? baseRoom.ballVx : snap.ballVx,
-      ballVy: isEchoOfLocalBall ? baseRoom.ballVy : snap.ballVy,
-      eventState: snap.eventState,
-      eventTeam: snap.eventTeam,
-      eventUntilMs: snap.eventUntilMs,
-      lastTouchTeam: snap.lastTouchTeam,
-      actorUid: snap.actorUid,
+      ballX: keepBaseBall ? baseRoom.ballX : snap.ballX,
+      ballY: keepBaseBall ? baseRoom.ballY : snap.ballY,
+      ballVx: keepBaseBall ? baseRoom.ballVx : snap.ballVx,
+      ballVy: keepBaseBall ? baseRoom.ballVy : snap.ballVy,
+      eventState: localHasNewerGoal ? baseRoom.eventState : snap.eventState,
+      eventTeam: localHasNewerGoal ? baseRoom.eventTeam : snap.eventTeam,
+      eventUntilMs: localHasNewerGoal ? baseRoom.eventUntilMs : snap.eventUntilMs,
+      lastTouchTeam: localHasNewerGoal ? baseRoom.lastTouchTeam : snap.lastTouchTeam,
+      actorUid: localHasNewerGoal ? baseRoom.actorUid : snap.actorUid,
       seq: nextSeq,
       updatedAtMs: now,
       heartbeatAtMs: now,
@@ -1740,6 +1751,11 @@ export function applyWebRTCAuthoritativeSnapshot(
   }
   hostAuthoritativePlayers.set(roomId, authMap);
   memoryPlayers.set(roomId, pMap);
+  realtimeWsBroker.syncInMemoryFromWebRTC(
+    roomId,
+    memoryRooms.get(roomId),
+    pMap
+  );
 }
 
 export async function syncRoomGameplayState(
@@ -1845,10 +1861,10 @@ export async function syncRoomGameplayState(
             typeof patch.elapsedMatchMs === 'number'
               ? Math.max(baseRoom.elapsedMatchMs || 0, patch.elapsedMatchMs)
               : baseRoom.elapsedMatchMs || 0,
-          countdownEndsAtMs:
-            (patch.countdownEndsAtMs || 0) > 0
-              ? patch.countdownEndsAtMs
-              : baseRoom.countdownEndsAtMs || 0,
+          countdownEndsAtMs: Math.max(
+            baseRoom.countdownEndsAtMs || 0,
+            patch.countdownEndsAtMs || 0
+          ),
           readyUids: mergedReady,
           actorUid: patch.actorUid,
           seq: nextSeq,
@@ -1892,7 +1908,8 @@ export async function registerGoalInNet(
   newRedScore: number,
   newBlueScore: number,
   goalPauseUntilMs: number,
-  ballState: { x: number; y: number; vx: number; vy: number }
+  ballState: { x: number; y: number; vx: number; vy: number },
+  actorUid?: string
 ): Promise<void> {
   const now = Date.now();
   const goalSeq = realtimeWsBroker.nextMonotonicSeq();
@@ -1913,8 +1930,8 @@ export async function registerGoalInNet(
 
   const updatedRoom: SyncedRoomRecord = {
     ...baseRoom,
-    redScore: safeRed,
-    blueScore: safeBlue,
+    redScore: Math.max(baseRoom.redScore || 0, safeRed),
+    blueScore: Math.max(baseRoom.blueScore || 0, safeBlue),
     ballX: safeX,
     ballY: safeY,
     ballVx: safeVx,
@@ -1923,8 +1940,9 @@ export async function registerGoalInNet(
     eventTeam: scoringTeam,
     eventUntilMs: Math.round(goalPauseUntilMs),
     kickoffTeam: concedingTeam,
-    kickoffActive: true,
+    kickoffActive: false,
     lastTouchTeam: 'none',
+    actorUid: actorUid || '',
     seq: goalSeq,
     updatedAtMs: now,
     heartbeatAtMs: now,
@@ -1936,10 +1954,10 @@ export async function registerGoalInNet(
   realtimeWsBroker.publishRoom(updatedRoom, true);
   realtimeWsBroker.publishFastBallTick(
     room.roomId,
-    room.hostUid,
+    actorUid || '',
     {
-      redScore: safeRed,
-      blueScore: safeBlue,
+      redScore: updatedRoom.redScore,
+      blueScore: updatedRoom.blueScore,
       ballX: safeX,
       ballY: safeY,
       ballVx: safeVx,
@@ -1949,7 +1967,7 @@ export async function registerGoalInNet(
       eventUntilMs: Math.round(goalPauseUntilMs),
       lastTouchTeam: 'none',
       kickoffTeam: concedingTeam,
-      kickoffActive: true,
+      kickoffActive: false,
     },
     goalSeq
   );
