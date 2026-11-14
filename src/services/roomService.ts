@@ -308,16 +308,50 @@ export function getLiveMatchSnapshot(roomId: string): {
 
   const memP = memoryPlayers.get(roomId) || {};
   const wsP = realtimeWsBroker.getRoomPlayers(roomId);
-  const mergedPlayers: Record<string, SyncedPlayerRecord> = { ...memP };
+  const allUids = Array.from(
+    new Set([...Object.keys(memP), ...Object.keys(wsP)])
+  );
+  const mergedPlayers: Record<string, SyncedPlayerRecord> = {};
 
-  for (const [uid, pDoc] of Object.entries(wsP)) {
-    const prev = mergedPlayers[uid];
-    if (
-      !prev ||
-      normSeq(pDoc.seq) >= normSeq(prev.seq)
-    ) {
-      mergedPlayers[uid] = pDoc;
-    }
+  for (const uid of allUids) {
+    const mDoc = memP[uid];
+    const wDoc = wsP[uid];
+    const primary =
+      mDoc && wDoc
+        ? normSeq(wDoc.seq) >= normSeq(mDoc.seq)
+          ? wDoc
+          : mDoc
+        : (wDoc || mDoc)!;
+    const secondary = primary === wDoc ? mDoc : wDoc;
+
+    const resolvedTeam: TeamColor = bestRoom?.blueUids?.includes(uid)
+      ? 'blue'
+      : bestRoom?.redUids?.includes(uid)
+        ? 'red'
+        : primary.nickname && primary.nickname !== 'Player'
+          ? primary.team
+          : secondary?.team || primary.team || 'red';
+
+    const resolvedNickname =
+      primary.nickname && primary.nickname !== 'Player'
+        ? primary.nickname
+        : secondary?.nickname && secondary.nickname !== 'Player'
+          ? secondary.nickname
+          : primary.nickname || 'Player';
+
+    const resolvedJersey =
+      primary.nickname && primary.nickname !== 'Player'
+        ? primary.jerseyNumber
+        : secondary?.nickname && secondary.nickname !== 'Player'
+          ? secondary.jerseyNumber
+          : primary.jerseyNumber || 10;
+
+    mergedPlayers[uid] = {
+      ...primary,
+      nickname: resolvedNickname,
+      jerseyNumber: resolvedJersey,
+      team: resolvedTeam,
+    };
   }
 
   return { room: bestRoom, players: mergedPlayers };
@@ -761,6 +795,7 @@ export function subscribeToActiveRoom(
             jerseyNumber: pDoc.jerseyNumber,
           };
         }
+        realtimeWsBroker.syncPlayerMeta(memP[uid]);
       }
       memoryPlayers.set(roomId, memP);
       emitIfStructuralOrPeriodic(false);
@@ -1511,8 +1546,15 @@ export function applyWebRTCClientInputState(
   const now = Date.now();
   const pMap = memoryPlayers.get(roomId) || {};
   const wsPlayers = realtimeWsBroker.getRoomPlayers(roomId);
-  const existing = pMap[pkt.playerId] || wsPlayers[pkt.playerId];
   const baseRoom = memoryRooms.get(roomId) || realtimeWsBroker.getRoom(roomId);
+  const mDoc = pMap[pkt.playerId];
+  const wDoc = wsPlayers[pkt.playerId];
+  const existing =
+    mDoc && mDoc.nickname !== 'Player'
+      ? mDoc
+      : wDoc && wDoc.nickname !== 'Player'
+        ? wDoc
+        : mDoc || wDoc;
 
   const km = typeof pkt.keyMask === 'number' ? pkt.keyMask : pkt.kicking ? 16 : 0;
   const isKickingNow = Boolean(pkt.kicking || (km & 16) !== 0);
@@ -1537,9 +1579,11 @@ export function applyWebRTCClientInputState(
     roomId,
     nickname: existing?.nickname || 'Player',
     jerseyNumber: existing?.jerseyNumber || 10,
-    team:
-      existing?.team ||
-      (baseRoom?.blueUids.includes(pkt.playerId) ? 'blue' : 'red'),
+    team: baseRoom?.blueUids?.includes(pkt.playerId)
+      ? 'blue'
+      : baseRoom?.redUids?.includes(pkt.playerId)
+        ? 'red'
+        : existing?.team || 'red',
     x: pkt.x,
     y: pkt.y,
     vx: pkt.vx || 0,
@@ -1651,8 +1695,14 @@ export function applyWebRTCAuthoritativeSnapshot(
     };
     if (localUid && uid === localUid) continue;
 
+    const mDoc = pMap[uid];
     const wsP = wsPlayers[uid];
-    const existing = pMap[uid] || wsP;
+    const existing =
+      mDoc && mDoc.nickname !== 'Player'
+        ? mDoc
+        : wsP && wsP.nickname !== 'Player'
+          ? wsP
+          : mDoc || wsP;
     const km =
       typeof pState.keyMask === 'number'
         ? pState.keyMask
@@ -1665,12 +1715,17 @@ export function applyWebRTCAuthoritativeSnapshot(
       playerId: uid,
       roomId,
       nickname:
-        existing?.nickname ||
-        (uid === hostUid ? baseRoom?.hostName || 'Host' : 'Player'),
+        existing?.nickname && existing.nickname !== 'Player'
+          ? existing.nickname
+          : uid === hostUid
+            ? baseRoom?.hostName || 'Host'
+            : existing?.nickname || 'Player',
       jerseyNumber: existing?.jerseyNumber || 10,
-      team:
-        existing?.team ||
-        (baseRoom?.blueUids.includes(uid) ? 'blue' : 'red'),
+      team: baseRoom?.blueUids?.includes(uid)
+        ? 'blue'
+        : baseRoom?.redUids?.includes(uid)
+          ? 'red'
+          : existing?.team || 'red',
       x: pState.x,
       y: pState.y,
       vx: pState.vx,
@@ -1934,6 +1989,7 @@ export async function resetFormationAfterGoalDelay(
         ? 'red'
         : baseRoom.kickoffTeam || 'red');
 
+  const nextCountdownEndsAtMs = now + 3000;
   const updatedRoom: SyncedRoomRecord = {
     ...baseRoom,
     ballX: FIELD_CENTER_X,
@@ -1945,7 +2001,8 @@ export async function resetFormationAfterGoalDelay(
     eventUntilMs: 0,
     lastTouchTeam: 'none',
     kickoffTeam: resolvedKickoffTeam,
-    kickoffActive: true,
+    kickoffActive: false,
+    countdownEndsAtMs: nextCountdownEndsAtMs,
     seq: resetSeq,
     updatedAtMs: now,
     heartbeatAtMs: now,
@@ -2020,7 +2077,8 @@ export async function resetFormationAfterGoalDelay(
       eventUntilMs: 0,
       lastTouchTeam: 'none',
       kickoffTeam: resolvedKickoffTeam,
-      kickoffActive: true,
+      kickoffActive: false,
+      countdownEndsAtMs: nextCountdownEndsAtMs,
       elapsedMatchMs: updatedRoom.elapsedMatchMs,
     },
     resetSeq

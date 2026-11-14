@@ -113,8 +113,6 @@ interface GoalNetNode {
 interface LocalPhysicsState {
   myX: number;
   myY: number;
-  prevMyX: number;
-  prevMyY: number;
   myOffsetX: number;
   myOffsetY: number;
   myVx: number;
@@ -123,14 +121,11 @@ interface LocalPhysicsState {
   myKickConsumed?: boolean;
   ballX: number;
   ballY: number;
-  prevBallX: number;
-  prevBallY: number;
   ballVx: number;
   ballVy: number;
   ballOffsetX: number;
   ballOffsetY: number;
   ballAngle: number;
-  prevBallAngle: number;
   lastTouchTeam: EventTeam;
   eventState: EventState;
   eventTeam: EventTeam;
@@ -150,8 +145,6 @@ interface LocalPhysicsState {
     {
       x: number;
       y: number;
-      prevX: number;
-      prevY: number;
       offsetX: number;
       offsetY: number;
       simX: number;
@@ -748,7 +741,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     eventTeam: room.eventTeam ?? 'none',
     eventUntilMs: room.eventUntilMs ?? 0,
     kickoffTeam: room.kickoffTeam || 'red',
-    kickoffActive: room.kickoffActive ?? true,
+    kickoffActive: false,
     elapsedMatchMs: room.elapsedMatchMs ?? 0,
     lastNetSwishMs: 0,
     controllingUid: '',
@@ -762,6 +755,9 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
 
   const roomRef = useRef<MatchRoomDoc>(room);
   const playersRef = useRef<Record<string, RoomPlayerDoc>>(players);
+  const knownPlayerMetaRef = useRef<
+    Record<string, { nickname: string; jerseyNumber: number; team: TeamColor }>
+  >({});
   const soundEnabledRef = useRef<boolean>(soundEnabled);
   const lastPlayerSyncMsRef = useRef<number>(0);
   const lastBallSyncMsRef = useRef<number>(0);
@@ -782,6 +778,13 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     room.seq && room.seq < 1000000000 ? room.seq : 0
   );
   const lastHandledEventUntilRef = useRef<number>(0);
+  const lastResetScoreHandledRef = useRef<number>(room.redScore + room.blueScore);
+  const localCountdownEndsAtMsRef = useRef<number>(
+    room.countdownEndsAtMs && room.countdownEndsAtMs > Date.now()
+      ? Date.now() + Math.min(COUNTDOWN_DURATION_MS, room.countdownEndsAtMs - Date.now())
+      : 0
+  );
+  const lastSeenRemoteCountdownRef = useRef<number>(room.countdownEndsAtMs || 0);
   const pendingRtcBallRef = useRef<{
     ballX: number;
     ballY: number;
@@ -818,7 +821,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     waitSecondsLeft: 10,
     countdownNumber: 3,
     goBannerActive: false,
-    kickoffActive: room.kickoffActive ?? true,
+    kickoffActive: false,
     kickoffTeam: room.kickoffTeam || 'red',
   }));
 
@@ -826,7 +829,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     soundEnabledRef.current = soundEnabled;
   }, [soundEnabled]);
 
-  // Rocket League Pre-Match Loading & 10-Second Max Wait + Synchronized 3-2-1 Countdown
+  // Rocket League Pre-Match Loading & 10-Second Max Wait + Synchronized 3-2-1 Countdown (at start & after every goal)
   useEffect(() => {
     markPlayerLoadedOnPitch(room.roomId, profile.uid).catch(() => {});
 
@@ -835,6 +838,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       const nowMs = Date.now();
       const readyList = curRoom.readyUids || [];
       const memberList = curRoom.memberUids || [];
+      const scoreTotal = (curRoom.redScore || 0) + (curRoom.blueScore || 0);
 
       if (!readyList.includes(profile.uid)) {
         markPlayerLoadedOnPitch(curRoom.roomId, profile.uid).catch(() => {});
@@ -858,54 +862,73 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
       const waitTimedOut = waitElapsedMs >= PREMATCH_MAX_WAIT_MS;
 
       let countdownEndsAt = curRoom.countdownEndsAtMs || 0;
-      if (countdownEndsAt === 0 && (allMembersReady || waitTimedOut)) {
+      if (countdownEndsAt === 0 && (allMembersReady || waitTimedOut || scoreTotal > 0)) {
         countdownEndsAt = nowMs + COUNTDOWN_DURATION_MS;
         curRoom.countdownEndsAtMs = countdownEndsAt;
+        lastSeenRemoteCountdownRef.current = countdownEndsAt;
+        localCountdownEndsAtMsRef.current = nowMs + COUNTDOWN_DURATION_MS;
+        lastCountdownBeepRef.current = 99;
         markPlayerLoadedOnPitch(
           curRoom.roomId,
           profile.uid,
           countdownEndsAt
         ).catch(() => {});
+      } else if (
+        countdownEndsAt > 0 &&
+        countdownEndsAt !== lastSeenRemoteCountdownRef.current
+      ) {
+        lastSeenRemoteCountdownRef.current = countdownEndsAt;
+        if (localCountdownEndsAtMsRef.current <= nowMs) {
+          localCountdownEndsAtMsRef.current = nowMs + COUNTDOWN_DURATION_MS;
+          lastCountdownBeepRef.current = 99;
+        }
       }
 
       const phys = physRef.current;
-      if (countdownEndsAt === 0) {
-        setPreMatchUi({
-          phase: 'waiting_players',
-          waitSecondsLeft,
-          countdownNumber: 3,
-          goBannerActive: false,
-          kickoffActive: phys.kickoffActive,
-          kickoffTeam: phys.kickoffTeam,
-        });
-      } else if (nowMs < countdownEndsAt) {
-        const cNum = Math.max(
+      const activeLocalCountdownUntil = localCountdownEndsAtMsRef.current;
+
+      let nextPhase: 'waiting_players' | 'countdown' | 'live' = 'live';
+      let nextWaitSec = 0;
+      let nextCNum = 0;
+
+      if (countdownEndsAt === 0 && scoreTotal === 0) {
+        nextPhase = 'waiting_players';
+        nextWaitSec = waitSecondsLeft;
+        nextCNum = 3;
+      } else if (nowMs < activeLocalCountdownUntil) {
+        nextPhase = 'countdown';
+        nextWaitSec = 0;
+        nextCNum = Math.max(
           1,
-          Math.min(3, Math.ceil((countdownEndsAt - nowMs) / 1000))
+          Math.min(3, Math.ceil((activeLocalCountdownUntil - nowMs) / 1000))
         );
-        setPreMatchUi({
-          phase: 'countdown',
-          waitSecondsLeft: 0,
-          countdownNumber: cNum,
-          goBannerActive: false,
-          kickoffActive: phys.kickoffActive,
-          kickoffTeam: phys.kickoffTeam,
-        });
       } else {
-        const goActive = nowMs - countdownEndsAt < 1400;
-        setPreMatchUi({
-          phase: 'live',
-          waitSecondsLeft: 0,
-          countdownNumber: 0,
-          goBannerActive: goActive,
-          kickoffActive: phys.kickoffActive,
-          kickoffTeam: phys.kickoffTeam,
-        });
+        nextPhase = 'live';
+        nextWaitSec = 0;
+        nextCNum = 0;
       }
+
+      setPreMatchUi((prev) => {
+        if (
+          prev.phase === nextPhase &&
+          prev.waitSecondsLeft === nextWaitSec &&
+          prev.countdownNumber === nextCNum
+        ) {
+          return prev;
+        }
+        return {
+          phase: nextPhase,
+          waitSecondsLeft: nextWaitSec,
+          countdownNumber: nextCNum,
+          goBannerActive: false,
+          kickoffActive: false,
+          kickoffTeam: phys.kickoffTeam,
+        };
+      });
     };
 
     checkPreMatchStatus();
-    const id = window.setInterval(checkPreMatchStatus, 150);
+    const id = window.setInterval(checkPreMatchStatus, 80);
     return () => window.clearInterval(id);
   }, [room.roomId, profile.uid]);
 
@@ -993,16 +1016,46 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
   }, [room]);
 
   useEffect(() => {
-    playersRef.current = players;
-  }, [players]);
+    const nextPlayers = { ...players };
+    for (const [uid, pl] of Object.entries(nextPlayers)) {
+      const authTeam: TeamColor = room.blueUids.includes(uid)
+        ? 'blue'
+        : room.redUids.includes(uid)
+          ? 'red'
+          : pl.team;
+      if (pl.nickname && pl.nickname !== 'Player') {
+        knownPlayerMetaRef.current[uid] = {
+          nickname: pl.nickname,
+          jerseyNumber: pl.jerseyNumber,
+          team: authTeam,
+        };
+      }
+      const cached = knownPlayerMetaRef.current[uid];
+      nextPlayers[uid] = {
+        ...pl,
+        team: authTeam,
+        nickname:
+          pl.nickname && pl.nickname !== 'Player'
+            ? pl.nickname
+            : cached?.nickname || pl.nickname,
+        jerseyNumber:
+          pl.nickname && pl.nickname !== 'Player'
+            ? pl.jerseyNumber
+            : cached?.jerseyNumber || pl.jerseyNumber,
+      };
+    }
+    playersRef.current = nextPlayers;
+  }, [players, room.blueUids, room.redUids]);
 
-  // Match 5-Minute Active Play Timer (Paused during Pre-Match Loading, 3-2-1 Countdown, and Kickoff Wait!)
+  // Match 5-Minute Active Play Timer (Paused during Pre-Match Loading & 3-2-1 Countdown)
   useEffect(() => {
     const updateTimer = () => {
       const currentRoom = roomRef.current;
       const phys = physRef.current;
       if (currentRoom.status === 'finished') {
-        setElapsedSeconds(MATCH_DURATION_SEC);
+        setElapsedSeconds((prev) =>
+          prev === MATCH_DURATION_SEC ? prev : MATCH_DURATION_SEC
+        );
         return;
       }
 
@@ -1015,7 +1068,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         MATCH_DURATION_SEC,
         Math.floor(syncedElapsedMs / 1000)
       );
-      setElapsedSeconds(sec);
+      setElapsedSeconds((prev) => (prev === sec ? prev : sec));
 
       if (syncedElapsedMs >= MATCH_DURATION_MS && !finishTriggeredRef.current) {
         finishTriggeredRef.current = true;
@@ -1027,7 +1080,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     };
 
     updateTimer();
-    const interval = window.setInterval(updateTimer, 150);
+    const interval = window.setInterval(updateTimer, 200);
     return () => window.clearInterval(interval);
   }, [profile.uid]);
 
@@ -1108,17 +1161,129 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     let lastPerfTime = performance.now();
     let accumulatorMs = 0;
 
+    const executeFormationResetWithCountdown = (
+      scoreTotal: number,
+      concedingTeam: TeamColor,
+      nowMs: number
+    ) => {
+      if (scoreTotal <= lastResetScoreHandledRef.current) return;
+      lastResetScoreHandledRef.current = scoreTotal;
+
+      const p = physRef.current;
+      const curRoom = roomRef.current;
+      const locTeam: TeamColor = curRoom.blueUids.includes(profile.uid)
+        ? 'blue'
+        : 'red';
+      const locIdx = Math.max(
+        0,
+        locTeam === 'red'
+          ? curRoom.redUids.indexOf(profile.uid)
+          : curRoom.blueUids.indexOf(profile.uid)
+      );
+
+      p.eventState = 'normal';
+      p.eventUntilMs = 0;
+      p.ballX = FIELD_CENTER_X;
+      p.ballY = FIELD_CENTER_Y;
+      p.ballVx = 0;
+      p.ballVy = 0;
+      p.ballOffsetX = 0;
+      p.ballOffsetY = 0;
+      p.eventTeam = 'none';
+      p.kickoffTeam = concedingTeam;
+      p.kickoffActive = false;
+
+      const nextCountdownEnds = nowMs + COUNTDOWN_DURATION_MS;
+      localCountdownEndsAtMsRef.current = nextCountdownEnds;
+      lastSeenRemoteCountdownRef.current = nextCountdownEnds;
+      lastCountdownBeepRef.current = 99;
+      curRoom.eventState = 'normal';
+      curRoom.eventUntilMs = 0;
+      curRoom.kickoffTeam = concedingTeam;
+      curRoom.kickoffActive = false;
+      curRoom.countdownEndsAtMs = nextCountdownEnds;
+
+      const spawn = getTeamSpawnPosition(locTeam, locIdx);
+      p.myX = spawn.x;
+      p.myY = spawn.y;
+      p.myOffsetX = 0;
+      p.myOffsetY = 0;
+      p.myVx = 0;
+      p.myVy = 0;
+      p.myKicking = false;
+      p.myKickConsumed = false;
+
+      curRoom.redUids.forEach((uid, idx) => {
+        if (uid === profile.uid) return;
+        const rSp = getTeamSpawnPosition('red', idx);
+        if (p.remoteRenderPos[uid]) {
+          p.remoteRenderPos[uid].x = rSp.x;
+          p.remoteRenderPos[uid].y = rSp.y;
+          p.remoteRenderPos[uid].offsetX = 0;
+          p.remoteRenderPos[uid].offsetY = 0;
+          p.remoteRenderPos[uid].vx = 0;
+          p.remoteRenderPos[uid].vy = 0;
+          p.remoteRenderPos[uid].kicking = false;
+        }
+      });
+      curRoom.blueUids.forEach((uid, idx) => {
+        if (uid === profile.uid) return;
+        const bSp = getTeamSpawnPosition('blue', idx);
+        if (p.remoteRenderPos[uid]) {
+          p.remoteRenderPos[uid].x = bSp.x;
+          p.remoteRenderPos[uid].y = bSp.y;
+          p.remoteRenderPos[uid].offsetX = 0;
+          p.remoteRenderPos[uid].offsetY = 0;
+          p.remoteRenderPos[uid].vx = 0;
+          p.remoteRenderPos[uid].vy = 0;
+          p.remoteRenderPos[uid].kicking = false;
+        }
+      });
+
+      resetFormationAfterGoalDelay(
+        curRoom,
+        playersRef.current,
+        profile.uid,
+        concedingTeam
+      ).catch(() => {});
+    };
+
     // Pure Fixed-Step Physics Tick (DT = 1/60s, integer tick, 4-decimal rounding after every operation)
     const runFixedPhysicsTick = (now: number) => {
       const p = physRef.current;
 
-      // Direct 60 FPS Snapshot Pull
+      // Direct 60 FPS Snapshot Pull (always preserve cached nickname, jerseyNumber & authoritative team!)
       const liveSnap = getLiveMatchSnapshot(roomRef.current.roomId);
+      const activeRoom = liveSnap.room || roomRef.current;
       if (Object.keys(liveSnap.players).length > 0) {
         const nextPlayers = { ...playersRef.current };
         for (const [uid, pl] of Object.entries(liveSnap.players)) {
           if (uid === profile.uid) continue;
-          nextPlayers[uid] = pl;
+          const authTeam: TeamColor = activeRoom.blueUids.includes(uid)
+            ? 'blue'
+            : activeRoom.redUids.includes(uid)
+              ? 'red'
+              : pl.team;
+          if (pl.nickname && pl.nickname !== 'Player') {
+            knownPlayerMetaRef.current[uid] = {
+              nickname: pl.nickname,
+              jerseyNumber: pl.jerseyNumber,
+              team: authTeam,
+            };
+          }
+          const cached = knownPlayerMetaRef.current[uid];
+          nextPlayers[uid] = {
+            ...pl,
+            team: authTeam,
+            nickname:
+              pl.nickname && pl.nickname !== 'Player'
+                ? pl.nickname
+                : cached?.nickname || pl.nickname,
+            jerseyNumber:
+              pl.nickname && pl.nickname !== 'Player'
+                ? pl.jerseyNumber
+                : cached?.jerseyNumber || pl.jerseyNumber,
+          };
         }
         playersRef.current = nextPlayers;
       }
@@ -1150,26 +1315,32 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         if (typeof netRoom.elapsedMatchMs === 'number') {
           p.elapsedMatchMs = Math.max(p.elapsedMatchMs, netRoom.elapsedMatchMs);
         }
-        if (netRoom.kickoffTeam && p.eventState !== 'goal') {
-          p.kickoffTeam = netRoom.kickoffTeam;
-        }
-        if (netRoom.kickoffActive === false && p.kickoffActive) {
-          p.kickoffActive = false;
-        } else if (
-          netRoom.kickoffActive === true &&
-          !p.kickoffActive &&
-          Math.hypot(netRoom.ballX - FIELD_CENTER_X, netRoom.ballY - FIELD_CENTER_Y) < 2 &&
-          Math.hypot(netRoom.ballVx, netRoom.ballVy) < 0.05 &&
-          now - lastLocalBallTouchMsRef.current > 600
-        ) {
-          p.kickoffActive = true;
-        }
+        p.kickoffActive = false;
 
-        if (p.eventState === 'goal' && now < p.eventUntilMs - 100) {
+        const nextRed = Math.max(roomRef.current.redScore, netRoom.redScore);
+        const nextBlue = Math.max(roomRef.current.blueScore, netRoom.blueScore);
+        const netScoreTotal = nextRed + nextBlue;
+
+        // If Host already transitioned from 'goal' to 'normal' for this score, immediately trigger formation reset + 3-2-1 countdown on Client!
+        if (
+          p.eventState === 'goal' &&
+          netRoom.eventState === 'normal' &&
+          netScoreTotal > lastResetScoreHandledRef.current &&
+          Math.hypot(netRoom.ballX - FIELD_CENTER_X, netRoom.ballY - FIELD_CENTER_Y) < 25
+        ) {
           roomRef.current = {
             ...netRoom,
-            redScore: Math.max(roomRef.current.redScore, netRoom.redScore),
-            blueScore: Math.max(roomRef.current.blueScore, netRoom.blueScore),
+            redScore: nextRed,
+            blueScore: nextBlue,
+          };
+          const concedingTeam: TeamColor =
+            p.eventTeam === 'red' ? 'blue' : 'red';
+          executeFormationResetWithCountdown(netScoreTotal, concedingTeam, now);
+        } else if (p.eventState === 'goal' && now < p.eventUntilMs - 100) {
+          roomRef.current = {
+            ...netRoom,
+            redScore: nextRed,
+            blueScore: nextBlue,
             eventState: 'goal',
             eventTeam: p.eventTeam,
             eventUntilMs: p.eventUntilMs,
@@ -1177,8 +1348,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         } else {
           roomRef.current = {
             ...netRoom,
-            redScore: Math.max(roomRef.current.redScore, netRoom.redScore),
-            blueScore: Math.max(roomRef.current.blueScore, netRoom.blueScore),
+            redScore: nextRed,
+            blueScore: nextBlue,
           };
 
           // Only GOAL events exist (no outs or corners!)
@@ -1196,7 +1367,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             }
             p.eventState = 'goal';
             p.eventTeam = netRoom.eventTeam;
-            p.eventUntilMs = now + GOAL_PAUSE_MS;
+            p.eventUntilMs = now + 1500;
             p.kickoffActive = false;
             p.ballX = netRoom.ballX;
             p.ballY = netRoom.ballY;
@@ -1236,17 +1407,31 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           : currentRoom.blueUids.indexOf(profile.uid)
       );
 
-      // Rocket League Pre-Match Loading & 3-2-1 Countdown Lock
+      // Handle Post-Goal formation reset -> Immediately launches 3-2-1 Countdown for all players!
+      if (p.eventState === 'goal' && now >= p.eventUntilMs) {
+        const scoredTeam = p.eventTeam;
+        const concedingTeam: TeamColor =
+          scoredTeam === 'red' ? 'blue' : 'red';
+        const curScoreTotal =
+          (currentRoom.redScore || 0) + (currentRoom.blueScore || 0);
+        executeFormationResetWithCountdown(curScoreTotal, concedingTeam, now);
+      }
+
+      // Rocket League Pre-Match Loading & 3-2-1 Countdown Lock (at match start AND after every goal!)
       const countdownEndsAtMs = currentRoom.countdownEndsAtMs || 0;
-      const isWaitingForPlayers = countdownEndsAtMs === 0;
-      const isCountdownActive =
-        countdownEndsAtMs > 0 && now < countdownEndsAtMs;
+      const isWaitingForPlayers =
+        countdownEndsAtMs === 0 &&
+        currentRoom.redScore + currentRoom.blueScore === 0;
+      const isCountdownActive = now < localCountdownEndsAtMsRef.current;
       const isPreMatchLocked = isWaitingForPlayers || isCountdownActive;
 
       if (isCountdownActive) {
         const secLeft = Math.max(
           1,
-          Math.min(3, Math.ceil((countdownEndsAtMs - now) / 1000))
+          Math.min(
+            3,
+            Math.ceil((localCountdownEndsAtMsRef.current - now) / 1000)
+          )
         );
         if (secLeft !== lastCountdownBeepRef.current) {
           lastCountdownBeepRef.current = secLeft;
@@ -1265,74 +1450,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         }
       }
 
-      // Handle 3-second Post-Goal formation reset -> Conceding Team gets Kickoff!
-      if (p.eventState === 'goal' && now >= p.eventUntilMs) {
-        const scoredTeam = p.eventTeam;
-        const concedingTeam: TeamColor =
-          scoredTeam === 'red' ? 'blue' : 'red';
-
-        p.eventState = 'normal';
-        p.eventUntilMs = 0;
-        p.ballX = FIELD_CENTER_X;
-        p.ballY = FIELD_CENTER_Y;
-        p.ballVx = 0;
-        p.ballVy = 0;
-        p.ballOffsetX = 0;
-        p.ballOffsetY = 0;
-        p.eventTeam = 'none';
-        p.kickoffTeam = concedingTeam;
-        p.kickoffActive = true;
-        roomRef.current.kickoffTeam = concedingTeam;
-        roomRef.current.kickoffActive = true;
-
-        const spawn = getTeamSpawnPosition(localTeam, localSlotIdx);
-        p.myX = spawn.x;
-        p.myY = spawn.y;
-        p.myOffsetX = 0;
-        p.myOffsetY = 0;
-        p.myVx = 0;
-        p.myVy = 0;
-
-        currentRoom.redUids.forEach((uid, idx) => {
-          if (uid === profile.uid) return;
-          const rSp = getTeamSpawnPosition('red', idx);
-          if (p.remoteRenderPos[uid]) {
-            p.remoteRenderPos[uid].x = rSp.x;
-            p.remoteRenderPos[uid].y = rSp.y;
-            p.remoteRenderPos[uid].offsetX = 0;
-            p.remoteRenderPos[uid].offsetY = 0;
-            p.remoteRenderPos[uid].vx = 0;
-            p.remoteRenderPos[uid].vy = 0;
-          }
-        });
-        currentRoom.blueUids.forEach((uid, idx) => {
-          if (uid === profile.uid) return;
-          const bSp = getTeamSpawnPosition('blue', idx);
-          if (p.remoteRenderPos[uid]) {
-            p.remoteRenderPos[uid].x = bSp.x;
-            p.remoteRenderPos[uid].y = bSp.y;
-            p.remoteRenderPos[uid].offsetX = 0;
-            p.remoteRenderPos[uid].offsetY = 0;
-            p.remoteRenderPos[uid].vx = 0;
-            p.remoteRenderPos[uid].vy = 0;
-          }
-        });
-
-        resetFormationAfterGoalDelay(
-          currentRoom,
-          allPlayers,
-          profile.uid,
-          concedingTeam
-        ).catch(() => {});
-      }
-
-      // Advance Match Clock ONLY when players are loaded, 3-2-1 is finished, and kickoff ball has been touched!
-      if (
-        !isPreMatchLocked &&
-        !p.kickoffActive &&
-        p.eventState === 'normal' &&
-        !isMatchFinished
-      ) {
+      // Advance Match Clock ONLY when players are loaded, 3-2-1 is finished, and not in goal celebration!
+      if (!isPreMatchLocked && p.eventState === 'normal' && !isMatchFinished) {
         p.elapsedMatchMs = Math.min(
           MATCH_DURATION_MS,
           p.elapsedMatchMs + 1000 / 60
@@ -1382,8 +1501,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
         p.ballVy = 0;
         p.ballOffsetX = 0;
         p.ballOffsetY = 0;
-        p.kickoffActive = true;
-        p.kickoffTeam = 'red';
+        p.kickoffActive = false;
       } else if (!isMatchFinished) {
         if (!effectiveKickHeld) {
           p.myKickConsumed = false;
@@ -1479,13 +1597,18 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               : 0;
         let state = p.remoteRenderPos[rp.playerId];
 
+        const rpTeam: TeamColor = currentRoom.blueUids.includes(rp.playerId)
+          ? 'blue'
+          : currentRoom.redUids.includes(rp.playerId)
+            ? 'red'
+            : rp.team;
         const rpSlotIdx = Math.max(
           0,
-          rp.team === 'red'
+          rpTeam === 'red'
             ? currentRoom.redUids.indexOf(rp.playerId)
             : currentRoom.blueUids.indexOf(rp.playerId)
         );
-        const rpSpawn = getTeamSpawnPosition(rp.team, rpSlotIdx);
+        const rpSpawn = getTeamSpawnPosition(rpTeam, rpSlotIdx);
 
         if (!state) {
           state = {
@@ -1969,7 +2092,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             const inGoalY = p.ballY > GOAL_TOP && p.ballY < GOAL_BOTTOM;
             if (inGoalY && p.ballX + BALL_RADIUS * 0.6 < FIELD_LEFT) {
               const newBlueScore = roomRef.current.blueScore + 1;
-              const pauseUntil = now + GOAL_PAUSE_MS;
+              const pauseUntil = now + 1500;
               p.eventState = 'goal';
               p.eventTeam = 'blue';
               p.eventUntilMs = pauseUntil;
@@ -1999,7 +2122,7 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
               ).catch(() => {});
             } else if (inGoalY && p.ballX - BALL_RADIUS * 0.6 > FIELD_RIGHT) {
               const newRedScore = roomRef.current.redScore + 1;
-              const pauseUntil = now + GOAL_PAUSE_MS;
+              const pauseUntil = now + 1500;
               p.eventState = 'goal';
               p.eventTeam = 'red';
               p.eventUntilMs = pauseUntil;
@@ -2601,23 +2724,6 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
     };
   };
 
-  const getEventBanner = () => {
-    if (room.eventState === 'goal') {
-      const scorer =
-        room.eventTeam === 'red' ? 'КРАСНАЯ КОМАНДА' : 'СИНЯЯ КОМАНДА';
-      return {
-        text: `⚽ ГОЛ! Забивает ${scorer}!`,
-        cls:
-          room.eventTeam === 'red'
-            ? 'bg-red-600/95 text-white border-red-400'
-            : 'bg-blue-600/95 text-white border-blue-400',
-      };
-    }
-    return null;
-  };
-
-  const eventBanner = getEventBanner();
-
   const redTeamRoster = room.redUids
     .map((uid) => players[uid])
     .filter((p): p is RoomPlayerDoc => Boolean(p));
@@ -2675,16 +2781,11 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
 
           <div className="flex flex-col items-center px-2.5 py-0.5 rounded-lg bg-slate-900 border border-slate-800">
             <span className="text-[9px] uppercase tracking-widest text-slate-400 font-semibold">
-              {preMatchUi.phase !== 'live'
-                ? 'Старт'
-                : preMatchUi.kickoffActive && room.eventState !== 'goal'
-                  ? 'Пауза (развод)'
-                  : 'Время'}
+              {preMatchUi.phase !== 'live' ? 'Отсчёт' : 'Время'}
             </span>
             <span
               className={`text-sm sm:text-base font-mono-tabular font-bold ${
-                preMatchUi.phase !== 'live' ||
-                (preMatchUi.kickoffActive && room.eventState !== 'goal')
+                preMatchUi.phase !== 'live'
                   ? 'text-amber-400'
                   : elapsedSeconds >= MATCH_DURATION_SEC - 30
                     ? 'text-amber-400'
@@ -2706,15 +2807,8 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           </div>
         </div>
 
-        {/* Right: Event Banner + Tab Button + Sound Toggle + Exit to Lobby */}
+        {/* Right: Tab Button + Sound Toggle + Exit to Lobby */}
         <div className="flex items-center gap-2">
-          {eventBanner && (
-            <div
-              className={`hidden lg:flex items-center px-3 py-1 rounded-lg border font-display font-bold text-xs tracking-wide shadow-md ${eventBanner.cls}`}
-            >
-              {eventBanner.text}
-            </div>
-          )}
           <button
             type="button"
             onMouseDown={() => setTabOpen(true)}
@@ -2756,9 +2850,25 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
           className="w-full h-full block"
         />
 
-        {/* Rocket League Top-Center 3-2-1 Countdown & Kickoff Status Banner */}
+        {/* Rocket League 3-2-1 Fading Digits Countdown (at match start & after every goal) */}
+        <style>{`
+          @keyframes rlDigitFadeOut {
+            0% {
+              opacity: 1;
+              transform: scale(1.12);
+            }
+            20% {
+              opacity: 1;
+              transform: scale(1);
+            }
+            100% {
+              opacity: 0;
+              transform: scale(0.82);
+            }
+          }
+        `}</style>
         {!isFinished && (
-          <div className="pointer-events-none absolute inset-x-0 top-3 z-10 flex flex-col items-center gap-2 px-4">
+          <div className="pointer-events-none absolute inset-x-0 top-6 z-10 flex flex-col items-center gap-2 px-4">
             {preMatchUi.phase === 'waiting_players' && (
               <div className="flex items-center gap-2.5 px-4 py-2 rounded-xl bg-slate-950/90 border border-amber-500/50 shadow-xl">
                 <Loader2 className="w-4 h-4 text-amber-400 animate-spin shrink-0" />
@@ -2772,55 +2882,25 @@ export const MatchArena: React.FC<MatchArenaProps> = ({
             )}
 
             {preMatchUi.phase === 'countdown' && (
-              <div className="flex flex-col items-center">
-                <div className="px-3.5 py-1 rounded-full bg-slate-950/90 border border-red-500/50 text-[11px] font-display font-bold uppercase tracking-wider text-red-300 shadow-lg mb-1.5">
-                  Все на позициях · Первый развод: Красная команда
-                </div>
-                <div className="w-20 h-20 sm:w-24 sm:h-24 rounded-2xl bg-slate-950/90 border-2 border-amber-400 flex items-center justify-center shadow-2xl">
-                  <span className="font-display font-black text-5xl sm:text-6xl text-amber-400 font-mono-tabular">
-                    {preMatchUi.countdownNumber}
-                  </span>
-                </div>
+              <div
+                key={`rl-cd-${preMatchUi.countdownNumber}-${room.redScore}-${room.blueScore}`}
+                style={{
+                  animation: 'rlDigitFadeOut 0.96s ease-out forwards',
+                }}
+                className="font-display font-black text-4xl sm:text-5xl text-white font-mono-tabular drop-shadow-[0_4px_12px_rgba(0,0,0,0.9)] select-none"
+              >
+                {preMatchUi.countdownNumber}
               </div>
             )}
-
-            {preMatchUi.phase === 'live' && preMatchUi.goBannerActive && (
-              <div className="px-6 py-2.5 rounded-2xl bg-emerald-500 text-slate-950 font-display font-black text-xl sm:text-2xl uppercase tracking-wider shadow-2xl border-2 border-white">
-                МАТЧ НАЧАЛСЯ! РАЗВОД КРАСНЫХ!
-              </div>
-            )}
-
-            {preMatchUi.phase === 'live' &&
-              !preMatchUi.goBannerActive &&
-              preMatchUi.kickoffActive &&
-              room.eventState !== 'goal' && (
-                <div
-                  className={`flex flex-wrap items-center justify-center gap-2 px-4 py-1.5 rounded-xl border shadow-xl text-xs font-display font-bold ${
-                    preMatchUi.kickoffTeam === 'red'
-                      ? 'bg-red-950/90 border-red-500/60 text-red-100'
-                      : 'bg-blue-950/90 border-blue-500/60 text-blue-100'
-                  }`}
-                >
-                  <span>
-                    ⚽ РАЗВОД МЯЧА:{' '}
-                    {preMatchUi.kickoffTeam === 'red'
-                      ? 'КРАСНАЯ КОМАНДА'
-                      : 'СИНЯЯ КОМАНДА'}
-                  </span>
-                  <span className="text-white/60">•</span>
-                  <span className="font-sans font-medium text-[11px] text-slate-200">
-                    Таймер 05:00 на паузе до касания · Соперники ждут за белым кругом
-                  </span>
-                </div>
-              )}
           </div>
         )}
 
-        {/* Right-Side Rocket League Player Loading Status Panel («справа показывает кто все еще грузит а кто зашел») */}
+        {/* Right-Side Rocket League Player Loading Status Panel (shown only at initial pre-match load) */}
         {!isFinished &&
+          room.redScore === 0 &&
+          room.blueScore === 0 &&
           (preMatchUi.phase === 'waiting_players' ||
-            preMatchUi.phase === 'countdown' ||
-            preMatchUi.goBannerActive) && (
+            preMatchUi.phase === 'countdown') && (
             <div className="pointer-events-none absolute right-3 top-3 z-20 w-64 sm:w-72 rounded-xl bg-slate-950/90 border border-slate-700/90 p-3.5 shadow-2xl">
               <div className="flex items-center justify-between gap-2 pb-2.5 mb-2.5 border-b border-slate-800">
                 <div className="flex items-center gap-1.5">
@@ -3189,48 +3269,6 @@ function drawArena(
   ctx.arc(FIELD_CENTER_X, FIELD_CENTER_Y, CENTER_CIRCLE_RADIUS, 0, Math.PI * 2);
   ctx.stroke();
 
-  // Kickoff Barrier Visual Highlight (Shows active half-line & white center circle rule until kickoff touch)
-  if (phys.kickoffActive && phys.eventState === 'normal') {
-    ctx.save();
-    const isRedKickoff = phys.kickoffTeam === 'red';
-    ctx.fillStyle = isRedKickoff
-      ? 'rgba(239, 68, 68, 0.14)'
-      : 'rgba(59, 130, 246, 0.14)';
-    ctx.beginPath();
-    ctx.arc(
-      FIELD_CENTER_X,
-      FIELD_CENTER_Y,
-      CENTER_CIRCLE_RADIUS,
-      0,
-      Math.PI * 2
-    );
-    ctx.fill();
-
-    // Highlight active kickoff barrier line & circle rim
-    ctx.strokeStyle = isRedKickoff
-      ? 'rgba(248, 113, 113, 0.92)'
-      : 'rgba(96, 165, 250, 0.92)';
-    ctx.lineWidth = 3.5;
-    ctx.setLineDash([8, 6]);
-    ctx.beginPath();
-    ctx.arc(
-      FIELD_CENTER_X,
-      FIELD_CENTER_Y,
-      CENTER_CIRCLE_RADIUS,
-      0,
-      Math.PI * 2
-    );
-    ctx.stroke();
-
-    ctx.beginPath();
-    ctx.moveTo(FIELD_CENTER_X, FIELD_TOP);
-    ctx.lineTo(FIELD_CENTER_X, FIELD_CENTER_Y - CENTER_CIRCLE_RADIUS);
-    ctx.moveTo(FIELD_CENTER_X, FIELD_CENTER_Y + CENTER_CIRCLE_RADIUS);
-    ctx.lineTo(FIELD_CENTER_X, FIELD_BOTTOM);
-    ctx.stroke();
-    ctx.restore();
-  }
-
   // Center Kickoff Spot
   ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
   ctx.beginPath();
@@ -3288,11 +3326,16 @@ function drawArena(
     const isRemoteKicking = Boolean(
       pos.kicking || (typeof km === 'number' && (km & 16) !== 0)
     );
+    const resolvedTeam: TeamColor = room.blueUids.includes(rp.playerId)
+      ? 'blue'
+      : room.redUids.includes(rp.playerId)
+        ? 'red'
+        : rp.team;
     renderList.push({
       uid: rp.playerId,
       nickname: rp.nickname,
       jerseyNumber: rp.jerseyNumber,
-      team: rp.team,
+      team: resolvedTeam,
       x: pos.x + (pos.offsetX || 0),
       y: pos.y + (pos.offsetY || 0),
       kicking: isRemoteKicking,

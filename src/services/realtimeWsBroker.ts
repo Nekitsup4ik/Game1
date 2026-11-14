@@ -126,6 +126,9 @@ interface FastPlayerTickPacket {
   km?: number;
   p: number;
   s: number;
+  n?: string;
+  jn?: number;
+  tm?: TeamColor;
 }
 
 interface FastBallTickPacket {
@@ -518,20 +521,43 @@ class RealtimeMultiplayerBroker {
           const nowMs = Date.now();
           const rPlayers = this.players.get(roomId) || {};
           const existing = rPlayers[pkt.u];
+          const room = this.rooms.get(roomId);
           const km = typeof pkt.km === 'number' ? pkt.km : pkt.k === 1 ? 16 : 0;
           const isKickingNow = pkt.k === 1 || (km & 16) !== 0;
           const kickUntilMs = isKickingNow
             ? nowMs + 160
             : existing?.kickUntilMs || 0;
 
+          const resolvedTeam: TeamColor = room?.blueUids?.includes(pkt.u)
+            ? 'blue'
+            : room?.redUids?.includes(pkt.u)
+              ? 'red'
+              : pkt.tm || existing?.team || 'red';
+
+          const resolvedNickname =
+            pkt.n && pkt.n !== 'Player'
+              ? pkt.n
+              : existing?.nickname && existing.nickname !== 'Player'
+                ? existing.nickname
+                : pkt.n || existing?.nickname || 'Player';
+
+          const resolvedJersey =
+            typeof pkt.jn === 'number' && pkt.jn > 0 && pkt.n !== 'Player'
+              ? pkt.jn
+              : existing?.nickname &&
+                  existing.nickname !== 'Player' &&
+                  existing.jerseyNumber
+                ? existing.jerseyNumber
+                : pkt.jn || existing?.jerseyNumber || 10;
+
           rPlayers[pkt.u] = {
             ...(existing || {
               playerId: pkt.u,
               roomId,
-              nickname: 'Player',
-              jerseyNumber: 10,
-              team: 'red',
             }),
+            nickname: resolvedNickname,
+            jerseyNumber: resolvedJersey,
+            team: resolvedTeam,
             x: pkt.x,
             y: pkt.y,
             vx: pkt.vx,
@@ -544,7 +570,6 @@ class RealtimeMultiplayerBroker {
             updatedAtMs: nowMs,
           };
           this.players.set(roomId, rPlayers);
-          const room = this.rooms.get(roomId);
           if (room) {
             room.heartbeatAtMs = nowMs;
           }
@@ -977,12 +1002,22 @@ class RealtimeMultiplayerBroker {
         : kicking
           ? 16
           : 0;
+    const resolvedNick =
+      fallbackMeta?.nickname && fallbackMeta.nickname !== 'Player'
+        ? fallbackMeta.nickname
+        : existing?.nickname && existing.nickname !== 'Player'
+          ? existing.nickname
+          : fallbackMeta?.nickname || 'Player';
+    const resolvedNum =
+      fallbackMeta?.jerseyNumber || existing?.jerseyNumber || 10;
+    const resolvedTeam = fallbackMeta?.team || existing?.team || 'red';
+
     rPlayers[uid] = {
       playerId: uid,
       roomId,
-      nickname: existing?.nickname || fallbackMeta?.nickname || 'Player',
-      jerseyNumber: existing?.jerseyNumber || fallbackMeta?.jerseyNumber || 10,
-      team: existing?.team || fallbackMeta?.team || 'red',
+      nickname: resolvedNick,
+      jerseyNumber: resolvedNum,
+      team: resolvedTeam,
       x,
       y,
       vx,
@@ -1006,6 +1041,9 @@ class RealtimeMultiplayerBroker {
       km,
       p: pingMs,
       s: outSeq,
+      n: resolvedNick,
+      jn: resolvedNum,
+      tm: resolvedTeam,
     };
     this.broadcastMqtt(
       `${TOPIC_PREFIX}/fast/${roomId}`,
@@ -1013,6 +1051,28 @@ class RealtimeMultiplayerBroker {
       false,
       kicking ? `p_kick:${uid}:${outSeq}` : `p:${uid}`
     );
+  }
+
+  public syncPlayerMeta(player: SyncedPlayerRecord) {
+    const rPlayers = this.players.get(player.roomId) || {};
+    const existing = rPlayers[player.playerId];
+    if (!existing) {
+      rPlayers[player.playerId] = { ...player };
+    } else {
+      rPlayers[player.playerId] = {
+        ...existing,
+        team: player.team,
+        nickname:
+          player.nickname && player.nickname !== 'Player'
+            ? player.nickname
+            : existing.nickname,
+        jerseyNumber:
+          player.nickname && player.nickname !== 'Player'
+            ? player.jerseyNumber
+            : existing.jerseyNumber || player.jerseyNumber,
+      };
+    }
+    this.players.set(player.roomId, rPlayers);
   }
 
   public publishFastBallTick(
